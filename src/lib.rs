@@ -3,16 +3,16 @@
 //! A memory-safe, massively scalable implementation of Mixture of Experts
 //! Large Language Model system with efficient GPU memory management.
 
-pub mod cache;
+pub mod expert_cache;
 pub mod cli;
 pub mod config;
 pub mod cpu;
+pub mod generate;
 pub mod gguf;
 pub mod gpu;
-pub mod memory;
-pub mod model;
 pub mod quant;
 pub mod qwen3moe;
 pub mod server;
 pub mod template;
 pub mod tokenizer;
+pub mod toolcall;

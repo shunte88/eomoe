@@ -52,12 +52,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 // Q4_K: 144 bytes: d f16, dmin f16, scales[12] (6-bit packed), qs[128]. Lane l: chunk
 // c = l/8 covers elements 64c..64c+63; it takes qs bytes 32c+4s..+3 (s = l%8): low
 // nibbles -> elements 64c+4s..+3 (scale 2c), high nibbles -> 64c+32+4s..+3 (scale 2c+1).
-extern "C" __global__ void mm_q4_k(const uint8_t* w, unsigned long long row_bytes, int k,
-                                   const float* x, float* y, int n_rows) {
-    const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t = blockIdx.y, lane = threadIdx.x & 31;
-    if (r >= n_rows) return;
-    const uint8_t* row = w + (size_t)r * row_bytes;
-    const float* xt = x + (size_t)t * k;
+__device__ __forceinline__ float dot_q4_k(const uint8_t* row, const float* xt, int k, int lane) {
     const int c = lane >> 3, s = lane & 7;
     float acc = 0.0f;
     for (int sb = 0; sb < k / 256; sb++) {
@@ -82,18 +77,12 @@ extern "C" __global__ void mm_q4_k(const uint8_t* w, unsigned long long row_byte
              + (d2 * ((q >> 4) & 0xF) - mm2) * xh.x + (d2 * ((q >> 12) & 0xF) - mm2) * xh.y
              + (d2 * ((q >> 20) & 0xF) - mm2) * xh.z + (d2 * (q >> 28) - mm2) * xh.w;
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[(size_t)t * n_rows + r] = acc;
+    return warp_sum(acc);
 }
 
 // Q6_K: 210 bytes: ql[128], qh[64], scales[16] i8, d f16 at 208. Lane l takes position l
 // of each of the 4 quadrants (32 elements) in both 128-element halves.
-extern "C" __global__ void mm_q6_k(const uint8_t* w, unsigned long long row_bytes, int k,
-                                   const float* x, float* y, int n_rows) {
-    const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t = blockIdx.y, l = threadIdx.x & 31;
-    if (r >= n_rows) return;
-    const uint8_t* row = w + (size_t)r * row_bytes;
-    const float* xt = x + (size_t)t * k;
+__device__ __forceinline__ float dot_q6_k(const uint8_t* row, const float* xt, int k, int l) {
     float acc = 0.0f;
     for (int sb = 0; sb < k / 256; sb++) {
         const uint8_t* b = row + sb * 210;
@@ -110,9 +99,31 @@ extern "C" __global__ void mm_q6_k(const uint8_t* w, unsigned long long row_byte
                  + d * sc[6] * (float)(((c >> 4) | (((h >> 6) & 3) << 4)) - 32) * xv[96];
         }
     }
-    acc = warp_sum(acc);
-    if (l == 0) y[(size_t)t * n_rows + r] = acc;
+    return warp_sum(acc);
 }
+
+// mm_X: y[t][r] = W[r] . x[t], one weight matrix. grid (ceil(n_rows / MM_ROWS), T).
+// mm_X_ids: the weights of token t start at wp[t] + off (grouped experts: one launch per
+// projection for all the experts of a layer, each gathered row reading its own expert).
+#define MM_QUANT(name, dot)                                                                        \
+    extern "C" __global__ void mm_##name(const uint8_t* w, unsigned long long row_bytes, int k,    \
+                                         const float* x, float* y, int n_rows) {                   \
+        const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t = blockIdx.y;                   \
+        if (r >= n_rows) return;                                                                   \
+        const float acc = dot(w + (size_t)r * row_bytes, x + (size_t)t * k, k, threadIdx.x & 31);  \
+        if ((threadIdx.x & 31) == 0) y[(size_t)t * n_rows + r] = acc;                              \
+    }                                                                                              \
+    extern "C" __global__ void mm_##name##_ids(const unsigned long long* wp, unsigned long long off, \
+                                               unsigned long long row_bytes, int k, const float* x, \
+                                               float* y, int n_rows) {                             \
+        const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t = blockIdx.y;                   \
+        if (r >= n_rows) return;                                                                   \
+        const uint8_t* w = (const uint8_t*)(wp[t] + off);                                          \
+        const float acc = dot(w + (size_t)r * row_bytes, x + (size_t)t * k, k, threadIdx.x & 31);  \
+        if ((threadIdx.x & 31) == 0) y[(size_t)t * n_rows + r] = acc;                              \
+    }
+MM_QUANT(q4_k, dot_q4_k)
+MM_QUANT(q6_k, dot_q6_k)
 
 // Row-wise RMSNorm, y may alias x. grid rows.
 extern "C" __global__ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
@@ -144,25 +155,45 @@ extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int
 }
 
 // Causal GQA attention with online softmax. q: T x nh x hd, caches: n_ctx x nkv x hd,
-// out: T x nh x hd. grid (nh, T), block hd. Token t sees positions [0, n_past + t].
-// ponytail: one position per step with a block reduction; tile K/V (flash-style) for long contexts.
+// out: T x nh x hd. grid (nh, T), block 32 * ATT_WARPS; hd a multiple of 32, <= 256.
+// Token t sees positions [0, n_past + t]. Each warp takes positions w, w + nw, ... with its own
+// softmax state (lane owns dims lane + 32d), then the warps merge.
+// ponytail: K/V re-read per query head (no GQA sharing), f32 cache; tile for long contexts.
+#define ATT_WARPS 8
 extern "C" __global__ void attention(const float* q, const float* kc, const float* vc, float* out,
                                      int nh, int nkv, int hd, int n_past, float scale) {
-    const int h = blockIdx.x, t = blockIdx.y, i = threadIdx.x;
-    const int hk = h / (nh / nkv);
-    const float qi = q[((size_t)t * nh + h) * hd + i];
+    __shared__ float sm[ATT_WARPS], sl[ATT_WARPS], sacc[ATT_WARPS][256];
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int hk = h / (nh / nkv), nd = hd / 32;
+    const float* qp = q + ((size_t)t * nh + h) * hd;
+    float qv[8], acc[8];
+    for (int d = 0; d < nd; d++) { qv[d] = qp[lane + 32 * d]; acc[d] = 0.0f; }
     const int n_ctx = n_past + t + 1;
-    float m = -INFINITY, l = 0.0f, acc = 0.0f;
-    for (int p = 0; p < n_ctx; p++) {
-        const size_t off = ((size_t)p * nkv + hk) * hd + i;
-        const float s = block_sum(qi * kc[off]) * scale;
+    float m = -INFINITY, l = 0.0f;
+    for (int p = w; p < n_ctx; p += ATT_WARPS) {
+        const size_t off = ((size_t)p * nkv + hk) * hd;
+        float s = 0.0f;
+        for (int d = 0; d < nd; d++) s += qv[d] * kc[off + lane + 32 * d];
+        s = warp_sum(s) * scale;
         const float mn = fmaxf(m, s);
         const float c = expf(m - mn), e = expf(s - mn);
         l = l * c + e;
-        acc = acc * c + e * vc[off];
+        for (int d = 0; d < nd; d++) acc[d] = acc[d] * c + e * vc[off + lane + 32 * d];
         m = mn;
     }
-    out[((size_t)t * nh + h) * hd + i] = acc / l;
+    if (lane == 0) { sm[w] = m; sl[w] = l; }
+    for (int d = 0; d < nd; d++) sacc[w][lane + 32 * d] = acc[d];
+    __syncthreads();
+    if (w != 0) return;
+    float M = sm[0];
+    for (int i = 1; i < ATT_WARPS; i++) M = fmaxf(M, sm[i]);
+    float L = 0.0f;
+    for (int i = 0; i < ATT_WARPS; i++) L += sl[i] * expf(sm[i] - M);
+    for (int d = 0; d < nd; d++) {
+        float o = 0.0f;
+        for (int i = 0; i < ATT_WARPS; i++) o += sacc[i][lane + 32 * d] * expf(sm[i] - M);
+        out[((size_t)t * nh + h) * hd + lane + 32 * d] = o / L;
+    }
 }
 
 extern "C" __global__ void add_inplace(float* x, const float* y, int n) {
@@ -177,10 +208,13 @@ extern "C" __global__ void gather_rows(float* dst, const float* src, const int* 
     for (int i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i];
 }
 
-// g = silu(g) * u
-extern "C" __global__ void swiglu(float* g, const float* u, int n) {
+// out[j][i] = silu(gu[j][i]) * gu[j][ff + i] for n rows of [gate | up] (2 * ff wide).
+extern "C" __global__ void swiglu(float* out, const float* gu, int ff, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) g[i] = g[i] / (1.0f + expf(-g[i])) * u[i];
+    if (i >= n * ff) return;
+    const int j = i / ff, c = i % ff;
+    const float g = gu[(size_t)j * 2 * ff + c], u = gu[(size_t)j * 2 * ff + ff + c];
+    out[i] = g / (1.0f + expf(-g)) * u;
 }
 
 // x[t] += sum_k w[t][k] * d[rows[t][k]] (k ascending by expert id, as the CPU reference).

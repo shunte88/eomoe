@@ -1,4 +1,0 @@
-# cuda-sys's build script reads this to find libcudart/libcublas at link time.
-# Set CUDA_LIBRARY_PATH in your environment to override.
-[env]
-CUDA_LIBRARY_PATH = "/usr/local/cuda/targets/x86_64-linux/lib"

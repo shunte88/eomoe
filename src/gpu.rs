@@ -1,20 +1,56 @@
 //! CUDA engine for qwen3moe. Same numerics as the CPU reference (f32 activations and KV
 //! cache, weights dequantized on the fly), with the dense weights resident in VRAM and the
-//! router-selected experts of each layer copied from host RAM into staging slots.
+//! experts in host RAM, cached in VRAM slots by `ExpertCache` (ubatches up to 32 tokens; larger
+//! ones read the cached experts and stream the rest through staging slots, as llama.cpp).
 //!
 //! Kernel seam: kernels are loaded by name from an embedded fatbin built from
 //! kernels/eomoe.cu (build.rs); an all-Rust module exporting the same names can replace it.
 
+use crate::expert_cache::ExpertCache;
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::quant::dequant_row;
 use crate::qwen3moe::{route, Engine, Weights};
-use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
+use rayon::prelude::*;
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
 static FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eomoe.fatbin"));
 
 type Ptr = CUdeviceptr;
+
+/// Larger ubatches touch most experts of a layer: caching them would evict the decode set.
+const CACHE_MAX_BATCH: usize = 32;
+/// Staging slots for the misses of uncached (large) ubatches, used in waves.
+const STAGE: usize = 32;
+/// VRAM left free after sizing the expert cache to "as much as fits".
+const VRAM_RESERVE: usize = 192 << 20;
+
+/// Layers whose experts have the same layout share one bank of slots and one cache.
+struct Group {
+    cache: ExpertCache,
+    bank: Ptr,
+    /// gate | up | down bytes of one expert.
+    slot_bytes: usize,
+}
+
+/// Every expert in page-locked RAM in slot layout (gate | up | down), so a miss is one async
+/// DMA at full PCIe speed (pageable copies are ~30% slower and block the host).
+/// ponytail: pins all expert bytes (~16 GiB for Qwen3-30B); a RAM-tight host gets the
+/// pageable fallback, add a config switch / partial pinning if that needs tuning.
+struct HostExperts {
+    buf: PinnedHostSlice<u8>,
+    /// [n_layer] offset of expert 0 of the layer.
+    base: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Bytes uploaded into cache slots.
+    pub bytes: u64,
+}
 
 macro_rules! launch {
     ($s:expr, $f:expr, $grid:expr, $block:expr, [$($a:ident),*]) => {{
@@ -29,6 +65,8 @@ struct Kernels {
     mm_f32: CudaFunction,
     mm_q4_k: CudaFunction,
     mm_q6_k: CudaFunction,
+    mm_q4_k_ids: CudaFunction,
+    mm_q6_k_ids: CudaFunction,
     rmsnorm: CudaFunction,
     qk_norm_rope: CudaFunction,
     attention: CudaFunction,
@@ -68,14 +106,14 @@ struct Scratch {
     attn: Ptr,
     o: Ptr,
     rl: Ptr,
+    /// Gathered rows: inputs, [gate | up] outputs, swiglu activations, down outputs.
     xg: Ptr,
-    gb: Ptr,
-    ub: Ptr,
+    gu: Ptr,
+    act: Ptr,
     db: Ptr,
     logits: Ptr,
-    gidx: Ptr,
-    trow: Ptr,
-    tw: Ptr,
+    /// Per layer routing, see `forward_chunk`: [gidx | trow | tw | wp].
+    meta: Ptr,
 }
 
 pub struct GpuModel {
@@ -87,9 +125,15 @@ pub struct GpuModel {
     output: Mat,
     /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f32.
     kv: Ptr,
-    /// One staging slot per expert of a layer: gate | up | down bytes.
-    slots: Ptr,
-    slot_bytes: usize,
+    groups: Vec<Group>,
+    group_of: Vec<usize>,
+    /// STAGE slots of the largest expert, for uncached ubatches.
+    stage: Ptr,
+    stage_bytes: usize,
+    stats: CacheStats,
+    host: Option<HostExperts>,
+    /// Page-locked staging for the per-layer routing upload.
+    meta_host: PinnedHostSlice<u8>,
     s: Scratch,
     n_ctx: usize,
     max_batch: usize,
@@ -107,8 +151,15 @@ fn err(e: impl std::fmt::Debug) -> String {
 }
 
 impl GpuModel {
-    /// Load the dense weights to GPU 0 and allocate a KV cache for `n_ctx` positions.
+    /// `with_cache` with the oracle's 4800 MiB expert cache.
     pub fn new(g: Gguf, n_ctx: usize) -> Result<Self, String> {
+        Self::with_cache(g, n_ctx, 4800)
+    }
+
+    /// Load the dense weights to GPU 0, allocate a KV cache for `n_ctx` positions and up to
+    /// `cache_mib` of expert slots (capped by free VRAM, so `usize::MAX >> 20` = all that fits),
+    /// split so each group caches the same fraction of its experts.
+    pub fn with_cache(g: Gguf, n_ctx: usize, cache_mib: usize) -> Result<Self, String> {
         let w = Weights::load(g)?;
         let ctx = CudaContext::new(0).map_err(err)?;
         let stream = ctx.default_stream();
@@ -118,6 +169,8 @@ impl GpuModel {
             mm_f32: f("mm_f32")?,
             mm_q4_k: f("mm_q4_k")?,
             mm_q6_k: f("mm_q6_k")?,
+            mm_q4_k_ids: f("mm_q4_k_ids")?,
+            mm_q6_k_ids: f("mm_q6_k_ids")?,
             rmsnorm: f("rmsnorm")?,
             qk_norm_rope: f("qk_norm_rope")?,
             attention: f("attention")?,
@@ -159,7 +212,13 @@ impl GpuModel {
                 router: mat(&l.router, upload(&l.router)?)?,
             });
             for t in [&l.gate, &l.up, &l.down] {
-                check_ty(t)?;
+                if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K) {
+                    return Err(format!("{}: {:?} experts have no CUDA kernel yet", t.name, t.ty));
+                }
+            }
+            // gate and up are read as one [gate | up] matrix of each slot.
+            if l.gate.ty != l.up.ty || l.gate.dims != l.up.dims {
+                return Err(format!("{}: gate and up experts differ in type or shape", l.gate.name));
             }
         }
         let out_norm = upload(&w.out_norm)?;
@@ -167,10 +226,26 @@ impl GpuModel {
         let dense = vram.get();
 
         let hp = &w.hp;
+        if hp.head_dim % 32 != 0 || hp.head_dim > 256 {
+            return Err(format!("head_dim {} unsupported by the attention kernel", hp.head_dim));
+        }
         let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
         let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * F)?;
-        let slot_bytes = w.layers.iter().map(|l| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>()).max().unwrap_or(0);
-        let slots = alloc(hp.n_expert * slot_bytes)?;
+        let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
+        let layout = |l: &crate::qwen3moe::Layer| (l.gate.ty, l.up.ty, l.down.ty, ebytes(l));
+        let mut layouts = vec![];
+        let group_of: Vec<usize> = w
+            .layers
+            .iter()
+            .map(|l| layouts.iter().position(|x| *x == layout(l)).unwrap_or_else(|| {
+                layouts.push(layout(l));
+                layouts.len() - 1
+            }))
+            .collect();
+        let host_bytes: usize = w.layers.iter().map(|l| ebytes(l) * hp.n_expert).sum();
+        let stage_bytes = layouts.iter().map(|l| l.3).max().unwrap_or(0);
+        let host = pin_experts(&ctx, &w, host_bytes);
+        let stage = alloc(STAGE * stage_bytes)?;
         let b = n_ctx.min(512);
         let s = Scratch {
             x: alloc(b * e * F)?,
@@ -180,18 +255,33 @@ impl GpuModel {
             o: alloc(b * e * F)?,
             rl: alloc(b * hp.n_expert * F)?,
             xg: alloc(b * kk * e * F)?,
-            gb: alloc(b * kk * hp.n_ff_exp * F)?,
-            ub: alloc(b * kk * hp.n_ff_exp * F)?,
+            gu: alloc(b * kk * 2 * hp.n_ff_exp * F)?,
+            act: alloc(b * kk * hp.n_ff_exp * F)?,
             db: alloc(b * kk * e * F)?,
             logits: alloc(b * hp.n_vocab * F)?,
-            gidx: alloc(b * kk * 4)?,
-            trow: alloc(b * kk * 4)?,
-            tw: alloc(b * kk * F)?,
+            meta: alloc(meta_bytes(b * kk))?,
         };
+        let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(b * kk), 0) }.map_err(err)?;
+        // The expert banks get what is left: the requested MiB, capped by free VRAM.
+        let (free, _) = result::mem_get_info().map_err(err)?;
+        let budget = (cache_mib << 20).min(free.saturating_sub(VRAM_RESERVE));
+        if budget < cache_mib << 20 {
+            if cache_mib != usize::MAX >> 20 { log::warn!("gpu: expert cache capped at {} MiB of free VRAM (asked {cache_mib})", budget >> 20); }
+        }
+        let frac = (budget as f64 / host_bytes as f64).min(1.0);
+        let mut groups = vec![];
+        for (gi, lay) in layouts.iter().enumerate() {
+            let n_layers = group_of.iter().filter(|&&x| x == gi).count();
+            // At least one cached ubatch's worth of distinct experts.
+            let min_slots = hp.n_expert.min(hp.n_expert_used * CACHE_MAX_BATCH);
+            let n_slots = ((frac * (n_layers * hp.n_expert) as f64) as usize).max(min_slots);
+            groups.push(Group { cache: ExpertCache::new(hp.n_layer, hp.n_expert, n_slots), bank: alloc(n_slots * lay.3)?, slot_bytes: lay.3 });
+        }
         log::info!(
-            "gpu: dense weights {} MiB, expert slots {} MiB, total {} MiB (n_ctx {n_ctx}, batch {b})",
+            "gpu: dense weights {} MiB, expert cache {} MiB ({:?} slots per group), total {} MiB (n_ctx {n_ctx}, batch {b})",
             dense >> 20,
-            (hp.n_expert * slot_bytes) >> 20,
+            groups.iter().map(|g| g.cache.n_slots() * g.slot_bytes).sum::<usize>() >> 20,
+            groups.iter().map(|g| g.cache.n_slots()).collect::<Vec<_>>(),
             vram.get() >> 20
         );
         Ok(Self {
@@ -201,8 +291,13 @@ impl GpuModel {
             out_norm,
             output,
             kv,
-            slots,
-            slot_bytes,
+            groups,
+            group_of,
+            stage,
+            stage_bytes,
+            stats: CacheStats::default(),
+            host,
+            meta_host,
             s,
             n_ctx,
             max_batch: b,
@@ -211,6 +306,31 @@ impl GpuModel {
             vram_bytes: vram.get(),
             w,
         })
+    }
+
+    /// Expert cache counters since load (cached ubatches only).
+    pub fn cache_stats(&self) -> CacheStats {
+        self.stats
+    }
+
+    /// Queue a copy of expert `ex` of layer `li` (gate | up | down) to `dst`; returns its bytes.
+    fn upload_expert(&self, li: usize, ex: usize, dst: Ptr) -> usize {
+        let parts = self.w.expert(&self.w.layers[li], ex);
+        let n: usize = parts.iter().map(|b| b.len()).sum();
+        match &self.host {
+            Some(h) => {
+                let src = &h.buf.as_slice().expect("pinned")[h.base[li] + ex * n..][..n];
+                unsafe { result::memcpy_htod_async(dst, src, self.stream.cu_stream()) }.expect("htod async");
+            }
+            None => {
+                let mut off = 0;
+                for b in parts {
+                    self.htod(dst + off as u64, b);
+                    off += b.len();
+                }
+            }
+        }
+        n
     }
 
     fn mm(&self, m: &Mat, x: Ptr, y: Ptr, ntok: usize) {
@@ -225,6 +345,18 @@ impl GpuModel {
         launch!(self, f, (gx as u32, ntok as u32, 1), block, [p, rb, k, x, y, n]);
     }
 
+    /// Grouped expert matvec: gathered row j reads the weights at wp[j] + off.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_ids(&self, ty: GgmlType, wp: Ptr, off: u64, row_bytes: usize, k: usize, x: Ptr, y: Ptr, n_rows: usize, ntok: usize) {
+        let f = match ty {
+            GgmlType::Q4_K => &self.k.mm_q4_k_ids,
+            GgmlType::Q6_K => &self.k.mm_q6_k_ids,
+            t => unreachable!("checked at load: {t:?}"),
+        };
+        let (rb, k, n) = (row_bytes as u64, k as i32, n_rows as i32);
+        launch!(self, f, (n_rows.div_ceil(4) as u32, ntok as u32, 1), 128, [wp, off, rb, k, x, y, n]);
+    }
+
     fn htod<T>(&self, dst: Ptr, src: &[T]) {
         unsafe { result::memcpy_htod_sync(dst, src) }.expect("htod");
     }
@@ -236,7 +368,12 @@ impl GpuModel {
         v
     }
 
-    fn forward_chunk(&mut self, tokens: &[u32]) -> Vec<f32> {
+    fn check_ctx(&self, n: usize) {
+        assert!(self.n_past + n <= self.n_ctx, "context overflow: {} + {n} > {}", self.n_past, self.n_ctx);
+    }
+
+    /// Run one ubatch; returns the logits of every token, or of the last only.
+    fn forward_chunk(&mut self, tokens: &[u32], all_logits: bool) -> Vec<f32> {
         let hp = &self.w.hp;
         let (e, hd, nh, nkv, ff, kk) = (hp.n_embd, hp.head_dim, hp.n_head, hp.n_head_kv, hp.n_ff_exp, hp.n_expert_used);
         let (kvd, t) = (nkv * hd, tokens.len());
@@ -268,7 +405,7 @@ impl GpuModel {
             let (qn, kn) = (l.q_norm, l.k_norm);
             launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
             launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [kd, kn, nkvi, hdi, pos0, eps, base]);
-            launch!(self, self.k.attention, (nh as u32, tn, 1), hd as u32, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
+            launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
             self.mm(&l.wo, attn, o, t);
             let n = (t * e) as i32;
             launch!(self, self.k.add_inplace, ((t * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
@@ -287,46 +424,141 @@ impl GpuModel {
             // Rows grouped by expert (ascending); per token, its k rows in expert order.
             let (mut gidx, mut segs) = (vec![], vec![]);
             let (mut trow, mut tw) = (vec![vec![]; t], vec![vec![]; t]);
-            let wl = &self.w.layers[li];
             for (ex, toks) in by_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
-                let slot = self.slots + (segs.len() * self.slot_bytes) as u64;
-                let [gb, ub, db] = self.w.expert(wl, ex);
-                self.htod(slot, gb);
-                self.htod(slot + gb.len() as u64, ub);
-                self.htod(slot + (gb.len() + ub.len()) as u64, db);
-                segs.push((slot, gb.len() as u64, (gb.len() + ub.len()) as u64, gidx.len(), toks.len()));
+                segs.push((ex, gidx.len(), toks.len()));
                 for &(ti, wgt) in toks {
                     trow[ti].push(gidx.len() as i32);
                     tw[ti].push(wgt);
                     gidx.push(ti as i32);
                 }
             }
-            self.htod(s.gidx, &gidx);
-            self.htod(s.trow, &trow.concat());
-            self.htod(s.tw, &tw.concat());
-            let (xg, gbuf, ubuf, dbuf, gi, tr, twp) = (s.xg, s.gb, s.ub, s.db, s.gidx, s.trow, s.tw);
-            launch!(self, self.k.gather_rows, (gidx.len() as u32, 1, 1), 256, [xg, h, gi, ei]);
-            let mat = |p: Ptr, ti: &TensorInfo, k: usize, n_rows: usize| Mat { p, ty: ti.ty, row_bytes: ti.row_bytes(), k, n_rows };
-            for &(slot, uo, _, r0, nr) in &segs {
-                let xin = xg + (r0 * e * F) as u64;
-                self.mm(&mat(slot, &wl.gate, e, ff), xin, gbuf + (r0 * ff * F) as u64, nr);
-                self.mm(&mat(slot + uo, &wl.up, e, ff), xin, ubuf + (r0 * ff * F) as u64, nr);
+            let r = gidx.len();
+            // wp[j]: the slot (gate | up | down) of the expert of gathered row j.
+            let mut wp = vec![0u64; r];
+            let gi = self.group_of[li];
+            let cached = t <= CACHE_MAX_BATCH;
+            if cached {
+                let ids: Vec<u32> = sel.iter().flatten().map(|&(e, _)| e as u32).collect();
+                let p = self.groups[gi].cache.plan(li, &ids, t);
+                let (bank, sb) = (self.groups[gi].bank, self.groups[gi].slot_bytes);
+                for &(ex, slot) in &p.fills {
+                    self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64) as u64;
+                }
+                self.stats.hits += p.hits as u64;
+                self.stats.misses += p.fills.len() as u64;
+                for &(ex, r0, nr) in &segs {
+                    let slot = self.groups[gi].cache.slot(li, ex).expect("planned expert resident");
+                    wp[r0..r0 + nr].fill(bank + (slot * sb) as u64);
+                }
             }
-            let n = (gidx.len() * ff) as i32;
-            launch!(self, self.k.swiglu, ((gidx.len() * ff).div_ceil(256) as u32, 1, 1), 256, [gbuf, ubuf, n]);
-            for &(slot, _, dn, r0, nr) in &segs {
-                self.mm(&mat(slot + dn, &wl.down, ff, e), gbuf + (r0 * ff * F) as u64, dbuf + (r0 * e * F) as u64, nr);
+            // One async copy of the routing. The pinned buffer is free again: the router dtoh
+            // above waited for the previous layer's copy.
+            let (o_tr, o_tw, o_wp) = meta_offsets(r);
+            {
+                let m = self.meta_host.as_mut_slice().expect("pinned");
+                let put = |m: &mut [u8], o: usize, v: [u8; 4]| m[o..o + 4].copy_from_slice(&v);
+                for (j, &v) in gidx.iter().enumerate() {
+                    put(m, 4 * j, v.to_le_bytes());
+                }
+                for (j, &v) in trow.concat().iter().enumerate() {
+                    put(m, o_tr + 4 * j, v.to_le_bytes());
+                }
+                for (j, &v) in tw.concat().iter().enumerate() {
+                    put(m, o_tw + 4 * j, v.to_le_bytes());
+                }
+                for (j, &v) in wp.iter().enumerate() {
+                    m[o_wp + 8 * j..o_wp + 8 * j + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                unsafe { result::memcpy_htod_async(s.meta, &m[..o_wp + 8 * r], self.stream.cu_stream()) }.expect("htod async");
+            }
+            let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
+            let (gi_, tr, twp, wpd) = (s.meta, s.meta + o_tr as u64, s.meta + o_tw as u64, s.meta + o_wp as u64);
+            launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gi_, ei]);
+            let wl = &self.w.layers[li];
+            let down_off = (self.w.expert(wl, 0)[0].len() * 2) as u64;
+            // Cached ubatches run all experts at once; uncached ones in waves of STAGE, the
+            // misses of each wave streamed through the staging slots.
+            for wave in segs.chunks(if cached { segs.len().max(1) } else { STAGE }) {
+                let (r0, rn) = (wave[0].1, wave.iter().map(|x| x.2).sum::<usize>());
+                if !cached {
+                    let g = &self.groups[gi];
+                    for (j, &(ex, w0, nr)) in wave.iter().enumerate() {
+                        let p = match g.cache.slot(li, ex) {
+                            Some(slot) => g.bank + (slot * g.slot_bytes) as u64,
+                            None => {
+                                let p = self.stage + (j * self.stage_bytes) as u64;
+                                self.upload_expert(li, ex, p);
+                                p
+                            }
+                        };
+                        wp[w0..w0 + nr].fill(p);
+                    }
+                    self.htod(wpd + (r0 * 8) as u64, &wp[r0..r0 + rn]);
+                }
+                let (wpw, xin) = (wpd + (r0 * 8) as u64, xg + (r0 * e * F) as u64);
+                let (guw, aw) = (gu + (r0 * 2 * ff * F) as u64, act + (r0 * ff * F) as u64);
+                self.mm_ids(wl.gate.ty, wpw, 0, wl.gate.row_bytes(), e, xin, guw, 2 * ff, rn);
+                let (ffi, rni) = (ff as i32, rn as i32);
+                launch!(self, self.k.swiglu, ((rn * ff).div_ceil(256) as u32, 1, 1), 256, [aw, guw, ffi, rni]);
+                self.mm_ids(wl.down.ty, wpw, down_off, wl.down.row_bytes(), ff, aw, dbuf + (r0 * e * F) as u64, e, rn);
             }
             let ki = kk as i32;
             launch!(self, self.k.moe_combine, (tn, 1, 1), 256, [x, dbuf, tr, twp, ki, ei]);
         }
         self.n_past += t;
 
-        let (x, h, wn) = (s.x, s.h, self.out_norm);
-        launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-        self.mm(&self.output, h, s.logits, t);
-        self.dtoh(s.logits, t * nv)
+        let (r0, nr) = if all_logits { (0, t) } else { (t - 1, 1) };
+        let (x, h, wn, nrn) = (s.x + (r0 * e * F) as u64, s.h, self.out_norm, nr as u32);
+        launch!(self, self.k.rmsnorm, (nrn, 1, 1), 256, [h, x, wn, ei, eps]);
+        self.mm(&self.output, h, s.logits, nr);
+        self.dtoh(s.logits, nr * nv)
     }
+}
+
+/// Byte offsets of trow, tw and wp in the routing buffer for r gathered rows (gidx at 0).
+fn meta_offsets(r: usize) -> (usize, usize, usize) {
+    (4 * r, 8 * r, (12 * r).next_multiple_of(8))
+}
+
+fn meta_bytes(r: usize) -> usize {
+    meta_offsets(r).2 + 8 * r
+}
+
+/// Copy every expert into pinned RAM in slot layout; None (pageable fallback) if pinning fails.
+fn pin_experts(ctx: &Arc<CudaContext>, w: &Weights, total: usize) -> Option<HostExperts> {
+    let t0 = std::time::Instant::now();
+    let mut buf = match unsafe { ctx.alloc_pinned_with_flags::<u8>(total, 0) } {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("gpu: pinning {} MiB of experts failed ({e:?}), using pageable copies", total >> 20);
+            return None;
+        }
+    };
+    let (mut base, mut off) = (vec![], 0);
+    for l in &w.layers {
+        base.push(off);
+        off += w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>() * w.hp.n_expert;
+    }
+    let dst = buf.as_mut_slice().expect("pinned");
+    let mut chunks = vec![];
+    let mut rest = &mut dst[..];
+    for l in &w.layers {
+        for ex in 0..w.hp.n_expert {
+            let parts = w.expert(l, ex);
+            let (c, r) = rest.split_at_mut(parts.iter().map(|b| b.len()).sum());
+            chunks.push((c, parts));
+            rest = r;
+        }
+    }
+    chunks.into_par_iter().for_each(|(c, parts)| {
+        let mut o = 0;
+        for b in parts {
+            c[o..o + b.len()].copy_from_slice(b);
+            o += b.len();
+        }
+    });
+    log::info!("gpu: pinned {} MiB of experts in {:.1}s", total >> 20, t0.elapsed().as_secs_f32());
+    Some(HostExperts { buf, base })
 }
 
 fn check_ty(t: &TensorInfo) -> Result<(), String> {
@@ -341,13 +573,30 @@ impl Engine for GpuModel {
         self.w.hp.n_vocab
     }
 
-    fn reset(&mut self) {
-        self.n_past = 0;
+    fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+
+    fn truncate(&mut self, n_past: usize) {
+        self.n_past = self.n_past.min(n_past);
     }
 
     /// Panics if the KV cache would overflow n_ctx.
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
-        assert!(self.n_past + tokens.len() <= self.n_ctx, "context overflow: {} + {} > {}", self.n_past, tokens.len(), self.n_ctx);
-        tokens.chunks(self.max_batch).flat_map(|c| self.forward_chunk(c)).collect()
+        self.check_ctx(tokens.len());
+        tokens.chunks(self.max_batch).flat_map(|c| self.forward_chunk(c, true)).collect()
+    }
+
+    fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.check_ctx(tokens.len());
+        let n = tokens.len().div_ceil(self.max_batch);
+        let mut last = vec![];
+        for (i, c) in tokens.chunks(self.max_batch).enumerate() {
+            last = self.forward_chunk(c, false);
+            if i + 1 < n {
+                last.clear();
+            }
+        }
+        last
     }
 }

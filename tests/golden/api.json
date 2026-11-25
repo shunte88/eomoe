@@ -1,0 +1,1949 @@
+{
+ "cases": {
+  "messages_text": {
+   "path": "/v1/messages",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What does len([1, 2]) return in Python? Reply briefly."
+     }
+    ],
+    "max_tokens": 64,
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-83iw7X0gFDpGLEd3iDm2lGOeYl5fOP5Z",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "`len([1, 2])` returns `2`.\n\nThe `len()` function returns the number of elements in a list, and the list `[1, 2]` contains 2 elements."
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "end_turn",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 0,
+      "input_tokens": 24,
+      "output_tokens": 43
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-CHLSeEBZjy3NusKtrRc1Wo6olSGf2fH3",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 23,
+         "input_tokens": 1,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "`"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "len"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "(["
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "1"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": ","
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " "
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "2"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "])"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "`"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " returns"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " `"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "2"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "`.\n\n"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "The"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " `"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "len"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "()`"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " function"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " returns"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " the"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " number"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " of"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " elements"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " in"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " a"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " list"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": ","
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " and"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " this"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " list"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " has"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " "
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "2"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " elements"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "."
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 36
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "messages_tool": {
+   "path": "/v1/messages",
+   "request": {
+    "system": [
+     {
+      "type": "text",
+      "text": "You are a coding agent. Use the tools to act."
+     },
+     {
+      "type": "text",
+      "text": "Working directory: /tmp/demo",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Bash",
+      "description": "Run a shell command and return its output.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command to run"
+        },
+        "timeout": {
+         "type": "number",
+         "description": "Timeout in ms"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     },
+     {
+      "name": "Read",
+      "description": "Read a file from the local filesystem.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "file_path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "file_path"
+       ]
+      }
+     }
+    ],
+    "max_tokens": 200,
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "List the files in the working directory."
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-7pgOoub7280CBcGN1wTO7qe8Pdk2oUiU",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "tool_use",
+       "id": "VVHWZlDeULwboXMkzSZIxan61yahNbnj",
+       "name": "Bash",
+       "input": {
+        "command": "ls -la"
+       }
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "tool_use",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 1,
+      "input_tokens": 403,
+      "output_tokens": 22
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-tKoRshGJt9CMEGovxZ1zmhMndcrt40Ab",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 403,
+         "input_tokens": 1,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "tool_use",
+        "id": "c8VvC8AeFDAbffOnUIyjH51Y3l9RKPuh",
+        "name": "Bash"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "\"command\":\""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "ls"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": " -"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "la"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "\""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "}"
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "tool_use",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 22
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "messages_tool_result": {
+   "path": "/v1/messages",
+   "request": {
+    "system": [
+     {
+      "type": "text",
+      "text": "You are a coding agent. Use the tools to act."
+     },
+     {
+      "type": "text",
+      "text": "Working directory: /tmp/demo",
+      "cache_control": {
+       "type": "ephemeral"
+      }
+     }
+    ],
+    "tools": [
+     {
+      "name": "Bash",
+      "description": "Run a shell command and return its output.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string",
+         "description": "The command to run"
+        },
+        "timeout": {
+         "type": "number",
+         "description": "Timeout in ms"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     },
+     {
+      "name": "Read",
+      "description": "Read a file from the local filesystem.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "file_path": {
+         "type": "string"
+        },
+        "limit": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "file_path"
+       ]
+      }
+     }
+    ],
+    "max_tokens": 120,
+    "messages": [
+     {
+      "role": "user",
+      "content": "List the files in the working directory."
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "text",
+        "text": "I'll list them."
+       },
+       {
+        "type": "tool_use",
+        "id": "toolu_01",
+        "name": "Bash",
+        "input": {
+         "command": "ls /tmp/demo"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "toolu_01",
+        "content": [
+         {
+          "type": "text",
+          "text": "a.py\nb.rs"
+         }
+        ]
+       },
+       {
+        "type": "text",
+        "text": "How many are there?"
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-gHt5y9mJo1wYeFG7ojrCWrvWtqXiNSQo",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "There are 2 files in the working directory."
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "end_turn",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 404,
+      "input_tokens": 59,
+      "output_tokens": 11
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-6fowdLg0QZkMzPbMOMZ3bnqhPKrggAs2",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 462,
+         "input_tokens": 1,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "There"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " are"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " "
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "2"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " files"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " in"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " the"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " working"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " directory"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "."
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 11
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "responses_text": {
+   "path": "/v1/responses",
+   "request": {
+    "input": "What does len([1, 2]) return in Python? Reply briefly.",
+    "instructions": "Be brief.",
+    "max_output_tokens": 64,
+    "store": false,
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795642629,
+     "created_at": 1795642629,
+     "id": "resp_z7OONsxMghQonEF0VMzhQdXdPUCRwPIw",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "content": [
+        {
+         "type": "output_text",
+         "annotations": [],
+         "logprobs": [],
+         "text": "2"
+        }
+       ],
+       "id": "msg_deml8eb8DBVZmwhemUtLQaz0aVGcEcv4",
+       "role": "assistant",
+       "status": "completed",
+       "type": "message"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 32,
+      "output_tokens": 2,
+      "total_tokens": 34,
+      "input_tokens_details": {
+       "cached_tokens": 3
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_JJ4P0TZZI9EYscNOOauGmOpdXOs9LGI5",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_JJ4P0TZZI9EYscNOOauGmOpdXOs9LGI5",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "content": [],
+        "id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+       }
+      }
+     },
+     {
+      "event": "response.content_part.added",
+      "data": {
+       "type": "response.content_part.added",
+       "item_id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "2"
+      }
+     },
+     {
+      "event": "response.output_text.done",
+      "data": {
+       "type": "response.output_text.done",
+       "item_id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+       "output_index": 0,
+       "content_index": 0,
+       "text": "2"
+      }
+     },
+     {
+      "event": "response.content_part.done",
+      "data": {
+       "type": "response.content_part.done",
+       "item_id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "annotations": [],
+        "logprobs": [],
+        "text": "2"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "type": "message",
+        "status": "completed",
+        "id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+        "content": [
+         {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "2"
+         }
+        ],
+        "role": "assistant"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_JJ4P0TZZI9EYscNOOauGmOpdXOs9LGI5",
+        "object": "response",
+        "created_at": 1795642629,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "type": "message",
+          "status": "completed",
+          "id": "msg_HKRLds4peUTz7hCy7nYFfdFtEehOwe75",
+          "content": [
+           {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": "2"
+           }
+          ],
+          "role": "assistant"
+         }
+        ],
+        "usage": {
+         "input_tokens": 32,
+         "output_tokens": 2,
+         "total_tokens": 34,
+         "input_tokens_details": {
+          "cached_tokens": 31
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 31,
+        "prompt_n": 1,
+        "prompt_ms": 21.637,
+        "prompt_per_token_ms": 21.637,
+        "prompt_per_second": 46.217128067661875,
+        "predicted_n": 2,
+        "predicted_ms": 17.463,
+        "predicted_per_token_ms": 17.463,
+        "predicted_per_second": 57.263929450838916
+       }
+      }
+     }
+    ]
+   }
+  },
+  "responses_tool": {
+   "path": "/v1/responses",
+   "request": {
+    "instructions": "You are a coding agent. Use the tools to act.",
+    "tools": [
+     {
+      "type": "function",
+      "name": "shell",
+      "description": "Runs a shell command and returns its output.",
+      "strict": false,
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "workdir": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "additionalProperties": false
+      }
+     }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "store": false,
+    "max_output_tokens": 200,
+    "input": [
+     {
+      "type": "message",
+      "role": "user",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "List the files in /tmp/demo."
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795642632,
+     "created_at": 1795642632,
+     "id": "resp_ihneok1y0X8yzyVdgWV5DYzBd4f6WwCF",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "id": "fc_G63eJXgq5NpM87bm0LSKa1Pcwj87X5tm",
+       "type": "function_call",
+       "status": "completed",
+       "arguments": "{\"command\":[\"ls\", \"-l\", \"/tmp/demo\"]}",
+       "call_id": "call_G63eJXgq5NpM87bm0LSKa1Pcwj87X5tm",
+       "name": "shell"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 308,
+      "output_tokens": 30,
+      "total_tokens": 338,
+      "input_tokens_details": {
+       "cached_tokens": 3
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_fXJgAWJHP2R5ALWvjLa7NkPBn9XHpvs0",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_fXJgAWJHP2R5ALWvjLa7NkPBn9XHpvs0",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+        "arguments": "",
+        "call_id": "call_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+        "name": "shell",
+        "type": "function_call",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "{",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\"command\":",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "[\"",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "ls",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\",",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": " \"-",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "l",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\",",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": " \"/",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "tmp",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "/demo",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\"]",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "}",
+       "item_id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+       "output_index": 0
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+        "type": "function_call",
+        "status": "completed",
+        "arguments": "{\"command\":[\"ls\", \"-l\", \"/tmp/demo\"]}",
+        "call_id": "call_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+        "name": "shell"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_fXJgAWJHP2R5ALWvjLa7NkPBn9XHpvs0",
+        "object": "response",
+        "created_at": 1795642632,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "id": "fc_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"command\":[\"ls\", \"-l\", \"/tmp/demo\"]}",
+          "call_id": "call_I1MjtWIUZosywmMmjxqCX6JtG4Img6Gi",
+          "name": "shell"
+         }
+        ],
+        "usage": {
+         "input_tokens": 308,
+         "output_tokens": 30,
+         "total_tokens": 338,
+         "input_tokens_details": {
+          "cached_tokens": 307
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 307,
+        "prompt_n": 1,
+        "prompt_ms": 34.661,
+        "prompt_per_token_ms": 34.661,
+        "prompt_per_second": 28.85086985372609,
+        "predicted_n": 30,
+        "predicted_ms": 846.005,
+        "predicted_per_token_ms": 29.17258620689655,
+        "predicted_per_second": 34.27875721774694
+       }
+      }
+     }
+    ]
+   }
+  },
+  "responses_tool_result": {
+   "path": "/v1/responses",
+   "request": {
+    "instructions": "You are a coding agent. Use the tools to act.",
+    "tools": [
+     {
+      "type": "function",
+      "name": "shell",
+      "description": "Runs a shell command and returns its output.",
+      "strict": false,
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "workdir": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "additionalProperties": false
+      }
+     }
+    ],
+    "store": false,
+    "max_output_tokens": 120,
+    "input": [
+     {
+      "type": "message",
+      "role": "user",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "List the files in /tmp/demo."
+       }
+      ]
+     },
+     {
+      "type": "function_call",
+      "call_id": "call_01",
+      "name": "shell",
+      "arguments": "{\"command\": [\"ls\", \"/tmp/demo\"]}"
+     },
+     {
+      "type": "function_call_output",
+      "call_id": "call_01",
+      "output": "a.py\nb.rs"
+     },
+     {
+      "type": "message",
+      "role": "user",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "How many are there?"
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795642633,
+     "created_at": 1795642633,
+     "id": "resp_RhI931LwMUebaMA4m5azSVH338FJV66f",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "content": [
+        {
+         "type": "output_text",
+         "annotations": [],
+         "logprobs": [],
+         "text": "There are 2 files in /tmp/demo."
+        }
+       ],
+       "id": "msg_zfZBwiUG2HKWtxZaBftX8fb2cmK7o267",
+       "role": "assistant",
+       "status": "completed",
+       "type": "message"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 364,
+      "output_tokens": 11,
+      "total_tokens": 375,
+      "input_tokens_details": {
+       "cached_tokens": 320
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_Gh7vuquG6i3QWuaQ9GJ9H0loE0XLxu8U",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_Gh7vuquG6i3QWuaQ9GJ9H0loE0XLxu8U",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "content": [],
+        "id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+       }
+      }
+     },
+     {
+      "event": "response.content_part.added",
+      "data": {
+       "type": "response.content_part.added",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "There"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " are"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " "
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "2"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " files"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " in"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " /"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "tmp"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "/demo"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "."
+      }
+     },
+     {
+      "event": "response.output_text.done",
+      "data": {
+       "type": "response.output_text.done",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "text": "There are 2 files in /tmp/demo."
+      }
+     },
+     {
+      "event": "response.content_part.done",
+      "data": {
+       "type": "response.content_part.done",
+       "item_id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "annotations": [],
+        "logprobs": [],
+        "text": "There are 2 files in /tmp/demo."
+       }
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "type": "message",
+        "status": "completed",
+        "id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+        "content": [
+         {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "There are 2 files in /tmp/demo."
+         }
+        ],
+        "role": "assistant"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_Gh7vuquG6i3QWuaQ9GJ9H0loE0XLxu8U",
+        "object": "response",
+        "created_at": 1795642634,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "type": "message",
+          "status": "completed",
+          "id": "msg_b42xphoAHtg7w6lH3rBzVf4FX4AiNXTK",
+          "content": [
+           {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": "There are 2 files in /tmp/demo."
+           }
+          ],
+          "role": "assistant"
+         }
+        ],
+        "usage": {
+         "input_tokens": 364,
+         "output_tokens": 11,
+         "total_tokens": 375,
+         "input_tokens_details": {
+          "cached_tokens": 363
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 363,
+        "prompt_n": 1,
+        "prompt_ms": 26.815,
+        "prompt_per_token_ms": 26.815,
+        "prompt_per_second": 37.292560134253215,
+        "predicted_n": 11,
+        "predicted_ms": 301.073,
+        "predicted_per_token_ms": 30.1073,
+        "predicted_per_second": 33.214536009539216
+       }
+      }
+     }
+    ]
+   }
+  }
+ },
+ "count_tokens": {
+  "status": 200,
+  "body": {
+   "input_tokens": 404
+  }
+ },
+ "models": {
+  "status": 200,
+  "body": {
+   "models": [
+    {
+     "name": "local-code",
+     "model": "local-code",
+     "modified_at": "",
+     "size": "",
+     "digest": "",
+     "type": "model",
+     "description": "",
+     "tags": [
+      ""
+     ],
+     "capabilities": [
+      "completion"
+     ],
+     "parameters": "",
+     "details": {
+      "parent_model": "",
+      "format": "gguf",
+      "family": "",
+      "families": [
+       ""
+      ],
+      "parameter_size": "",
+      "quantization_level": ""
+     }
+    }
+   ],
+   "object": "list",
+   "data": [
+    {
+     "id": "local-code",
+     "aliases": [
+      "local-code"
+     ],
+     "tags": [],
+     "object": "model",
+     "architecture": {
+      "input_modalities": [
+       "text"
+      ],
+      "output_modalities": [
+       "text"
+      ]
+     },
+     "created": 1795642634,
+     "owned_by": "llamacpp",
+     "meta": {
+      "vocab_type": 2,
+      "n_vocab": 151936,
+      "n_ctx": 16384,
+      "n_ctx_train": 262144,
+      "n_embd": 2048,
+      "n_params": 30532122624,
+      "size": 18550716416,
+      "ftype": "Q4_K - Medium"
+     }
+    }
+   ]
+  }
+ },
+ "health": {
+  "status": 200,
+  "body": {
+   "status": "ok"
+  }
+ }
+}

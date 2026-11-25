@@ -9,6 +9,8 @@ ENV PATH=/root/.cargo/bin:$PATH \
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY kernels/ kernels/
 COPY src/ src/
 COPY config.example.yaml ./
 RUN cargo build --release
@@ -26,7 +28,7 @@ RUN mkdir -p /app/config /app/models
 ENV EOMOE_CONFIG_PATH=/app/config/config.yaml
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["./eomoe", "serve"]
+CMD ["./eomoe", "serve", "--host", "0.0.0.0"]

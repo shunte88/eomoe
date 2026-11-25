@@ -42,12 +42,17 @@ impl Engine for CpuModel {
         self.w.hp.n_vocab
     }
 
-    fn reset(&mut self) {
+    fn n_ctx(&self) -> usize {
+        usize::MAX
+    }
+
+    fn truncate(&mut self, n_past: usize) {
+        let kvd = self.w.hp.n_head_kv * self.w.hp.head_dim;
         for (k, v) in &mut self.kv {
-            k.clear();
-            v.clear();
+            k.truncate(n_past * kvd);
+            v.truncate(n_past * kvd);
         }
-        self.n_past = 0;
+        self.n_past = self.n_past.min(n_past);
     }
 
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {

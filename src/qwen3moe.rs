@@ -6,8 +6,19 @@ use crate::gguf::{Gguf, TensorInfo};
 /// A forward-pass engine: run tokens at positions n_past.. and return T x n_vocab logits.
 pub trait Engine {
     fn n_vocab(&self) -> usize;
-    fn reset(&mut self);
+    /// Positions the KV cache can hold.
+    fn n_ctx(&self) -> usize;
+    /// Keep the first `n_past` positions of the KV cache, drop the rest.
+    fn truncate(&mut self, n_past: usize);
+    fn reset(&mut self) {
+        self.truncate(0)
+    }
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32>;
+    /// Logits of the last token only: prefill without T x n_vocab logits.
+    fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let (l, nv) = (self.forward(tokens), self.n_vocab());
+        l[l.len() - nv..].to_vec()
+    }
 }
 
 pub struct Hparams {

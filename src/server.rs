@@ -1,121 +1,778 @@
-//! HTTP server for eomoe with REST API endpoints
+//! HTTP API, wire-compatible with llama-server for the endpoints Claude Code and Codex use:
+//! POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses), /v1/messages/count_tokens;
+//! GET /v1/models, /health. Event sequences and JSON shapes follow llama-server
+//! (tools/server/server-task.cpp); tests/golden/api.json holds captured oracle traffic.
+//!
+//! Both APIs are converted to OpenAI chat messages, rendered with the GGUF chat template and run
+//! on one model thread, which owns the engine (CUDA work stays on the thread that created it).
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use crate::generate::{Finish, Generator, Sampling, Utf8Stream};
+use crate::qwen3moe::Engine;
+use crate::template::ChatTemplate;
+use crate::tokenizer::Tokenizer;
+use crate::toolcall::{Splitter, ToolCall};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use tokio::sync::mpsc as tmpsc;
 
-use crate::model::MoEModel;
-
-/// Server state containing model
-#[derive(Debug, Clone)]
-pub struct ServerState {
-    pub model: Arc<Mutex<MoEModel>>,
+/// A generation request for the model thread.
+struct Job {
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    sampling: Sampling,
+    tx: tmpsc::UnboundedSender<Gen>,
 }
 
-/// API error response
-#[derive(Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
+enum Gen {
+    Started { n_cached: usize },
+    Token(u32),
+    Done(Finish),
 }
 
-/// Model inference request
-#[derive(Deserialize)]
-pub struct InferenceRequest {
-    pub prompt: String,
-    pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
+pub struct App {
+    tok: Tokenizer,
+    tpl: ChatTemplate,
+    jobs: mpsc::Sender<Job>,
+    alias: String,
+    n_ctx: usize,
 }
 
-/// Model inference response
-#[derive(Serialize)]
-pub struct InferenceResponse {
-    pub text: String,
-    pub tokens: Vec<String>,
-    pub usage: UsageStats,
+impl App {
+    /// Start the model thread; `load` builds the engine on it.
+    pub fn new<E: Engine + 'static>(
+        tok: Tokenizer,
+        tpl: ChatTemplate,
+        alias: String,
+        load: impl FnOnce() -> Result<E, String> + Send + 'static,
+    ) -> Result<Arc<Self>, String> {
+        // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
+        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"].iter().filter_map(|t| tok.token_id(t)).collect();
+        eog.push(tok.eos);
+        let (jobs, rx) = mpsc::channel::<Job>();
+        let (ready_tx, ready) = mpsc::channel();
+        let eog_t = eog;
+        std::thread::Builder::new()
+            .name("eomoe-model".into())
+            .spawn(move || {
+                let mut g = match load() {
+                    Ok(e) => {
+                        ready_tx.send(Ok(e.n_ctx())).ok();
+                        Generator::new(e)
+                    }
+                    Err(e) => return drop(ready_tx.send(Err(e))),
+                };
+                for job in rx {
+                    model_job(&mut g, job, &eog_t);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let n_ctx = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx }))
+    }
 }
 
-/// Usage statistics
-#[derive(Serialize)]
-pub struct UsageStats {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
+// ponytail: one model thread runs jobs in arrival order (llama-server --parallel 1); the queue is
+// unbounded. Continuous batching across requests is Phase 6.
+fn model_job<E: Engine>(g: &mut Generator<E>, job: Job, eog: &[u32]) {
+    let tx = job.tx;
+    let n_cached = g.reusable(&job.prompt);
+    if tx.send(Gen::Started { n_cached }).is_err() {
+        return;
+    }
+    let (t0, mut t1, mut n) = (std::time::Instant::now(), None, 0usize);
+    let r = g.generate(&job.prompt, job.max_tokens, &job.sampling, |t| eog.contains(&t), |t| {
+        t1.get_or_insert_with(std::time::Instant::now);
+        n += 1;
+        tx.send(Gen::Token(t)).is_ok()
+    });
+    // A request that panics the engine kills this thread; its stream reports an error and later
+    // requests get "model thread stopped".
+    let t1 = t1.unwrap_or_else(std::time::Instant::now);
+    let (pre, dec) = (t1 - t0, t1.elapsed());
+    let n_new = job.prompt.len() - n_cached;
+    log::info!(
+        "prompt {} tok ({} cached), prefill {:.1}s ({:.0} tok/s), {} out ({:.1} tok/s), {:?}",
+        job.prompt.len(), n_cached, pre.as_secs_f32(), n_new as f32 / pre.as_secs_f32(), n,
+        n.saturating_sub(1) as f32 / dec.as_secs_f32().max(1e-6), r.as_ref().map(|x| x.0)
+    );
+    if let Ok((finish, _)) = r {
+        tx.send(Gen::Done(finish)).ok();
+    }
 }
 
-/// Health check endpoint
-pub async fn health_check() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "healthy" }))
+/// One chat request in the internal (OpenAI chat) form.
+struct Chat {
+    messages: Value,
+    tools: Value,
+    max_tokens: usize,
+    sampling: Sampling,
+    stop: Vec<String>,
 }
 
-/// Model info endpoint
-pub async fn model_info(State(state): State<ServerState>) -> impl IntoResponse {
-    // Get model info from the model state
-    let model = state.model.lock().await;
-    Json(serde_json::json!({
-        "model": "MoE LLM",
-        "status": "ready",
-        "expert_count": model.expert_count(),
-        "config": model.config()
+/// What a request's stream carries to the API formatter.
+enum Out {
+    Start { n_prompt: usize, n_cached: usize },
+    Text(String),
+    End { calls: Vec<ToolCall>, finish: Finish, n_out: usize, stop_word: Option<String> },
+    /// Generation failed after the response started.
+    Error(Value),
+}
+
+#[derive(Debug)]
+struct ApiError(StatusCode, Value);
+
+impl ApiError {
+    fn new(code: StatusCode, ty: &str, msg: impl Into<String>) -> Self {
+        Self(code, json!({"code": code.as_u16(), "message": msg.into(), "type": ty}))
+    }
+    fn bad(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+fn rand_id() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let mut x = t ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    const A: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    (0..32)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            A[(x % 62) as usize] as char
+        })
+        .collect()
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Content-part arrays become one string (parts joined by "\n", as llama.cpp does for
+/// string-only templates); non-text parts are dropped.
+fn flatten_content(messages: &mut Value) {
+    for m in messages.as_array_mut().into_iter().flatten() {
+        if let Some(parts) = m.get("content").and_then(Value::as_array) {
+            let text: Vec<&str> = parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+            m["content"] = text.join("\n").into();
+        }
+    }
+}
+
+impl App {
+    fn prompt(&self, chat: &Chat) -> Result<Vec<u32>, ApiError> {
+        let mut messages = chat.messages.clone();
+        flatten_content(&mut messages);
+        let mut req = json!({ "messages": messages, "add_generation_prompt": true });
+        if chat.tools.as_array().is_some_and(|t| !t.is_empty()) {
+            req["tools"] = chat.tools.clone();
+        }
+        let text = self.tpl.render(&req).map_err(|e| ApiError::bad(format!("chat template: {e}")))?;
+        Ok(self.tok.encode(&text, true))
+    }
+
+    /// Queue `chat` on the model thread; the receiver yields Start, Text..., End.
+    fn run(self: &Arc<Self>, chat: Chat) -> Result<tmpsc::UnboundedReceiver<Out>, ApiError> {
+        let prompt = self.prompt(&chat)?;
+        if prompt.len() >= self.n_ctx {
+            let mut e = ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "exceed_context_size_error",
+                format!("request ({} tokens) exceeds the available context size ({} tokens), try increasing it", prompt.len(), self.n_ctx),
+            );
+            e.1["n_prompt_tokens"] = prompt.len().into();
+            e.1["n_ctx"] = self.n_ctx.into();
+            return Err(e);
+        }
+        let (gtx, mut grx) = tmpsc::unbounded_channel();
+        let (otx, orx) = tmpsc::unbounded_channel();
+        let n_prompt = prompt.len();
+        let job = Job { prompt, max_tokens: chat.max_tokens, sampling: chat.sampling, tx: gtx };
+        self.jobs.send(job).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
+        let app = self.clone();
+        let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
+        tokio::spawn(async move {
+            let (mut utf8, mut split, mut n_out) = (Utf8Stream::default(), Splitter::new(has_tools), 0);
+            let mut stops = StopMatcher::new(chat.stop);
+            let mut finish = None;
+            while let Some(g) = grx.recv().await {
+                match g {
+                    Gen::Started { n_cached } => drop(otx.send(Out::Start { n_prompt, n_cached })),
+                    Gen::Token(t) => {
+                        if otx.is_closed() {
+                            return; // client gone: dropping grx stops the model
+                        }
+                        n_out += 1;
+                        let (text, hit) = stops.push(&utf8.push(&app.tok.decode_bytes(&[t])));
+                        let text = split.push(&text);
+                        if !text.is_empty() {
+                            otx.send(Out::Text(text)).ok();
+                        }
+                        if hit {
+                            finish = Some(Finish::Stop);
+                            break;
+                        }
+                    }
+                    Gen::Done(f) => finish = Some(f),
+                }
+            }
+            let Some(finish) = finish else {
+                let e = ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "generation failed (see server log)");
+                otx.send(Out::Error(e.1)).ok();
+                return;
+            };
+            let (rest, calls) = split.finish(&chat.tools);
+            let tail = stops.flush();
+            let text = rest + &if calls.is_empty() { tail } else { String::new() };
+            if !text.is_empty() {
+                otx.send(Out::Text(text)).ok();
+            }
+            otx.send(Out::End { calls, finish, n_out, stop_word: stops.hit }).ok();
+        });
+        Ok(orx)
+    }
+}
+
+/// Cuts generated text at the first stop string, holding back partial matches.
+struct StopMatcher {
+    stops: Vec<String>,
+    held: String,
+    hit: Option<String>,
+}
+
+impl StopMatcher {
+    fn new(stops: Vec<String>) -> Self {
+        Self { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), held: String::new(), hit: None }
+    }
+
+    /// (text safe to emit, whether a stop string was found).
+    fn push(&mut self, delta: &str) -> (String, bool) {
+        self.held.push_str(delta);
+        if let Some((p, s)) = self.stops.iter().filter_map(|s| self.held.find(s.as_str()).map(|p| (p, s))).min_by_key(|x| x.0) {
+            self.hit = Some(s.clone());
+            let out = self.held[..p].to_owned();
+            self.held.clear();
+            return (out, true);
+        }
+        let held = &self.held;
+        let keep = self.stops.iter().flat_map(|s| (1..s.len()).filter(move |&n| s.is_char_boundary(n) && held.ends_with(&s[..n]))).max().unwrap_or(0);
+        let cut = self.held.len() - keep;
+        let out = self.held[..cut].to_owned();
+        self.held.drain(..cut);
+        (out, false)
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+fn sampling(body: &Value) -> Sampling {
+    let d = Sampling::default();
+    let f = |k: &str, v: f32| body[k].as_f64().map_or(v, |x| x as f32);
+    Sampling {
+        temperature: f("temperature", d.temperature).max(0.0),
+        top_p: f("top_p", d.top_p).clamp(0.0, 1.0),
+        min_p: f("min_p", d.min_p).clamp(0.0, 1.0),
+        top_k: body["top_k"].as_u64().map_or(d.top_k, |k| k as usize),
+        seed: body["seed"].as_u64().unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 | 1),
+    }
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Anthropic Messages -> chat (llama.cpp server-chat.cpp convert_anthropic_to_oai).
+fn anthropic_to_chat(b: &Value) -> Result<Chat, ApiError> {
+    let mut msgs = vec![];
+    if !b["system"].is_null() {
+        msgs.push(json!({"role": "system", "content": text_of(&b["system"])}));
+    }
+    for m in b["messages"].as_array().ok_or_else(|| ApiError::bad("'messages' is required"))? {
+        let role = m["role"].as_str().unwrap_or("user");
+        let Some(blocks) = m["content"].as_array() else {
+            if !m["content"].is_null() || role != "assistant" {
+                msgs.push(m.clone());
+            }
+            continue;
+        };
+        let (mut parts, mut calls, mut tools) = (vec![], vec![], vec![]);
+        for bl in blocks {
+            match bl["type"].as_str() {
+                Some("text") => parts.push(json!({"type": "text", "text": bl["text"]})),
+                Some("tool_use") => calls.push(json!({"id": bl["id"], "type": "function", "function": {"name": bl["name"], "arguments": bl["input"].to_string()}})),
+                Some("tool_result") => tools.push(json!({"role": "tool", "tool_call_id": bl["tool_use_id"], "content": text_of(&bl["content"])})),
+                _ => {}
+            }
+        }
+        if !parts.is_empty() || !calls.is_empty() {
+            let mut msg = json!({"role": role, "content": if parts.is_empty() { json!("") } else { json!(parts) }});
+            if !calls.is_empty() {
+                msg["tool_calls"] = calls.into();
+            }
+            msgs.push(msg);
+        }
+        msgs.extend(tools);
+    }
+    let tools: Vec<Value> = b["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["name"].is_string())
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"].as_str().unwrap_or(""), "parameters": if t["input_schema"].is_null() { json!({}) } else { t["input_schema"].clone() }}}))
+        .collect();
+    Ok(Chat {
+        messages: msgs.into(),
+        tools: tools.into(),
+        max_tokens: b["max_tokens"].as_u64().unwrap_or(4096) as usize,
+        sampling: sampling(b),
+        stop: b["stop_sequences"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+    })
+}
+
+/// OpenAI Responses -> chat (llama.cpp server-chat.cpp convert_responses_to_chatcmpl).
+fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
+    if b["input"].is_null() {
+        return Err(ApiError::bad("'input' is required"));
+    }
+    if b["previous_response_id"].as_str().is_some_and(|s| !s.is_empty()) {
+        return Err(ApiError::bad("eomoe does not support 'previous_response_id'."));
+    }
+    let mut msgs: Vec<Value> = vec![];
+    if let Some(i) = b["instructions"].as_str() {
+        msgs.push(json!({"role": "system", "content": i}));
+    }
+    match &b["input"] {
+        Value::String(s) => msgs.push(json!({"role": "user", "content": s})),
+        Value::Array(items) => {
+            for it in items {
+                let merge = msgs.last().is_some_and(|m| m["role"] == "assistant");
+                let content = match &it["content"] {
+                    Value::String(s) => json!([{"type": "input_text", "text": s}]),
+                    c => c.clone(),
+                };
+                let parts = |c: &Value| -> Vec<Value> {
+                    c.as_array().into_iter().flatten().filter_map(|p| p["text"].as_str()).map(|t| json!({"type": "text", "text": t})).collect()
+                };
+                let role = it["role"].as_str().unwrap_or("");
+                let ty = it["type"].as_str().unwrap_or("");
+                if matches!(role, "user" | "system" | "developer") && content.is_array() {
+                    msgs.push(json!({"role": role, "content": parts(&content)}));
+                } else if role == "assistant" && ty == "message" {
+                    if merge {
+                        let last = msgs.last_mut().unwrap();
+                        let mut c = last["content"].as_array().cloned().unwrap_or_default();
+                        c.extend(parts(&content));
+                        last["content"] = c.into();
+                    } else {
+                        msgs.push(json!({"role": "assistant", "content": parts(&content)}));
+                    }
+                } else if ty == "function_call" {
+                    let tc = json!({"id": it["call_id"], "type": "function", "function": {"name": it["name"], "arguments": it["arguments"]}});
+                    if merge {
+                        let last = msgs.last_mut().unwrap();
+                        let mut c = last["tool_calls"].as_array().cloned().unwrap_or_default();
+                        c.push(tc);
+                        last["tool_calls"] = c.into();
+                    } else {
+                        msgs.push(json!({"role": "assistant", "tool_calls": [tc]}));
+                    }
+                } else if ty == "function_call_output" {
+                    msgs.push(json!({"role": "tool", "tool_call_id": it["call_id"], "content": text_of_output(&it["output"])}));
+                } else if ty == "reasoning" {
+                    // No reasoning in Qwen3-Coder's template.
+                } else {
+                    return Err(ApiError::bad("Cannot determine type of 'item'"));
+                }
+            }
+        }
+        _ => return Err(ApiError::bad("'input' must be a string or an array")),
+    }
+    let tools: Vec<Value> = b["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["type"] == "function")
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"], "strict": t.get("strict").cloned().unwrap_or(json!(true))}}))
+        .collect();
+    Ok(Chat {
+        messages: msgs.into(),
+        tools: tools.into(),
+        // No limit by default, as llama-server: generation stops at EOG or a full context.
+        max_tokens: b["max_output_tokens"].as_u64().map_or(usize::MAX, |n| n as usize),
+        sampling: sampling(b),
+        stop: vec![],
+    })
+}
+
+fn text_of_output(v: &Value) -> Value {
+    match v {
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<String>().into(),
+        v => v.clone(),
+    }
+}
+
+/// One SSE event: `event: <type>` + data, as llama-server writes them.
+fn sse(data: Value) -> String {
+    format!("event: {}\ndata: {data}\n\n", data["type"].as_str().unwrap_or(""))
+}
+
+/// Formats a request's `Out` stream for one API, both streamed and as the final body.
+trait Format: Send + 'static {
+    fn on(&mut self, out: &Out) -> Vec<String>;
+    fn body(&self) -> Value;
+}
+
+#[derive(Default)]
+struct Acc {
+    text: String,
+    calls: Vec<(String, ToolCall)>,
+    n_prompt: usize,
+    n_cached: usize,
+    n_out: usize,
+    finish: Option<Finish>,
+    stop_word: Option<String>,
+}
+
+impl Acc {
+    fn on(&mut self, out: &Out) {
+        match out {
+            Out::Start { n_prompt, n_cached } => (self.n_prompt, self.n_cached) = (*n_prompt, *n_cached),
+            Out::Text(t) => self.text += t,
+            Out::End { calls, finish, n_out, stop_word } => {
+                self.calls = calls.iter().map(|c| (rand_id(), c.clone())).collect();
+                (self.finish, self.n_out, self.stop_word) = (Some(*finish), *n_out, stop_word.clone());
+            }
+            Out::Error(_) => {}
+        }
+    }
+}
+
+struct Anthropic {
+    id: String,
+    model: String,
+    a: Acc,
+    text_open: bool,
+}
+
+impl Anthropic {
+    fn stop_reason(&self) -> &'static str {
+        match self.a.finish {
+            Some(Finish::Length) => "max_tokens",
+            _ if !self.a.calls.is_empty() => "tool_use",
+            _ => "end_turn",
+        }
+    }
+    fn usage(&self) -> Value {
+        json!({"cache_read_input_tokens": self.a.n_cached, "input_tokens": self.a.n_prompt - self.a.n_cached, "output_tokens": self.a.n_out})
+    }
+}
+
+impl Format for Anthropic {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        match out {
+            Out::Start { .. } => {
+                let mut u = self.usage();
+                u["output_tokens"] = 0.into();
+                vec![sse(json!({"type": "message_start", "message": {"id": self.id, "type": "message", "role": "assistant", "content": [], "model": self.model, "stop_reason": null, "stop_sequence": null, "usage": u}}))]
+            }
+            Out::Text(t) => {
+                let mut v = vec![];
+                if !self.text_open {
+                    self.text_open = true;
+                    v.push(sse(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
+                }
+                v.push(sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}})));
+                v
+            }
+            Out::End { .. } => {
+                let base = self.text_open as usize;
+                let mut v = vec![];
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    v.push(sse(json!({"type": "content_block_start", "index": base + k, "content_block": {"type": "tool_use", "id": id, "name": c.name}})));
+                    v.push(sse(json!({"type": "content_block_delta", "index": base + k, "delta": {"type": "input_json_delta", "partial_json": c.arguments}})));
+                }
+                for i in 0..base + self.a.calls.len() {
+                    v.push(sse(json!({"type": "content_block_stop", "index": i})));
+                }
+                v.push(sse(json!({"type": "message_delta", "delta": {"stop_reason": self.stop_reason(), "stop_sequence": self.a.stop_word}, "usage": {"output_tokens": self.a.n_out}})));
+                v.push(sse(json!({"type": "message_stop"})));
+                v
+            }
+            Out::Error(e) => vec![format!("event: error\ndata: {e}\n\n")],
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut content = vec![];
+        if !self.a.text.is_empty() {
+            content.push(json!({"type": "text", "text": self.a.text}));
+        }
+        for (id, c) in &self.a.calls {
+            let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+            content.push(json!({"type": "tool_use", "id": id, "name": c.name, "input": input}));
+        }
+        json!({"id": self.id, "type": "message", "role": "assistant", "content": content, "model": self.model, "stop_reason": self.stop_reason(), "stop_sequence": self.a.stop_word, "usage": self.usage()})
+    }
+}
+
+struct Responses {
+    id: String,
+    msg_id: String,
+    model: String,
+    created: u64,
+    a: Acc,
+    text_open: bool,
+}
+
+impl Responses {
+    fn msg_item(&self) -> Value {
+        json!({"type": "message", "status": "completed", "id": self.msg_id, "content": [self.part()], "role": "assistant"})
+    }
+    fn part(&self) -> Value {
+        json!({"type": "output_text", "annotations": [], "logprobs": [], "text": self.a.text})
+    }
+    fn fc_item(id: &str, c: &ToolCall) -> Value {
+        json!({"id": format!("fc_{id}"), "type": "function_call", "status": "completed", "arguments": c.arguments, "call_id": format!("call_{id}"), "name": c.name})
+    }
+    fn output(&self) -> Vec<Value> {
+        let mut o = vec![];
+        if self.text_open {
+            o.push(self.msg_item());
+        }
+        o.extend(self.a.calls.iter().map(|(id, c)| Self::fc_item(id, c)));
+        o
+    }
+    fn usage(&self) -> Value {
+        json!({"input_tokens": self.a.n_prompt, "output_tokens": self.a.n_out, "total_tokens": self.a.n_prompt + self.a.n_out, "input_tokens_details": {"cached_tokens": self.a.n_cached}})
+    }
+}
+
+impl Format for Responses {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        let ix = |s: &Self| json!({"item_id": s.msg_id, "output_index": 0, "content_index": 0});
+        let with = |mut base: Value, ty: &str, extra: Value| {
+            base["type"] = ty.into();
+            for (k, v) in extra.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            sse(base)
+        };
+        match out {
+            Out::Start { .. } => {
+                let r = json!({"id": self.id, "object": "response", "status": "in_progress"});
+                vec![sse(json!({"type": "response.created", "response": r})), sse(json!({"type": "response.in_progress", "response": r}))]
+            }
+            Out::Text(t) => {
+                let mut v = vec![];
+                if !self.text_open {
+                    self.text_open = true;
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": 0, "item": {"content": [], "id": self.msg_id, "role": "assistant", "status": "in_progress", "type": "message"}})));
+                    v.push(with(ix(self), "response.content_part.added", json!({"part": {"type": "output_text", "text": ""}})));
+                }
+                v.push(with(ix(self), "response.output_text.delta", json!({"delta": t})));
+                v
+            }
+            Out::End { .. } => {
+                let base = self.text_open as usize;
+                let mut v = vec![];
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    let fc = format!("fc_{id}");
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": base + k, "item": {"id": fc, "arguments": "", "call_id": format!("call_{id}"), "name": c.name, "type": "function_call", "status": "in_progress"}})));
+                    v.push(sse(json!({"type": "response.function_call_arguments.delta", "delta": c.arguments, "item_id": fc, "output_index": base + k})));
+                }
+                if self.text_open {
+                    v.push(with(ix(self), "response.output_text.done", json!({"text": self.a.text})));
+                    v.push(with(ix(self), "response.content_part.done", json!({"part": self.part()})));
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": 0, "item": self.msg_item()})));
+                }
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": base + k, "item": Self::fc_item(id, c)})));
+                }
+                v.push(sse(json!({"type": "response.completed", "response": {"id": self.id, "object": "response", "created_at": self.created, "status": "completed", "model": self.model, "output": self.output(), "usage": self.usage()}})));
+                v
+            }
+            Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
+        }
+    }
+
+    fn body(&self) -> Value {
+        json!({"completed_at": now(), "created_at": self.created, "id": self.id, "model": self.model, "object": "response", "output": self.output(), "status": "completed", "usage": self.usage()})
+    }
+}
+
+/// Stream the formatted events, or collect them into the final JSON body.
+async fn respond(rx: Result<tmpsc::UnboundedReceiver<Out>, ApiError>, mut f: impl Format, stream: bool) -> Response {
+    let mut rx = match rx {
+        Ok(rx) => rx,
+        Err(e) => return e.into_response(),
+    };
+    if !stream {
+        while let Some(o) = rx.recv().await {
+            if let Out::Error(e) = o {
+                return ApiError(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            }
+            f.on(&o);
+        }
+        return Json(f.body()).into_response();
+    }
+    let (tx, srx) = tmpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(o) = rx.recv().await {
+            for e in f.on(&o) {
+                if tx.send(e).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // llama-server sends an SSE comment after 30 s without data, so a long prefill does not trip
+    // client idle timeouts.
+    let body = futures_util::stream::unfold(srx, |mut r| async move {
+        let s = match tokio::time::timeout(std::time::Duration::from_secs(30), r.recv()).await {
+            Ok(s) => s?,
+            Err(_) => ":\n\n".to_owned(),
+        };
+        Some((Ok::<_, std::convert::Infallible>(s), r))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .unwrap()
+}
+
+/// The request JSON; a malformed body gets llama-server's error shape, not axum's plain text.
+fn parse(body: &[u8]) -> Result<Value, ApiError> {
+    serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON body: {e}")))
+}
+
+async fn messages(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let f = Anthropic { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), a: Acc::default(), text_open: false };
+    let rx = anthropic_to_chat(&b).and_then(|c| app.run(c));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
+async fn responses(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let f = Responses { id: format!("resp_{}", rand_id()), msg_id: format!("msg_{}", rand_id()), model: app.alias.clone(), created: now(), a: Acc::default(), text_open: false };
+    let rx = responses_to_chat(&b).and_then(|c| app.run(c));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
+async fn count_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    match parse(&body).and_then(|b| anthropic_to_chat(&b)).and_then(|c| app.prompt(&c)) {
+        Ok(p) => Json(json!({"input_tokens": p.len()})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn input_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    match parse(&body).and_then(|b| responses_to_chat(&b)).and_then(|c| app.prompt(&c)) {
+        Ok(p) => Json(json!({"input_tokens": p.len(), "object": "response.input_tokens"})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn models(State(app): State<Arc<App>>) -> Json<Value> {
+    let n = &app.alias;
+    Json(json!({
+        "models": [{"name": n, "model": n, "modified_at": "", "size": "", "digest": "", "type": "model", "description": "", "tags": [""], "capabilities": ["completion"], "parameters": "",
+                    "details": {"parent_model": "", "format": "gguf", "family": "", "families": [""], "parameter_size": "", "quantization_level": ""}}],
+        "object": "list",
+        "data": [{"id": n, "aliases": [n], "tags": [], "object": "model", "created": now(), "owned_by": "eomoe", "meta": {"n_vocab": app.tok.n_vocab(), "n_ctx": app.n_ctx}}],
     }))
 }
 
-/// Inference endpoint
-pub async fn inference(
-    State(state): State<ServerState>,
-    Json(request): Json<InferenceRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // In a real implementation, this would:
-    // - Process the prompt using the MoE model
-    // - Route to appropriate experts
-    // - Handle GPU memory management
-    // - Return the generated text
-
-    // For now, return a mock response with proper structure
-    let response = InferenceResponse {
-        text: format!("Mock response to: {}", request.prompt),
-        tokens: vec!["token1".to_string(), "token2".to_string(), "token3".to_string()],
-        usage: UsageStats {
-            prompt_tokens: request.prompt.chars().count(),
-            completion_tokens: 3,
-            total_tokens: request.prompt.chars().count() + 3,
-        }
-    };
-
-    Ok(Json(response))
+pub fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/v1/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/v1/models", get(models))
+        .route("/models", get(models))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/responses", post(responses))
+        .route("/responses", post(responses))
+        .route("/v1/responses/input_tokens", post(input_tokens))
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
+        .with_state(app)
 }
 
-/// Start the HTTP server
-pub async fn start_server(
-    model: Arc<Mutex<MoEModel>>,
-    host: &str,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Create server state
-    let state = ServerState {
-        model,
-    };
+pub async fn serve(app: Arc<App>, host: &str, port: u16) -> Result<(), String> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await.map_err(|e| format!("{host}:{port}: {e}"))?;
+    log::info!("listening on http://{}", listener.local_addr().map_err(|e| e.to_string())?);
+    axum::serve(listener, router(app)).await.map_err(|e| e.to_string())
+}
 
-    // Define routes
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route("/info", get(model_info))
-        .route("/inference", post(inference))
-        .with_state(state);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Bind to the specified port
-    let listener = TcpListener::bind((host, port)).await?;
-    log::info!("listening on {}", listener.local_addr()?);
+    #[test]
+    fn stop_matcher_cuts_at_stop_and_holds_partials() {
+        let mut m = StopMatcher::new(vec!["END".into(), "".into()]);
+        assert_eq!(m.push("abc E"), ("abc ".into(), false));
+        assert_eq!(m.push("Nx"), ("ENx".into(), false)); // partial match released
+        assert_eq!(m.push("yy EN"), ("yy ".into(), false));
+        assert_eq!(m.push("D tail"), ("".into(), true));
+        assert_eq!(m.hit.as_deref(), Some("END"));
+        let mut m = StopMatcher::new(vec![]);
+        assert_eq!(m.push("é"), ("é".into(), false));
+    }
 
-    // Start the server
-    axum::serve(listener, app).await?;
+    #[test]
+    fn anthropic_tool_results_follow_the_user_text() {
+        let b = json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "x"}, {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"c": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "o1"}, {"type": "text", "text": "o2"}]}, {"type": "text", "text": "q"}]}]});
+        let c = anthropic_to_chat(&b).unwrap();
+        let m = c.messages.as_array().unwrap();
+        assert_eq!(m[0], json!({"role": "system", "content": "ab"}));
+        assert_eq!(m[1]["tool_calls"][0]["function"]["arguments"], r#"{"c":1}"#);
+        assert_eq!((m[2]["role"].as_str(), m[3]["role"].as_str(), m[3]["content"].as_str()), (Some("user"), Some("tool"), Some("o1o2")));
+        assert_eq!(c.max_tokens, 4096);
+    }
 
-    Ok(())
+    #[test]
+    fn responses_function_calls_merge_into_the_assistant_turn() {
+        let b = json!({"instructions": "sys", "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "done"}]});
+        let m = responses_to_chat(&b).unwrap().messages;
+        assert_eq!(m.as_array().unwrap().len(), 4);
+        assert_eq!(m[2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(m[3], json!({"role": "tool", "tool_call_id": "c1", "content": "done"}));
+        assert!(responses_to_chat(&json!({"input": [{"type": "bogus"}]})).is_err());
+    }
 }

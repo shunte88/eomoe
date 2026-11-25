@@ -1,12 +1,9 @@
-//! Configuration management for eomoe.
-//!
-//! Precedence: CLI flag > YAML config file > built-in default.
+//! Configuration for `serve`. Precedence: CLI flag / env var > YAML config file > default.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use crate::cli::ServeArgs;
-use crate::model::ModelConfig;
 
 /// Top-level YAML config. Every key is optional; unknown keys are ignored.
 #[derive(Debug, Default, Deserialize)]
@@ -14,7 +11,6 @@ use crate::model::ModelConfig;
 pub struct EomoeConfig {
     pub model: ModelSection,
     pub server: ServerSection,
-    pub gpu: GpuSection,
     pub logging: LoggingSection,
 }
 
@@ -22,10 +18,8 @@ pub struct EomoeConfig {
 #[serde(default)]
 pub struct ModelSection {
     pub path: Option<PathBuf>,
-    pub cache_size_mib: Option<u32>,
-    pub num_experts: Option<usize>,
-    pub expert_dim: Option<usize>,
-    pub num_layers: Option<usize>,
+    pub ctx_size: Option<usize>,
+    pub cache_mib: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,12 +27,7 @@ pub struct ModelSection {
 pub struct ServerSection {
     pub host: Option<String>,
     pub port: Option<u16>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct GpuSection {
-    pub device_id: Option<u32>,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -50,45 +39,31 @@ pub struct LoggingSection {
 /// Fully resolved settings for `serve`.
 #[derive(Debug)]
 pub struct ServeSettings {
-    pub model: ModelConfig,
+    pub model: PathBuf,
+    pub ctx_size: usize,
+    /// None: all free VRAM.
+    pub cache_mib: Option<usize>,
     pub host: String,
     pub port: u16,
-    pub device: u32,
+    pub alias: String,
 }
 
 impl EomoeConfig {
-    /// Load configuration from a YAML file
     pub fn load(path: &Path) -> Result<Self, String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         serde_yaml::from_str(&content).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Merge CLI args over this config, falling back to defaults.
-    pub fn resolve_serve(&self, cli: &ServeArgs) -> Result<ServeSettings, String> {
-        let m = &self.model;
-        let path = cli
-            .model
-            .clone()
-            .or_else(|| m.path.clone())
-            .ok_or("no model path: pass --model or set model.path in the config file")?;
-
-        Ok(ServeSettings {
-            model: ModelConfig {
-                model_path: path.to_string_lossy().into_owned(),
-                cache_size_mib: cli.cache_size.or(m.cache_size_mib).unwrap_or(1024),
-                num_experts: m.num_experts.unwrap_or(128),
-                expert_dim: m.expert_dim.unwrap_or(1024),
-                num_layers: m.num_layers.unwrap_or(24),
-            },
-            host: cli
-                .host
-                .clone()
-                .or_else(|| self.server.host.clone())
-                .unwrap_or_else(|| "0.0.0.0".to_string()),
-            port: cli.port.or(self.server.port).unwrap_or(8080),
-            device: cli.device.or(self.gpu.device_id).unwrap_or(0),
-        })
+    pub fn resolve_serve(&self, cli: &ServeArgs) -> ServeSettings {
+        let (m, s) = (&self.model, &self.server);
+        ServeSettings {
+            model: cli.model.clone().or_else(|| m.path.clone()).unwrap_or_else(crate::cli::default_model),
+            ctx_size: cli.ctx_size.or(m.ctx_size).unwrap_or(16384),
+            cache_mib: cli.cache_mib.or(m.cache_mib),
+            host: cli.host.clone().or_else(|| s.host.clone()).unwrap_or_else(|| "127.0.0.1".into()),
+            port: cli.port.or(s.port).unwrap_or(8080),
+            alias: cli.alias.clone().or_else(|| s.alias.clone()).unwrap_or_else(|| "local-code".into()),
+        }
     }
 }
 
@@ -98,27 +73,15 @@ mod tests {
 
     #[test]
     fn cli_overrides_config_overrides_defaults() {
-        let cfg: EomoeConfig = serde_yaml::from_str(
-            "model:\n  path: /cfg/model.gguf\n  num_experts: 8\nserver:\n  host: 127.0.0.1\n  port: 9000\n",
-        )
-        .unwrap();
-        let cli = ServeArgs {
-            model: None,
-            host: None,
-            port: Some(7000),
-            cache_size: None,
-            device: None,
-        };
-        let s = cfg.resolve_serve(&cli).unwrap();
-        assert_eq!(s.model.model_path, "/cfg/model.gguf"); // from config
-        assert_eq!(s.model.num_experts, 8); // from config
-        assert_eq!(s.host, "127.0.0.1"); // from config
+        let cfg: EomoeConfig = serde_yaml::from_str("model:\n  path: /cfg/model.gguf\n  cache_mib: 2000\nserver:\n  host: 0.0.0.0\n  port: 9000\n").unwrap();
+        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, alias: None };
+        let s = cfg.resolve_serve(&cli);
+        assert_eq!(s.model, PathBuf::from("/cfg/model.gguf")); // config
+        assert_eq!(s.cache_mib, Some(2000)); // config
+        assert_eq!(s.host, "0.0.0.0"); // config
         assert_eq!(s.port, 7000); // CLI beats config
-        assert_eq!(s.model.cache_size_mib, 1024); // default
-        assert_eq!(s.device, 0); // default
-
-        // No model path anywhere is an error, not a silent default.
-        assert!(EomoeConfig::default().resolve_serve(&cli).is_err());
+        assert_eq!((s.ctx_size, s.alias.as_str()), (16384, "local-code")); // defaults
+        assert_eq!(EomoeConfig::default().resolve_serve(&cli).cache_mib, None);
     }
 
     #[test]

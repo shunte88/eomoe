@@ -13,8 +13,8 @@ Architecture decisions:
 | 1. GGUF loader, tokenizer, chat template | Byte-identical to `tests/golden/{tokenize,template}.json` | **done** 2026-11-25 |
 | 2. CPU reference forward pass | `greedy.json` top-1 on every step; mean logprob error ≤ llama.cpp's own CPU-vs-CUDA floor | **done** 2026-11-25 |
 | 3. CUDA engine | Matches phase 2 / `greedy.json` | done 2026-11-25 (see below) |
-| 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | not started |
-| 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | not started |
+| 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | done 2026-11-25 (see below) |
+| 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | done 2026-11-25 (see below) |
 | 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | not started |
 
 ## Phase 0 baseline (2026-11-25)
@@ -99,3 +99,61 @@ The oracle decodes at 27.2 tok/s, so the kernels are not the bottleneck: expert 
 Profile history (nsys): the first kernels dequantised one element per thread with one block per (row, token). mm_q4_k plus mm_q6_k took 95% of GPU time, which capped kernels-only decode at 27 tok/s. Rewriting them as warp-per-row with vectorised sub-block decode gave the 76.5 tok/s above.
 
 Known ceilings (marked `ponytail:` in the code): matvec re-reads the weights for every token, so prefill is not tiled; attention runs one position per step.
+
+## Phase 4 gate (2026-11-25)
+
+Command: `cargo test --release --test phase4_golden -- --include-ignored --nocapture --test-threads 1`
+
+| Test | Oracle | eomoe |
+|---|---|---|
+| `cache_hit_rate_on_ref_trace_beats_oracle`: replay `ref_trace.mct` at the oracle's 879 slots per group, ubatch ≤ 8 | 117973 hits / 36917 misses (76.17%) | **117973 / 36917, identical**: `src/expert_cache.rs` is an exact port of llama.cpp's ClassLRU |
+| `gpu_decode_beats_oracle_tok_s`: the 4 greedy cases (warm-up, tokens must still equal `greedy.json`), then prompt 1 + 256 greedy tokens, 4800 MiB cache | 27.2 tok/s | **33.7–34.1 tok/s** over 3 runs (+25%), 73.3% hits over the whole run |
+
+Phase 3 gates re-run on the final code: GPU vs CPU 0.00009, floor gate 0/128 top-1 fails with mean 0.1738, incremental decode reproduces `greedy.json`.
+
+Engine (`src/gpu.rs`):
+- **Expert cache.** Layers are grouped by expert layout (Q6_K vs Q4_K down), as in the oracle. Each group gets a bank of slots (gate | up | down) and an `ExpertCache`. The budget is split so each group caches the same fraction of its experts (4800 MiB gives 880 slots per group).
+- **Large batches.** Ubatches over 32 tokens bypass the policy, as in the oracle. They read the experts already cached and stream misses through 32 staging slots in waves.
+- **Pinned experts.** At load, all experts (16.3 GiB) are copied into page-locked RAM in slot layout. A miss is then one async DMA at 14 GB/s (pageable runs at 10 GB/s and blocks the host). If pinning fails, it falls back to pageable copies. Pinning takes ~8.6 s at load.
+- **Grouped expert kernels.** `mm_q4_k_ids` / `mm_q6_k_ids` take one weight pointer per gathered row. Each layer's MoE is gather, then [gate|up] (one matvec over the contiguous slot), then swiglu, down, and combine: 5 launches instead of ~28. The routing goes up as one async copy from pinned memory.
+- **Attention.** It is now warp-parallel over positions (flash-decoding style). Before this change it took 32% of kernel time.
+
+Measured steps on this decode benchmark (tok/s): pageable sync uploads 16.9, pinned async 27.5, grouped kernels 29.3, warp attention 34.1.
+
+Rejected: a CRF half-life of 32–64 gives +0.24 pp on `ref_trace`, but that would be tuning on the gate's own trace. The oracle's 128 is kept.
+
+Remaining time per token is ~29 ms: ~20 ms of miss uploads (~280 MB/token at 14 GB/s, PCIe 4.0 x8), serial with ~9 ms of kernels. Overlapping them (next-layer expert prefetch) is Phase 6.
+
+## Phase 5 gate (2026-11-25)
+
+`eomoe serve` (`src/server.rs`) speaks llama-server's `/v1/messages`, `/v1/responses`, count_tokens / input_tokens, `/v1/models` and `/health`. Request conversion, SSE event sequences, IDs and errors were ported from llama.cpp `e6443bd` source. The CLI (`src/cli.rs`) has the reference launcher's commands: install, serve, check, codex, claude.
+
+| Gate | Command | Result |
+|---|---|---|
+| Reference `check` | `PORT=8090 ~/.local/share/local-code-llm/bin/local-code-llm check` against `eomoe serve --port 8090` | **pass** (both endpoints stream and complete); `eomoe check` passes too |
+| Oracle API diff | `cargo test --release --test phase5_golden -- --ignored` (replays `tests/golden/api.json`, captured by `tools/capture_api_golden.py`) | **pass**: all 6 cases (messages and responses × text / tool / tool_result, full and stream). Prompt tokens are exact: 24 / 404 / 463 / 32 / 308 / 364. Tool calls are identical (`Bash {"command":"ls -la"}`, `shell {"command":["ls","-l","/tmp/demo"]}`), as are the stop reasons and streamed event sequences. count_tokens 404 = 404; health and models match |
+| Real Claude Code 2.1.332 | `eomoe claude --port 8090 -p "calc.py has a bug: add() should return the sum. Fix it by editing the file." --tools Read,Edit,Bash` | **pass**: 3 turns (Read, then Edit, then answer), and `calc.py` now has `return a + b`. 68 s wall |
+| Real Codex 0.172.0 | `eomoe codex --port 8090 exec --skip-git-repo-check --sandbox workspace-write "mul.py has a bug: ..."` | **pass**: 5 turns, and `mul.py` now has `return a * b`. 124 s wall |
+
+Server log for the Codex session: the first turn prefilled 6811 tokens in 86 s (79 tok/s). Later turns reused the KV prefix (6848 / 7054 / 7147 / 7241 cached), so each recomputed only 20–130 tokens. Decode ran at 13.6–14.4 tok/s at a ~7K context.
+
+Code review (standards and spec, two parallel reviewers) led to these fixes, all re-gated above:
+- A client disconnect now stops generation even while a tool call or stop string is held back. Checked live: `Ok(Cancelled)` after 3 tokens.
+- A 30 s `:` SSE keep-alive during long prefills.
+- Errors after the stream starts are reported (Anthropic `event: error`, Responses `data: {"error":…}`).
+- A UTF-8 split character after an invalid byte is no longer lost.
+- The sampling seed changes per nanosecond, not per second.
+- A malformed JSON body gets the `{"error":…}` shape.
+- Added `/v1/responses/input_tokens`.
+- Unit tests for the stop matcher and both request converters.
+
+Engine changes made for serving:
+- `Engine::truncate` / `forward_last` support KV prefix reuse (`src/generate.rs`).
+- The expert cache defaults to all free VRAM after the KV cache: 2937 MiB at 16K ctx, 539 slots per group.
+- The engine lives on one OS thread (the CUDA context is not bound per call).
+
+Known limits, carried to Phase 6:
+- **Context.** A stock Claude Code prompt is ~19K tokens, more than the 16K ctx (the reference has the same limit and the same error), so the gate session limited its tools. An f16 KV cache would give 32K ctx in the same VRAM.
+- **Prefill** runs at 80–110 tok/s against the oracle's 393 (the matvec is not tiled). It dominates first-turn latency.
+- **Decode** at 4–7K context is 14–17 tok/s, against 34 tok/s at a short context. Attention cost and cache misses at a smaller cache.
+- `/v1/chat/completions` is not served; neither client uses it.
