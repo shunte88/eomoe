@@ -11,13 +11,16 @@ repository = "https://github.com/claude-code/eomoe"
 tokio = { version = "1.0", features = ["full"] }
 axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 clap = { version = "4.4", features = ["derive", "env"] }
 cuda-sys = "0.2"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.10"
+memmap2 = "0.9.12"
+fancy-regex = "0.20.2"
+minijinja = { version = "3.1.0", features = ["preserve_order", "loop_controls", "json", "serde"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

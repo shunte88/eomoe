@@ -6,6 +6,9 @@
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod gguf;
 pub mod memory;
 pub mod model;
 pub mod server;
+pub mod template;
+pub mod tokenizer;

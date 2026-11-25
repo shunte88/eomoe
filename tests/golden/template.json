@@ -119,5 +119,149 @@
    "add_generation_prompt": true
   },
   "prompt": "<|im_start|>system\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>read_file</name>\n<description>Read a file from disk</description>\n<parameters>\n<parameter>\n<name>path</name>\n<type>string</type>\n<description>File path</description>\n</parameter>\n<required>[`path`]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nShow me src/main.rs<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nfn main() {}\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be terse."
+    },
+    {
+     "role": "user",
+     "content": "Find TODOs"
+    },
+    {
+     "role": "assistant",
+     "content": "  Searching now.  ",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": "{\"query\": \"TODO\", \"limit\": 10, \"case\": true, \"ratio\": 0.5, \"paths\": [\"src/*.rs\", \"it's\"], \"opts\": {\"depth\": 2, \"x\": null}}"
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"a.rs\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "src/a.rs:1: TODO"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": "// TODO"
+    },
+    {
+     "role": "assistant",
+     "content": "One TODO in a.rs."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "  Search code for a <pattern> & report matches.\n",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "Regex, e.g. a<b"
+        },
+        "mode": {
+         "type": "string",
+         "enum": [
+          "fast",
+          "full",
+          "it's"
+         ],
+         "default": "fast"
+        },
+        "limit": {
+         "type": "integer",
+         "enum": [
+          10,
+          50
+         ],
+         "minimum": 1,
+         "default": 10
+        },
+        "ratio": {
+         "type": "number",
+         "default": 2.5
+        },
+        "case": {
+         "type": "boolean",
+         "default": false
+        },
+        "paths": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "Globs"
+        },
+        "opts": {
+         "type": [
+          "object",
+          "null"
+         ],
+         "properties": {
+          "depth": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "depth"
+         ]
+        }
+       },
+       "required": [
+        "query",
+        "mode"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "File path"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|im_start|>system\nBe terse.\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>search</name>\n<description>Search code for a <pattern> & report matches.</description>\n<parameters>\n<parameter>\n<name>query</name>\n<type>string</type>\n<description>Regex, e.g. a<b</description>\n</parameter>\n<parameter>\n<name>mode</name>\n<type>string</type>\n<enum>[`fast`, `full`, `it's`]</enum>\n<default>fast</default>\n</parameter>\n<parameter>\n<name>limit</name>\n<type>integer</type>\n<enum>[10, 50]</enum>\n<minimum>1</minimum>\n<default>10</default>\n</parameter>\n<parameter>\n<name>ratio</name>\n<type>number</type>\n<default>2.5</default>\n</parameter>\n<parameter>\n<name>case</name>\n<type>boolean</type>\n<default>False</default>\n</parameter>\n<parameter>\n<name>paths</name>\n<type>array</type>\n<description>Globs</description>\n<items>{\"type\": \"string\"}</items>\n</parameter>\n<parameter>\n<name>opts</name>\n<type>['object', 'null']</type>\n<properties>{\"depth\": {\"type\": \"integer\"}}</properties>\n<required>[`depth`]</required>\n</parameter>\n<required>[`query`, `mode`]</required>\n</parameters>\n</function>\n<function>\n<name>read_file</name>\n<description>Read a file from disk</description>\n<parameters>\n<parameter>\n<name>path</name>\n<type>string</type>\n<description>File path</description>\n</parameter>\n<required>[`path`]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nFind TODOs<|im_end|>\n<|im_start|>assistant\nSearching now.\n\n<tool_call>\n<function=search>\n<parameter=query>\nTODO\n</parameter>\n<parameter=limit>\n10\n</parameter>\n<parameter=case>\nTrue\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=paths>\n['src/*.rs', \"it's\"]\n</parameter>\n<parameter=opts>\n{'depth': 2, 'x': None}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/a.rs:1: TODO\n</tool_response>\n<tool_response>\n// TODO\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\nOne TODO in a.rs.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
  }
 ]

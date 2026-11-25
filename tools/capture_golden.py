@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Capture reference outputs from a running llama-server (the oracle) into tests/golden/.
 
-Usage: python3 -I tools/capture_golden.py [base_url]   (default http://127.0.0.1:8099)
+Usage: python3 -I tools/capture_golden.py [--no-gen] [base_url]   (default http://127.0.0.1:8099)
+  --no-gen  only tokenize.json + template.json (no GPU needed: run the oracle with --gpu-layers 0)
 
 Writes:
   tokenize.json   text -> token ids (parse_special=true, add_special=false)
@@ -14,7 +15,9 @@ import sys
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8099"
+ARGS = [a for a in sys.argv[1:] if a != "--no-gen"]
+NO_GEN = "--no-gen" in sys.argv[1:]
+BASE = ARGS[0] if ARGS else "http://127.0.0.1:8099"
 OUT = Path(__file__).resolve().parent.parent / "tests" / "golden"
 
 
@@ -42,6 +45,12 @@ TEXTS = [
     "https://example.com/path?query=1&b=2#frag",
 ]
 
+# Tokenized with parse_special=false: CONTROL tokens stay text, USER_DEFINED ones still split.
+TEXTS_RAW = [
+    "<|im_start|>user\nhi<|im_end|>\n",
+    "<tool_call>x</tool_call> <think>y</think><|endoftext|>",
+]
+
 TOOLS = [{
     "type": "function",
     "function": {
@@ -54,6 +63,28 @@ TOOLS = [{
         },
     },
 }]
+
+BIG_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "  Search code for a <pattern> & report matches.\n",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Regex, e.g. a<b"},
+                "mode": {"type": "string", "enum": ["fast", "full", "it's"], "default": "fast"},
+                "limit": {"type": "integer", "enum": [10, 50], "minimum": 1, "default": 10},
+                "ratio": {"type": "number", "default": 2.5},
+                "case": {"type": "boolean", "default": False},
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Globs"},
+                "opts": {"type": ["object", "null"], "properties": {"depth": {"type": "integer"}},
+                         "required": ["depth"]},
+            },
+            "required": ["query", "mode"],
+        },
+    },
+}
 
 TEMPLATES = [
     {"messages": [{"role": "user", "content": "Hi"}]},
@@ -71,6 +102,20 @@ TEMPLATES = [
             "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}]},
         {"role": "tool", "tool_call_id": "call_1", "content": "fn main() {}"},
     ], "tools": TOOLS},
+    {"messages": [
+        {"role": "system", "content": "Be terse."},
+        {"role": "user", "content": "Find TODOs"},
+        {"role": "assistant", "content": "  Searching now.  ", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "search", "arguments":
+                "{\"query\": \"TODO\", \"limit\": 10, \"case\": true, \"ratio\": 0.5, "
+                "\"paths\": [\"src/*.rs\", \"it's\"], \"opts\": {\"depth\": 2, \"x\": null}}"}},
+            {"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"a.rs\"}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "src/a.rs:1: TODO"},
+        {"role": "tool", "tool_call_id": "c2", "content": "// TODO"},
+        {"role": "assistant", "content": "One TODO in a.rs."},
+        {"role": "user", "content": "Thanks"},
+    ], "tools": [BIG_TOOL] + TOOLS},
 ]
 
 GREEDY_PROMPTS = [
@@ -81,8 +126,8 @@ GREEDY_PROMPTS = [
 ]
 
 
-def tokenize(text):
-    return post("/tokenize", {"content": text, "add_special": False, "parse_special": True})["tokens"]
+def tokenize(text, parse_special=True):
+    return post("/tokenize", {"content": text, "add_special": False, "parse_special": parse_special})["tokens"]
 
 
 def greedy(tokens, n_predict):
@@ -95,7 +140,8 @@ def greedy(tokens, n_predict):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
 
-    tok = [{"text": t, "tokens": tokenize(t)} for t in TEXTS]
+    tok = [{"text": t, "parse_special": True, "tokens": tokenize(t)} for t in TEXTS]
+    tok += [{"text": t, "parse_special": False, "tokens": tokenize(t, False)} for t in TEXTS_RAW]
     (OUT / "tokenize.json").write_text(json.dumps(tok, ensure_ascii=False, indent=1))
     print(f"tokenize: {len(tok)} cases")
 
@@ -105,6 +151,8 @@ def main():
         tpl.append({"request": body, "prompt": post("/apply-template", body)["prompt"]})
     (OUT / "template.json").write_text(json.dumps(tpl, ensure_ascii=False, indent=1))
     print(f"template: {len(tpl)} cases")
+    if NO_GEN:
+        return
 
     gr = []
     for p in GREEDY_PROMPTS:

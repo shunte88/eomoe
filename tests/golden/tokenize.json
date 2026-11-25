@@ -1,6 +1,7 @@
 [
  {
   "text": "Hello, world!",
+  "parse_special": true,
   "tokens": [
    9707,
    11,
@@ -10,6 +11,7 @@
  },
  {
   "text": "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n",
+  "parse_special": true,
   "tokens": [
    750,
    15801,
@@ -41,6 +43,7 @@
  },
  {
   "text": "    indented\n\t\ttabs\r\nCRLF   trailing   ",
+  "parse_special": true,
   "tokens": [
    262,
    1257,
@@ -59,6 +62,7 @@
  },
  {
   "text": "I'm sure it's they're we'll you've he'd",
+  "parse_special": true,
   "tokens": [
    40,
    2776,
@@ -77,6 +81,7 @@
  },
  {
   "text": "Numbers: 1 12 123 1234 12345 3.14159 -42 0x1F 1e-9",
+  "parse_special": true,
   "tokens": [
    27237,
    25,
@@ -125,6 +130,7 @@
  },
  {
   "text": "Unicode: café naïve 日本語 中文 한국어 Ελληνικά русский",
+  "parse_special": true,
   "tokens": [
    33920,
    25,
@@ -154,6 +160,7 @@
  },
  {
   "text": "Emoji: 🚀🔥👍🏽 👨‍👩‍👧‍👦",
+  "parse_special": true,
   "tokens": [
    92731,
    25,
@@ -178,6 +185,7 @@
  },
  {
   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+  "parse_special": true,
   "tokens": [
    151644,
    872,
@@ -192,6 +200,7 @@
  },
  {
   "text": "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>",
+  "parse_special": true,
   "tokens": [
    151657,
    198,
@@ -219,6 +228,7 @@
  },
  {
   "text": "fn main() { let v: Vec<u8> = (0..=255).collect(); println!(\"{:?}\", &v[..]); }",
+  "parse_special": true,
   "tokens": [
    8822,
    1887,
@@ -255,6 +265,7 @@
  },
  {
   "text": "SELECT id, name FROM users WHERE email LIKE '%@example.com' ORDER BY id DESC;",
+  "parse_special": true,
   "tokens": [
    4858,
    877,
@@ -279,6 +290,7 @@
  },
  {
   "text": "    \n\n\n    \n",
+  "parse_special": true,
   "tokens": [
    61439,
    1066
@@ -286,10 +298,12 @@
  },
  {
   "text": "",
+  "parse_special": true,
   "tokens": []
  },
  {
   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "parse_special": true,
   "tokens": [
    69440,
    69440,
@@ -333,6 +347,7 @@
  },
  {
   "text": "https://example.com/path?query=1&b=2#frag",
+  "parse_special": true,
   "tokens": [
    2428,
    1110,
@@ -349,6 +364,47 @@
    17,
    2,
    33198
+  ]
+ },
+ {
+  "text": "<|im_start|>user\nhi<|im_end|>\n",
+  "parse_special": false,
+  "tokens": [
+   27,
+   91,
+   318,
+   4906,
+   91,
+   29,
+   872,
+   198,
+   6023,
+   27,
+   91,
+   318,
+   6213,
+   91,
+   397
+  ]
+ },
+ {
+  "text": "<tool_call>x</tool_call> <think>y</think><|endoftext|>",
+  "parse_special": false,
+  "tokens": [
+   151657,
+   87,
+   151658,
+   220,
+   151667,
+   88,
+   151668,
+   27,
+   91,
+   8691,
+   723,
+   427,
+   91,
+   29
   ]
  }
 ]
