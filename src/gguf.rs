@@ -64,6 +64,13 @@ pub struct TensorInfo {
     pub size: usize,
 }
 
+impl TensorInfo {
+    pub fn row_bytes(&self) -> usize {
+        let (be, bb) = self.ty.block();
+        (self.dims[0] / be * bb) as usize
+    }
+}
+
 pub struct Gguf {
     mmap: Mmap,
     pub version: u32,
@@ -196,6 +203,12 @@ impl Gguf {
 
     pub fn data(&self, t: &TensorInfo) -> &[u8] {
         &self.mmap[t.offset..t.offset + t.size]
+    }
+
+    /// Raw bytes of row `i`; 3-D tensors (experts) are treated as rows flattened over dims[1..].
+    pub fn row(&self, t: &TensorInfo, i: usize) -> &[u8] {
+        let rb = t.row_bytes();
+        &self.data(t)[i * rb..(i + 1) * rb]
     }
 
     /// Zero-copy view of an F32 tensor.

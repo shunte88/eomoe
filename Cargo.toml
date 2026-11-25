@@ -21,6 +21,8 @@ env_logger = "0.10"
 memmap2 = "0.9.12"
 fancy-regex = "0.20.2"
 minijinja = { version = "3.1.0", features = ["preserve_order", "loop_controls", "json", "serde"] }
+half = "2.7.1"
+rayon = "1.12.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

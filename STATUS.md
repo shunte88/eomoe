@@ -11,7 +11,7 @@ Architecture decisions:
 |---|---|---|
 | 0. Baseline | Golden outputs + perf captured from the oracle | **done** 2026-11-25 |
 | 1. GGUF loader, tokenizer, chat template | Byte-identical to `tests/golden/{tokenize,template}.json` | **done** 2026-11-25 |
-| 2. CPU reference forward pass | Greedy tokens + top-5 logprobs match `greedy.json` | not started |
+| 2. CPU reference forward pass | `greedy.json` top-1 on every step; mean logprob error ≤ llama.cpp's own CPU-vs-CUDA floor | **done** 2026-11-25 |
 | 3. CUDA engine | Matches phase 2 / `greedy.json` | not started |
 | 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | not started |
 | 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | not started |
@@ -53,3 +53,24 @@ Command: `cargo test --release --test phase1_golden -- --include-ignored` (needs
 
 Model open (mmap + metadata + tensor index): ~0.07 s.
 Known gaps, untested because no oracle case exists: Python float exponent formatting in `tojson` (`1e-09`); llama.cpp's forced-CONTROL override list (every affected Qwen token is already CONTROL).
+
+## Phase 2 gate (2026-11-25)
+
+Command: `cargo test --release --test phase2_golden -- --include-ignored --nocapture`
+
+| Test | Checks | Result |
+|---|---|---|
+| `dequant_matches_gguf_py` | Rows dequantized by gguf-py (`tools/capture_dequant.py`): Q4_K (token_embd, expert gate) and Q6_K (output, expert down), rel 1e-6 | pass |
+| `forward_matches_oracle_greedy` | Teacher-forced over 4 prompts × 32 steps (128 steps): top-1 == oracle on every non-tie step; mean \|Δlogprob\| over oracle top-5 ≤ 0.2414 | top-1 128/128, mean 0.174 |
+
+**Revised gate (user decision 2026-11-25).** The planned gate allowed only 0.05 logprob error per token. That is unreachable, even for llama.cpp itself:
+- llama.cpp quantizes activations inside its quantized matmuls (Q8_K on CPU, q8_1 on CUDA). This model amplifies the rounding: residual-stream sums reach ~950 by layer 2.
+- `tools/measure_backend_floor.py` scores llama.cpp's own CPU backend against its CUDA `greedy.json` with the same metric: 1 top-1 mismatch, 434/640 logprobs off by more than 0.05, mean 0.241, max 2.28.
+- eomoe CPU in f32 scores 0 top-1 mismatches, 399/640 logprobs off by more than 0.05, mean 0.174, max 2.75. The top-5 set differs on 17 steps, always at the 5th-place boundary.
+
+Further evidence the forward pass is correct:
+- **Layer by layer:** a `llama-eval-callback` dump for prompt "The" matches ours in layers 0–2, with identical expert selection.
+- **Exact match under emulation:** when our matmuls emulate Q8_K activation quantization, layer 0 `Vcur` matches llama.cpp to 6 digits (−0.190937 vs −0.190936). The emulation code was removed afterwards; f32 lands closer to the CUDA oracle.
+- **The gate goes red on a real bug:** dropping the top-8 weight renormalization gives 21/128 top-1 failures and mean 5.06.
+
+Speed (CPU reference, rayon over 32 logical cores, whole sequence in one batch): 15–20 tok/s.
