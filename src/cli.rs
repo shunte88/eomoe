@@ -7,8 +7,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[clap(name = "eomoe", version = "0.1.0")]
 pub struct CliArgs {
-    /// Configuration file path
-    #[clap(long)]
+    /// YAML configuration file (CLI flags override its values)
+    #[clap(long, env = "EOMOE_CONFIG_PATH", global = true)]
     pub config: Option<PathBuf>,
 
     #[clap(subcommand)]
@@ -43,21 +43,25 @@ pub struct InstallArgs {
 /// Serve command arguments
 #[derive(Parser)]
 pub struct ServeArgs {
-    /// Path to the model file
-    #[clap(long, required = true)]
-    pub model: PathBuf,
+    /// Path to the model file [config: model.path]
+    #[clap(long)]
+    pub model: Option<PathBuf>,
 
-    /// Port to listen on
-    #[clap(long, default_value = "8080")]
-    pub port: u16,
+    /// Address to bind [config: server.host, default: 0.0.0.0]
+    #[clap(long)]
+    pub host: Option<String>,
 
-    /// GPU memory cache size in MiB
-    #[clap(long, default_value = "1024")]
-    pub cache_size: u32,
+    /// Port to listen on [config: server.port, default: 8080]
+    #[clap(long)]
+    pub port: Option<u16>,
 
-    /// CUDA device ID to use
-    #[clap(long, default_value = "0")]
-    pub device: u32,
+    /// GPU memory cache size in MiB [config: model.cache_size_mib, default: 1024]
+    #[clap(long)]
+    pub cache_size: Option<u32>,
+
+    /// CUDA device ID [config: gpu.device_id, default: 0]
+    #[clap(long)]
+    pub device: Option<u32>,
 }
 
 /// Check command arguments
@@ -81,24 +85,6 @@ pub async fn execute_install(args: &InstallArgs) -> Result<(), Box<dyn std::erro
 
     // For now, simulate success
     println!("Installation completed successfully!");
-    Ok(())
-}
-
-/// Execute the serve command
-pub async fn execute_serve(args: &ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Serving model from: {}", args.model.display());
-    println!("Listening on port: {}", args.port);
-    println!("GPU memory cache size: {} MiB", args.cache_size);
-    println!("Using CUDA device: {}", args.device);
-
-    // In a real implementation, this would:
-    // - Initialize the model
-    // - Start the HTTP server
-    // - Set up REST API endpoints
-    // - Configure GPU memory management
-
-    // For now, simulate success
-    println!("Server started successfully!");
     Ok(())
 }
 

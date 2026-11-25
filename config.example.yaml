@@ -1,5 +1,7 @@
 # eomoe Configuration File
 # This is an example configuration file for the eomoe MoE LLM service
+# Every key is optional. CLI flags override these values.
+# Load with --config <file> or EOMOE_CONFIG_PATH=<file>.
 
 # Model configuration
 model:
@@ -13,19 +15,19 @@ model:
 server:
   port: 8080
   host: "0.0.0.0"
-  max_connections: 1000
+  # max_connections: 1000      # not yet implemented
 
 # GPU configuration
 gpu:
   device_id: 0
-  memory_limit_mib: 4096
+  # memory_limit_mib: 4096     # not yet implemented
 
 # Logging configuration
 logging:
   level: "info"
-  file: "/var/log/eomoe/eomoe.log"
+  # file: "/var/log/eomoe/eomoe.log"  # not yet implemented; logs go to stderr
 
-# Health check configuration
-health:
-  interval_seconds: 30
-  timeout_seconds: 5
+# Health check configuration (not yet implemented)
+# health:
+#   interval_seconds: 30
+#   timeout_seconds: 5

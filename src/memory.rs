@@ -1,8 +1,6 @@
 //! Memory management for MoE experts with GPU VRAM/CUDA context swapping
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::ptr;
 
 use cuda_sys::cudart::*;
@@ -23,8 +21,6 @@ pub enum MemoryError {
 /// Manages GPU memory allocation and expert swapping
 #[derive(Debug)]
 pub struct MemoryManager {
-    /// GPU memory pool
-    gpu_memory: Option<GPUAllocator>,
     /// System memory cache for experts
     system_cache: SystemCache,
     /// Current GPU memory usage
@@ -43,11 +39,9 @@ impl MemoryManager {
             cudaFree(ptr::null_mut::<std::os::raw::c_void>());
         }
 
-        let gpu_memory = Some(GPUAllocator::new());
         let max_gpu_memory = cache_size_mib as usize * 1024 * 1024; // Convert MiB to bytes
 
         Ok(MemoryManager {
-            gpu_memory,
             system_cache: SystemCache::new(),
             gpu_memory_usage: 0,
             max_gpu_memory,
@@ -126,44 +120,6 @@ impl MemoryManager {
             cached_experts: 0,
             loaded_experts: 0,
         }
-    }
-}
-
-/// GPU memory allocator for MoE experts
-#[derive(Debug)]
-struct GPUAllocator {
-    /// Device memory pool
-    pool: Vec<GPUPointer>,
-}
-
-impl GPUAllocator {
-    fn new() -> Self {
-        GPUAllocator {
-            pool: Vec::new(),
-        }
-    }
-
-    /// Allocate memory on GPU
-    fn allocate(&mut self, size: usize) -> Result<GPUPointer, MemoryError> {
-        // Allocate on GPU
-        let gpu_ptr = unsafe {
-            let mut ptr: *mut std::os::raw::c_void = ptr::null_mut();
-
-            // For now, use a simplified approach - in a real implementation
-            // we'd properly handle cudaError_t enum values
-            let _result = cudaMalloc(&mut ptr, size);
-
-            // Simple check - if it's not a null pointer, we assume success
-            if ptr.is_null() {
-                return Err(MemoryError::AllocationFailed);
-            }
-            ptr
-        };
-
-        Ok(GPUPointer {
-            ptr: gpu_ptr,
-            size,
-        })
     }
 }
 
@@ -254,63 +210,6 @@ struct ExpertData {
     size: usize,
 }
 
-/// Manages memory swapping between GPU and system memory for MoE experts
-pub struct ExpertCache {
-    /// Memory manager for GPU memory allocation
-    memory_manager: Arc<Mutex<MemoryManager>>,
-    /// Cache of expert data loaded into GPU
-    loaded_experts: HashMap<String, GPUPointer>,
-    /// Cache of expert data in system memory
-    cached_experts: HashMap<String, Vec<u8>>,
-    /// Maximum cache size in MiB
-    max_cache_size: usize,
-}
-
-impl ExpertCache {
-    /// Create a new expert cache with specified memory limits
-    pub fn new(max_cache_size_mib: u32) -> Result<Self, MemoryError> {
-        let memory_manager = Arc::new(Mutex::new(MemoryManager::new(max_cache_size_mib)?));
-
-        Ok(ExpertCache {
-            memory_manager,
-            loaded_experts: HashMap::new(),
-            cached_experts: HashMap::new(),
-            max_cache_size: max_cache_size_mib as usize * 1024 * 1024,
-        })
-    }
-
-    /// Load an expert into GPU memory
-    pub fn load_expert(&mut self, expert_id: &str) -> Result<GPUPointer, MemoryError> {
-        // Acquire lock on memory manager
-        let mut manager = self.memory_manager.lock().unwrap();
-        let gpu_ptr = manager.load_expert_to_gpu(expert_id)?;
-        Ok(gpu_ptr)
-    }
-
-    /// Cache expert data in system memory
-    pub fn cache_expert(&mut self, expert_id: String, data: Vec<u8>) {
-        // Add to system cache
-        self.cached_experts.insert(expert_id, data);
-    }
-
-    /// Remove expert from cache
-    pub fn remove_expert(&mut self, expert_id: &str) {
-        self.cached_experts.remove(expert_id);
-        self.loaded_experts.remove(expert_id);
-    }
-
-    /// Get current memory usage statistics
-    pub fn get_stats(&self) -> MemoryStats {
-        let manager = self.memory_manager.lock().unwrap();
-        MemoryStats {
-            gpu_memory_usage: manager.gpu_memory_usage(),
-            max_gpu_memory: manager.max_gpu_memory(),
-            cached_experts: self.cached_experts.len(),
-            loaded_experts: self.loaded_experts.len(),
-        }
-    }
-}
-
 /// Memory statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
@@ -342,9 +241,4 @@ mod tests {
         assert_eq!(manager.max_gpu_memory, 1024 * 1024 * 1024); // 1GB
     }
 
-    #[test]
-    fn test_expert_cache_creation() {
-        let cache = ExpertCache::new(1024).unwrap();
-        assert_eq!(cache.max_cache_size, 1024 * 1024 * 1024); // 1GB
-    }
 }

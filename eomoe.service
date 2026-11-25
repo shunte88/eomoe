@@ -7,14 +7,12 @@ Type=simple
 User=www-data
 Group=www-data
 WorkingDirectory=/opt/eomoe
-ExecStart=/opt/eomoe/eomoe serve --config /etc/eomoe/config.yaml
+ExecStart=/opt/eomoe/eomoe --config /etc/eomoe/config.yaml serve
 Restart=always
 RestartSec=10
+# Logs go to stderr -> journal (journalctl -u eomoe).
 
-# Environment variables
-Environment=EOMOE_CONFIG_PATH=/etc/eomoe/config.yaml
-
-# Security enhancements
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

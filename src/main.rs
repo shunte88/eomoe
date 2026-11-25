@@ -1,56 +1,34 @@
 use clap::Parser;
+use eomoe::{cli, config::EomoeConfig, model, server};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::fs;
-use serde::Deserialize;
-
-mod cli;
-mod memory;
-mod model;
-mod cache;
-mod server_simple;
-mod config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    let args = cli::CliArgs::parse();
 
-    let cli_args = cli::CliArgs::parse();
-
-    // Load configuration if provided
-    let config = match &cli_args.config {
-        Some(config_path) => {
-            let config_content = fs::read_to_string(config_path)?;
-            let config: config::EomoeConfig = serde_yaml::from_str(&config_content)?;
-            Some(config)
-        }
-        None => None,
+    let config = match &args.config {
+        Some(path) => EomoeConfig::load(path)?,
+        None => EomoeConfig::default(),
     };
 
-    match &cli_args.command {
-        cli::Command::Install(install_args) => {
-            cli::execute_install(install_args).await?;
-        }
-        cli::Command::Serve(serve_args) => {
-            // Create model, memory manager, and cache
-            // In a real implementation, this would be more sophisticated
-            let model_config = model::ModelConfig {
-                model_path: serve_args.model.to_string_lossy().to_string(),
-                cache_size_mib: serve_args.cache_size,
-                num_experts: 128,
-                expert_dim: 1024,
-                num_layers: 24,
-            };
+    // RUST_LOG still wins over the config file.
+    let level = config.logging.level.as_deref().unwrap_or("info");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
-            let model = model::MoEModel::new(model_config).unwrap();
-            // Start the server with the model
-            server_simple::start_server(
-                Arc::new(Mutex::new(model)),
-                serve_args.port,
-            ).await?;
-        }
-        cli::Command::Check(check_args) => {
-            cli::execute_check(check_args).await?;
+    match &args.command {
+        cli::Command::Install(a) => cli::execute_install(a).await?,
+        cli::Command::Check(a) => cli::execute_check(a).await?,
+        cli::Command::Serve(a) => {
+            let s = config.resolve_serve(a)?;
+            log::info!(
+                "model={} cache={} MiB device={}",
+                s.model.model_path,
+                s.model.cache_size_mib,
+                s.device
+            );
+            let model = model::MoEModel::new(s.model)?;
+            server::start_server(Arc::new(Mutex::new(model)), &s.host, s.port).await?;
         }
     }
 

@@ -4,7 +4,7 @@ A memory-safe, massively scalable implementation of a Mixture of Experts (MoE) L
 
 ## Features
 
-- **Memory-Safe Rust Implementation**: Zero unsafe code, comprehensive error handling
+- **Memory-Safe Rust Implementation**: unsafe confined to the CUDA FFI calls in `memory.rs`
 - **GPU Memory Management**: Efficient VRAM/CUDA context swapping with expert loading/unloading
 - **MoE Architecture**: Complete Mixture of Experts model with expert weights and routing
 - **REST API Server**: HTTP endpoints for inference, health checks, and model information
@@ -51,8 +51,12 @@ The system is designed around:
 # Build the project
 cargo build --release
 
-# Start the server
+# Start the server (flags only)
 ./target/release/eomoe serve --model /path/to/model.gguf --port 8080
+
+# Start from a config file; any flag overrides the file
+./target/release/eomoe --config config.example.yaml serve --port 9000
+EOMOE_CONFIG_PATH=config.example.yaml ./target/release/eomoe serve
 
 # Check system health
 ./target/release/eomoe check
@@ -64,7 +68,8 @@ cargo build --release
 ## Dependencies
 
 - Rust 1.70+
-- CUDA runtime libraries (for GPU operations)
+- CUDA runtime libraries (for GPU operations). `.cargo/config.toml` points the linker
+  at `/usr/local/cuda/targets/x86_64-linux/lib`; set `CUDA_LIBRARY_PATH` to override.
 - cuBLAS library (for GPU linear algebra operations)
 
 ## Implementation Notes

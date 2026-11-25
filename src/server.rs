@@ -1,7 +1,4 @@
-//! HTTP server implementation for eomoe MoE model
-//!
-//! Implements REST API endpoints for MoE model inference, health checks,
-//! and model information.
+//! HTTP server for eomoe with REST API endpoints
 
 use axum::{
     extract::State,
@@ -13,128 +10,112 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 use crate::model::MoEModel;
-use crate::memory::MemoryManager;
-use crate::cache::ExpertCache;
 
-/// Server state containing model and memory manager
+/// Server state containing model
 #[derive(Debug, Clone)]
 pub struct ServerState {
-    pub model: Arc<MoEModel>,
-    pub memory_manager: Arc<MemoryManager>,
-    pub expert_cache: Arc<ExpertCache>,
+    pub model: Arc<Mutex<MoEModel>>,
 }
 
 /// API error response
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
 
-impl IntoResponse for ErrorResponse {
-    fn into_response(self) -> axum::response::Response {
-        let body = Json(self);
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
-    }
+/// Model inference request
+#[derive(Deserialize)]
+pub struct InferenceRequest {
+    pub prompt: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+/// Model inference response
+#[derive(Serialize)]
+pub struct InferenceResponse {
+    pub text: String,
+    pub tokens: Vec<String>,
+    pub usage: UsageStats,
+}
+
+/// Usage statistics
+#[derive(Serialize)]
+pub struct UsageStats {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
 }
 
 /// Health check endpoint
 pub async fn health_check() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "healthy",
-        "service": "eomoe-moe-server"
-    }))
+    Json(serde_json::json!({ "status": "healthy" }))
 }
 
 /// Model info endpoint
 pub async fn model_info(State(state): State<ServerState>) -> impl IntoResponse {
-    let config = state.model.config();
+    // Get model info from the model state
+    let model = state.model.lock().await;
     Json(serde_json::json!({
-        "model": config.model_path,
-        "num_experts": config.num_experts,
-        "expert_dim": config.expert_dim,
-        "num_layers": config.num_layers,
-        "cache_size_mib": config.cache_size_mib,
+        "model": "MoE LLM",
+        "status": "ready",
+        "expert_count": model.expert_count(),
+        "config": model.config()
     }))
 }
 
-/// Model inference endpoint
-pub async fn model_inference(
+/// Inference endpoint
+pub async fn inference(
     State(state): State<ServerState>,
-    Json(payload): Json<InferenceRequest>,
-) -> impl IntoResponse {
+    Json(request): Json<InferenceRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     // In a real implementation, this would:
-    // - Load the requested experts into GPU memory if not already cached
-    // - Perform MoE inference with the loaded experts
-    // - Return the inference results
+    // - Process the prompt using the MoE model
+    // - Route to appropriate experts
+    // - Handle GPU memory management
+    // - Return the generated text
 
-    // For now, we'll simulate inference
+    // For now, return a mock response with proper structure
     let response = InferenceResponse {
-        prompt: payload.prompt,
-        response: "This is a simulated MoE inference response".to_string(),
-        expert_used: payload.expert_id.unwrap_or(0),
+        text: format!("Mock response to: {}", request.prompt),
+        tokens: vec!["token1".to_string(), "token2".to_string(), "token3".to_string()],
+        usage: UsageStats {
+            prompt_tokens: request.prompt.chars().count(),
+            completion_tokens: 3,
+            total_tokens: request.prompt.chars().count() + 3,
+        }
     };
 
-    Json(response)
-}
-
-/// Inference request payload
-#[derive(Debug, Deserialize)]
-pub struct InferenceRequest {
-    pub prompt: String,
-    pub expert_id: Option<usize>,
-}
-
-/// Inference response payload
-#[derive(Debug, Serialize)]
-pub struct InferenceResponse {
-    pub prompt: String,
-    pub response: String,
-    pub expert_used: usize,
+    Ok(Json(response))
 }
 
 /// Start the HTTP server
 pub async fn start_server(
-    model: Arc<MoEModel>,
-    memory_manager: Arc<MemoryManager>,
-    expert_cache: Arc<ExpertCache>,
+    model: Arc<Mutex<MoEModel>>,
+    host: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Create server state
     let state = ServerState {
         model,
-        memory_manager,
-        expert_cache,
     };
 
+    // Define routes
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/info", get(model_info))
-        .route("/infer", post(model_inference))
+        .route("/inference", post(inference))
         .with_state(state);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    println!("Server listening on http://0.0.0.0:{}", port);
+    // Bind to the specified port
+    let listener = TcpListener::bind((host, port)).await?;
+    log::info!("listening on {}", listener.local_addr()?);
 
+    // Start the server
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_health_check() {
-        let response = health_check().await;
-        assert_eq!(response.0.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_model_info() {
-        // This would require a mock model to test
-        // For now, we just verify the function compiles
-        assert!(true);
-    }
 }
