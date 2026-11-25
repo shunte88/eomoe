@@ -1,0 +1,31 @@
+# eomoe Configuration File
+# This is an example configuration file for the eomoe MoE LLM service
+
+# Model configuration
+model:
+  path: "/opt/eomoe/models/gguf-model.gguf"
+  cache_size_mib: 1024
+  num_experts: 128
+  expert_dim: 1024
+  num_layers: 24
+
+# Server configuration
+server:
+  port: 8080
+  host: "0.0.0.0"
+  max_connections: 1000
+
+# GPU configuration
+gpu:
+  device_id: 0
+  memory_limit_mib: 4096
+
+# Logging configuration
+logging:
+  level: "info"
+  file: "/var/log/eomoe/eomoe.log"
+
+# Health check configuration
+health:
+  interval_seconds: 30
+  timeout_seconds: 5

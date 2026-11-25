@@ -7,6 +7,10 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[clap(name = "eomoe", version = "0.1.0")]
 pub struct CliArgs {
+    /// Configuration file path
+    #[clap(long)]
+    pub config: Option<PathBuf>,
+
     #[clap(subcommand)]
     pub command: Command,
 }

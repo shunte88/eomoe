@@ -1,23 +1,31 @@
-//! eomoe - Expert One-Way Context MoE LLM
-//!
-//! A memory-safe, massively scalable implementation of Mixture of Experts
-//! Large Language Model system with efficient GPU memory management.
-
 use clap::Parser;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::fs;
+use serde::Deserialize;
 
 mod cli;
 mod memory;
 mod model;
 mod cache;
 mod server_simple;
+mod config;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let cli_args = cli::CliArgs::parse();
+
+    // Load configuration if provided
+    let config = match &cli_args.config {
+        Some(config_path) => {
+            let config_content = fs::read_to_string(config_path)?;
+            let config: config::EomoeConfig = serde_yaml::from_str(&config_content)?;
+            Some(config)
+        }
+        None => None,
+    };
 
     match &cli_args.command {
         cli::Command::Install(install_args) => {

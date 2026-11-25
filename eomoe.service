@@ -1,0 +1,24 @@
+[Unit]
+Description=eomoe MoE LLM Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/eomoe
+ExecStart=/opt/eomoe/eomoe serve --config /etc/eomoe/config.yaml
+Restart=always
+RestartSec=10
+
+# Environment variables
+Environment=EOMOE_CONFIG_PATH=/etc/eomoe/config.yaml
+
+# Security enhancements
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

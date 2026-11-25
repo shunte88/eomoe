@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  eomoe:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config
+      - ./models:/app/models
+    environment:
+      - EOMOE_CONFIG_PATH=/app/config/config.yaml
+    command: ["./target/release/eomoe", "serve", "--model", "/app/models/model.gguf", "--port", "8080"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
