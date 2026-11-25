@@ -12,7 +12,7 @@ Architecture decisions:
 | 0. Baseline | Golden outputs + perf captured from the oracle | **done** 2026-11-25 |
 | 1. GGUF loader, tokenizer, chat template | Byte-identical to `tests/golden/{tokenize,template}.json` | **done** 2026-11-25 |
 | 2. CPU reference forward pass | `greedy.json` top-1 on every step; mean logprob error ≤ llama.cpp's own CPU-vs-CUDA floor | **done** 2026-11-25 |
-| 3. CUDA engine | Matches phase 2 / `greedy.json` | not started |
+| 3. CUDA engine | Matches phase 2 / `greedy.json` | done 2026-11-25 (see below) |
 | 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | not started |
 | 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | not started |
 | 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | not started |
@@ -74,3 +74,28 @@ Further evidence the forward pass is correct:
 - **The gate goes red on a real bug:** dropping the top-8 weight renormalization gives 21/128 top-1 failures and mean 5.06.
 
 Speed (CPU reference, rayon over 32 logical cores, whole sequence in one batch): 15–20 tok/s.
+
+## Phase 3 gate (2026-11-25)
+
+Command: `cargo test --release --test phase3_golden -- --include-ignored --nocapture --test-threads 1` (RTX 5060 8 GB, sm_120; kernels in `kernels/eomoe.cu`, built to a SASS fatbin by `build.rs` and loaded by name in `src/gpu.rs`).
+
+| Test | Result |
+|---|---|
+| `gpu_matches_cpu_reference`: \|Δlogprob\| over CPU top-5, all teacher-forced steps, tol 0.02 | max 0.00008 |
+| `gpu_forward_matches_oracle_greedy`: the Phase 2 floor gate | top-1 fails 0/128, mean 0.1738 (floor 0.2414), max 2.7544, top-5 set differs on 17 steps. Identical to the CPU reference |
+| `gpu_incremental_decode_matches_oracle_tokens`: prefill, then 1-token decode through the KV cache | all 4 cases reproduce the `greedy.json` tokens |
+
+VRAM allocated: 1412 MiB (dense weights, f32 KV cache for 256 ctx, 128 expert slots, scratch).
+
+Speed, with no expert cache yet (Phase 4):
+
+| Mode | Decode | Prefill |
+|---|---|---|
+| Real run: every routed expert re-uploaded from pageable memory, synchronously, every layer (~1.2 GB/token) | 5.8 tok/s | 9–15 tok/s |
+| Kernels only, uploads skipped (debug run, output invalid) | 76.5 tok/s | 143 tok/s |
+
+The oracle decodes at 27.2 tok/s, so the kernels are not the bottleneck: expert transfer is. That is Phase 4's job (VRAM expert cache, pinned/async staging).
+
+Profile history (nsys): the first kernels dequantised one element per thread with one block per (row, token). mm_q4_k plus mm_q6_k took 95% of GPU time, which capped kernels-only decode at 27 tok/s. Rewriting them as warp-per-row with vectorised sub-block decode gave the 76.5 tok/s above.
+
+Known ceilings (marked `ponytail:` in the code): matvec re-reads the weights for every token, so prefill is not tiled; attention runs one position per step.
