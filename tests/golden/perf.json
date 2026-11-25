@@ -1,0 +1,24 @@
+{
+ "decode": {
+  "cache_n": 0,
+  "prompt_n": 18,
+  "prompt_ms": 657.448,
+  "prompt_per_token_ms": 36.52488888888889,
+  "prompt_per_second": 27.3785911585403,
+  "predicted_n": 256,
+  "predicted_ms": 9381.698,
+  "predicted_per_token_ms": 36.79097254901961,
+  "predicted_per_second": 27.18058074348588
+ },
+ "prefill": {
+  "cache_n": 0,
+  "prompt_n": 4096,
+  "prompt_ms": 10425.789,
+  "prompt_per_token_ms": 2.545358642578125,
+  "prompt_per_second": 392.8719447516154,
+  "predicted_n": 16,
+  "predicted_ms": 937.046,
+  "predicted_per_token_ms": 62.46973333333334,
+  "predicted_per_second": 16.007752020711894
+ }
+}
