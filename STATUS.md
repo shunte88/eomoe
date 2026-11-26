@@ -323,4 +323,28 @@ Gates (all pass, `--test-threads=1`):
 | lib | 12 pass |
 | Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, **49 s wall** (was 63 s). First turn: prefill 32.9 s at **576 tok/s** (was 411). Follow-ups 113 and 173; decode 25–29 |
 
-GEMM is still ~79% of prefill time. The next lever is an MMQ-style kernel: integer quants as exact f16 with per-block scales applied to partial sums. That drops the weight lo half and the float dequant.
+**MMQ-style follow-up (same day).** Quants go in as exact f16 integers. Per 16 of K: p = q·x (2 mmas, x hi + lo), then acc += sc·p − mn·Σx in f32. Q4_K's scale covers 32, so it folds once per 32. Weights are now exact.
+
+| Step | Prefill 4K |
+|---|---|
+| 3-mma hi/lo kernel above | 781 tok/s |
+| MMQ, scalar unpack and stores | 415 |
+| + packed 16-byte shared stores, Q4_K uint32 loads | 749 |
+| + Q4_K folds once per 32 | 812 |
+| expert tile 32 tokens (tried, reverted: weights re-decoded per tile) | 682 |
+| dense tile 128 tokens, experts 64 | 840 |
+| Q6_K 16-bit loads (blocks are 210 bytes, 2-aligned) | 905 |
+| Q4_K 16-byte loads (load checks expert parts are 16-byte multiples) | **938–953** |
+
+Global load instructions turned out to be the limit, not the mma count. Each thread reads its own row, so the loads are uncoalesced.
+
+Gates (all pass, `--test-threads=1`):
+
+| Gate | Result |
+|---|---|
+| Phase 3 | top-1 fails 0/128, mean 0.1829 (floor 0.2414); incremental decode exact; GPU vs CPU p50 0.00035, max 1.15 |
+| Phase 4 | hits 76.17%; decode 38.1 tok/s |
+| Phase 5 API diff | pass |
+| Phase 6 | 32K, 576 slots; prefill 4K **952.6 tok/s** (oracle 392.9: 2.4x); decode after 19K 25.5; follow-up 115.4 |
+| lib | 12 pass |
+| Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, **45 s wall** (oracle-era 7m50s). First turn: prefill 28.7 s at **660 tok/s**. Follow-ups 113 and 171; decode 25–29 |
