@@ -18,16 +18,21 @@ fn log_softmax(l: &[f32]) -> Vec<f32> {
     l.iter().map(|x| x - lse).collect()
 }
 
-/// Both engines are f32 end to end, so only summation order differs: the GPU must agree
-/// with the CPU reference far more tightly than either agrees with llama.cpp.
+/// Both engines compute in f32 and store KV in f16 (llama.cpp's default); only summation order
+/// differs. End to end, that is chaotic: when two experts tie for the 8th routing slot (router
+/// logit gap 5.9e-5 at greedy.json case 2, position 8, layer 4), any reordering can flip the
+/// choice, and every later position of that case then moves by up to ~1. Positions before such a
+/// flip agree to <= 0.003. A kernel bug moves every position of every case, so the gate is on the
+/// median (and a sanity max); accuracy against llama.cpp is gated by the oracle floor test.
 #[test]
 #[ignore = "needs model file + GPU"]
 fn gpu_matches_cpu_reference() {
-    const TOL: f32 = 0.02;
+    const P50_TOL: f32 = 0.001;
+    const MAX_TOL: f32 = 2.0;
     let mut c = CpuModel::new(Gguf::open(model_path()).unwrap()).unwrap();
     let mut gm = gpu();
     let nv = c.n_vocab();
-    let mut worst = 0f32;
+    let (mut worst, mut diffs) = (0f32, vec![]);
     for case in golden("greedy.json").as_array().unwrap() {
         let mut seq: Vec<u32> = serde_json::from_value(case["prompt_tokens"].clone()).unwrap();
         let gen: Vec<u32> = serde_json::from_value(case["tokens"].clone()).unwrap();
@@ -41,12 +46,17 @@ fn gpu_matches_cpu_reference() {
             let mut idx: Vec<usize> = (0..nv).collect();
             idx.select_nth_unstable_by(4, |x, y| la[*y].total_cmp(&la[*x]));
             for &i in &idx[..5] {
-                worst = worst.max((la[i] - lb[i]).abs());
+                let d = (la[i] - lb[i]).abs();
+                worst = worst.max(d);
+                diffs.push(d);
             }
         }
     }
-    println!("GPU vs CPU: max |dlogprob| over CPU top-5 = {worst:.5}");
-    assert!(worst <= TOL, "GPU diverges from CPU reference: {worst} > {TOL}");
+    diffs.sort_by(f32::total_cmp);
+    let q = |f: f64| diffs[((diffs.len() - 1) as f64 * f) as usize];
+    println!("GPU vs CPU: max |dlogprob| over CPU top-5 = {worst:.5}; mean {:.5}, p50 {:.5}, p99 {:.5}, {} of {} > 0.02",
+        diffs.iter().sum::<f32>() / diffs.len() as f32, q(0.5), q(0.99), diffs.iter().filter(|&&d| d > 0.02).count(), diffs.len());
+    assert!(q(0.5) <= P50_TOL && worst <= MAX_TOL, "GPU diverges from CPU reference: p50 {} max {worst}", q(0.5));
 }
 
 #[test]

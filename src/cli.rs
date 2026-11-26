@@ -47,7 +47,7 @@ pub struct ServeArgs {
     /// Port [config: server.port, default: 8080]
     #[clap(long, env = "PORT")]
     pub port: Option<u16>,
-    /// Context size in tokens [config: model.ctx_size, default: 16384]
+    /// Context size in tokens [config: model.ctx_size, default: 32768]
     #[clap(long, env = "CTX_SIZE")]
     pub ctx_size: Option<usize>,
     /// VRAM expert cache in MiB [config: model.cache_mib, default: all free VRAM]
@@ -64,7 +64,7 @@ pub struct ClientArgs {
     #[clap(long, env = "PORT", default_value_t = 8080)]
     pub port: u16,
     /// Context size the clients are told about
-    #[clap(long, env = "CTX_SIZE", default_value_t = 16384)]
+    #[clap(long, env = "CTX_SIZE", default_value_t = crate::config::DEFAULT_CTX)]
     pub ctx_size: usize,
     /// Arguments passed through to the client
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]

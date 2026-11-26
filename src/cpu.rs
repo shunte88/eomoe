@@ -99,9 +99,11 @@ impl Engine for CpuModel {
                     rope(hv, pos);
                 }
             }
+            // The KV cache holds f16, as llama.cpp's default (and the GPU engine) does.
+            let f16 = |x: &f32| half::f16::from_f32(*x).to_f32();
             let (kc, vc) = &mut self.kv[li];
-            kc.extend_from_slice(&k);
-            vc.extend_from_slice(&v);
+            kc.extend(k.iter().map(f16));
+            vc.extend(v.iter().map(f16));
             let (kc, vc) = (&*kc, &*vc);
 
             let scale = 1.0 / (hd as f32).sqrt();

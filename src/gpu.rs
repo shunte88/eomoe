@@ -23,6 +23,13 @@ type Ptr = CUdeviceptr;
 const CACHE_MAX_BATCH: usize = 32;
 /// Staging slots for the misses of uncached (large) ubatches, used in waves.
 const STAGE: usize = 32;
+/// Batches of at least this many tokens (per expert, for experts) use the tiled GEMM.
+const GEMM_MIN: usize = 16;
+/// Tokens per layer-major prefill pass: the experts move once per SPAN tokens. Costs
+/// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
+const SPAN: usize = 4096;
+/// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
+const LOGIT_ROWS: usize = 64;
 /// VRAM left free after sizing the expert cache to "as much as fits".
 const VRAM_RESERVE: usize = 192 << 20;
 
@@ -67,9 +74,19 @@ struct Kernels {
     mm_q6_k: CudaFunction,
     mm_q4_k_ids: CudaFunction,
     mm_q6_k_ids: CudaFunction,
+    mm_q4_k_t8: CudaFunction,
+    mm_q6_k_t8: CudaFunction,
+    mm_q4_k_ids_t8: CudaFunction,
+    mm_q6_k_ids_t8: CudaFunction,
+    gemm_q4_k: CudaFunction,
+    gemm_q6_k: CudaFunction,
+    gemm_q4_k_ids: CudaFunction,
+    gemm_q6_k_ids: CudaFunction,
     rmsnorm: CudaFunction,
     qk_norm_rope: CudaFunction,
     attention: CudaFunction,
+    attention_tiled: CudaFunction,
+    store_f16: CudaFunction,
     add_inplace: CudaFunction,
     gather_rows: CudaFunction,
     swiglu: CudaFunction,
@@ -104,6 +121,8 @@ struct Scratch {
     h: Ptr,
     q: Ptr,
     attn: Ptr,
+    /// This chunk's K | V (f32) before roping and storing into the f16 cache.
+    kvs: Ptr,
     o: Ptr,
     rl: Ptr,
     /// Gathered rows: inputs, [gate | up] outputs, swiglu activations, down outputs.
@@ -112,7 +131,7 @@ struct Scratch {
     act: Ptr,
     db: Ptr,
     logits: Ptr,
-    /// Per layer routing, see `forward_chunk`: [gidx | trow | tw | wp].
+    /// Per layer routing, see `forward_span` and `meta_bytes`.
     meta: Ptr,
 }
 
@@ -123,7 +142,7 @@ pub struct GpuModel {
     layers: Vec<DLayer>,
     out_norm: Ptr,
     output: Mat,
-    /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f32.
+    /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16.
     kv: Ptr,
     groups: Vec<Group>,
     group_of: Vec<usize>,
@@ -137,6 +156,8 @@ pub struct GpuModel {
     s: Scratch,
     n_ctx: usize,
     max_batch: usize,
+    /// Tokens per layer-major pass (`forward_span`).
+    span: usize,
     n_past: usize,
     /// Owns every device allocation the raw pointers above point into.
     _bufs: Vec<CudaSlice<u8>>,
@@ -145,6 +166,7 @@ pub struct GpuModel {
 }
 
 const F: usize = std::mem::size_of::<f32>();
+const H: usize = 2; // f16
 
 fn err(e: impl std::fmt::Debug) -> String {
     format!("CUDA: {e:?}")
@@ -171,9 +193,19 @@ impl GpuModel {
             mm_q6_k: f("mm_q6_k")?,
             mm_q4_k_ids: f("mm_q4_k_ids")?,
             mm_q6_k_ids: f("mm_q6_k_ids")?,
+            mm_q4_k_t8: f("mm_q4_k_t8")?,
+            mm_q6_k_t8: f("mm_q6_k_t8")?,
+            mm_q4_k_ids_t8: f("mm_q4_k_ids_t8")?,
+            mm_q6_k_ids_t8: f("mm_q6_k_ids_t8")?,
+            gemm_q4_k: f("gemm_q4_k")?,
+            gemm_q6_k: f("gemm_q6_k")?,
+            gemm_q4_k_ids: f("gemm_q4_k_ids")?,
+            gemm_q6_k_ids: f("gemm_q6_k_ids")?,
             rmsnorm: f("rmsnorm")?,
             qk_norm_rope: f("qk_norm_rope")?,
             attention: f("attention")?,
+            attention_tiled: f("attention_tiled")?,
+            store_f16: f("store_f16")?,
             add_inplace: f("add_inplace")?,
             gather_rows: f("gather_rows")?,
             swiglu: f("swiglu")?,
@@ -230,7 +262,7 @@ impl GpuModel {
             return Err(format!("head_dim {} unsupported by the attention kernel", hp.head_dim));
         }
         let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
-        let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * F)?;
+        let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * H)?;
         let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
         let layout = |l: &crate::qwen3moe::Layer| (l.gate.ty, l.up.ty, l.down.ty, ebytes(l));
         let mut layouts = vec![];
@@ -246,22 +278,23 @@ impl GpuModel {
         let stage_bytes = layouts.iter().map(|l| l.3).max().unwrap_or(0);
         let host = pin_experts(&ctx, &w, host_bytes);
         let stage = alloc(STAGE * stage_bytes)?;
-        let b = n_ctx.min(512);
+        let (b, span) = (n_ctx.min(512), n_ctx.min(SPAN));
         let s = Scratch {
-            x: alloc(b * e * F)?,
-            h: alloc(b * e * F)?,
+            x: alloc(span * e * F)?,
+            h: alloc(span * e * F)?,
             q: alloc(b * nq * F)?,
             attn: alloc(b * nq * F)?,
+            kvs: alloc(2 * b * kvd * F)?,
             o: alloc(b * e * F)?,
             rl: alloc(b * hp.n_expert * F)?,
             xg: alloc(b * kk * e * F)?,
             gu: alloc(b * kk * 2 * hp.n_ff_exp * F)?,
             act: alloc(b * kk * hp.n_ff_exp * F)?,
             db: alloc(b * kk * e * F)?,
-            logits: alloc(b * hp.n_vocab * F)?,
-            meta: alloc(meta_bytes(b * kk))?,
+            logits: alloc(LOGIT_ROWS.min(b) * hp.n_vocab * F)?,
+            meta: alloc(meta_bytes(span, b, kk, hp.n_expert))?,
         };
-        let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(b * kk), 0) }.map_err(err)?;
+        let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(span, b, kk, hp.n_expert), 0) }.map_err(err)?;
         // The expert banks get what is left: the requested MiB, capped by free VRAM.
         let (free, _) = result::mem_get_info().map_err(err)?;
         let budget = (cache_mib << 20).min(free.saturating_sub(VRAM_RESERVE));
@@ -301,6 +334,7 @@ impl GpuModel {
             s,
             n_ctx,
             max_batch: b,
+            span,
             n_past: 0,
             _bufs: bufs,
             vram_bytes: vram.get(),
@@ -311,6 +345,11 @@ impl GpuModel {
     /// Expert cache counters since load (cached ubatches only).
     pub fn cache_stats(&self) -> CacheStats {
         self.stats
+    }
+
+    /// Expert cache slots per layer group.
+    pub fn cache_slots(&self) -> Vec<usize> {
+        self.groups.iter().map(|g| g.cache.n_slots()).collect()
     }
 
     /// Queue a copy of expert `ex` of layer `li` (gate | up | down) to `dst`; returns its bytes.
@@ -334,27 +373,41 @@ impl GpuModel {
     }
 
     fn mm(&self, m: &Mat, x: Ptr, y: Ptr, ntok: usize) {
-        // Quantized kernels: one warp per row, MM_ROWS (= 4) rows per block.
-        let (f, gx, block) = match m.ty {
-            GgmlType::F32 => (&self.k.mm_f32, m.n_rows, 256),
-            GgmlType::Q4_K => (&self.k.mm_q4_k, m.n_rows.div_ceil(4), 128),
-            GgmlType::Q6_K => (&self.k.mm_q6_k, m.n_rows.div_ceil(4), 128),
-            t => unreachable!("checked at load: {t:?}"),
+        // Quantized kernels: one warp per row, MM_ROWS (= 4) rows per block; tiles of 8 tokens
+        // (prefill) or one token (decode) per grid row.
+        let (p, rb, k, n, ti) = (m.p, m.row_bytes as u64, m.k as i32, m.n_rows as i32, ntok as i32);
+        if m.ty == GgmlType::F32 {
+            return launch!(self, self.k.mm_f32, (m.n_rows as u32, ntok as u32, 1), 256, [p, rb, k, x, y, n]);
+        }
+        let (f, gx, gy) = match (m.ty, ntok) {
+            (GgmlType::Q4_K, 1) => (&self.k.mm_q4_k, m.n_rows.div_ceil(4), 1),
+            (GgmlType::Q6_K, 1) => (&self.k.mm_q6_k, m.n_rows.div_ceil(4), 1),
+            (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (t, _) => unreachable!("checked at load: {t:?}"),
         };
-        let (p, rb, k, n) = (m.p, m.row_bytes as u64, m.k as i32, m.n_rows as i32);
-        launch!(self, f, (gx as u32, ntok as u32, 1), block, [p, rb, k, x, y, n]);
+        launch!(self, f, (gx as u32, gy as u32, 1), 128, [p, rb, k, x, y, n, ti]);
     }
 
-    /// Grouped expert matvec: gathered row j reads the weights at wp[j] + off.
+    /// Grouped expert matvec: gathered row j reads the weights at wp[j] + off. The kernel is
+    /// picked by rows per expert: tiles share decoded weights only within one expert (the
+    /// GEMM re-decodes them per expert a tile straddles; the 8-token tile falls back to one
+    /// token at a time), so decode's ~1 row per expert runs one row per grid row.
     #[allow(clippy::too_many_arguments)]
-    fn mm_ids(&self, ty: GgmlType, wp: Ptr, off: u64, row_bytes: usize, k: usize, x: Ptr, y: Ptr, n_rows: usize, ntok: usize) {
-        let f = match ty {
-            GgmlType::Q4_K => &self.k.mm_q4_k_ids,
-            GgmlType::Q6_K => &self.k.mm_q6_k_ids,
-            t => unreachable!("checked at load: {t:?}"),
+    fn mm_ids(&self, ty: GgmlType, wp: Ptr, off: u64, row_bytes: usize, k: usize, x: Ptr, y: Ptr, n_rows: usize, ntok: usize, per_expert: usize) {
+        let (f, gx, gy) = match (ty, per_expert) {
+            (GgmlType::Q4_K, ..4) => (&self.k.mm_q4_k_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::Q6_K, ..4) => (&self.k.mm_q6_k_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (t, _) => unreachable!("checked at load: {t:?}"),
         };
-        let (rb, k, n) = (row_bytes as u64, k as i32, n_rows as i32);
-        launch!(self, f, (n_rows.div_ceil(4) as u32, ntok as u32, 1), 128, [wp, off, rb, k, x, y, n]);
+        let (rb, k, n, ti) = (row_bytes as u64, k as i32, n_rows as i32, ntok as i32);
+        launch!(self, f, (gx as u32, gy as u32, 1), 128, [wp, off, rb, k, x, y, n, ti]);
     }
 
     fn htod<T>(&self, dst: Ptr, src: &[T]) {
@@ -372,14 +425,19 @@ impl GpuModel {
         assert!(self.n_past + n <= self.n_ctx, "context overflow: {} + {n} > {}", self.n_past, self.n_ctx);
     }
 
-    /// Run one ubatch; returns the logits of every token, or of the last only.
-    fn forward_chunk(&mut self, tokens: &[u32], all_logits: bool) -> Vec<f32> {
+    /// Run up to `span` tokens layer by layer: attention in ubatches of `max_batch`, then the
+    /// MoE of the whole span in expert waves, so each expert is uploaded at most once per layer
+    /// (a 4096-token prefill moves the experts once, not once per ubatch). Returns the logits of
+    /// every token, or of the last only.
+    fn forward_span(&mut self, tokens: &[u32], all_logits: bool) -> Vec<f32> {
         let hp = &self.w.hp;
         let (e, hd, nh, nkv, ff, kk) = (hp.n_embd, hp.head_dim, hp.n_head, hp.n_head_kv, hp.n_ff_exp, hp.n_expert_used);
-        let (kvd, t) = (nkv * hd, tokens.len());
+        let (kvd, t, b) = (nkv * hd, tokens.len(), self.max_batch);
         let s = self.s;
         let nv = hp.n_vocab;
         let n_expert = hp.n_expert;
+        let chunks: Vec<(usize, usize)> = (0..t).step_by(b).map(|c0| (c0, b.min(t - c0))).collect();
+        let at = |p: Ptr, c0: usize, width: usize| p + (c0 * width * F) as u64;
 
         let mut xe = vec![0f32; t * e];
         for (row, &tok) in xe.chunks_exact_mut(e).zip(tokens) {
@@ -387,141 +445,175 @@ impl GpuModel {
         }
         self.htod(s.x, &xe);
 
-        let (ei, eps, base, pos0) = (e as i32, hp.eps, hp.rope_base, self.n_past as i32);
-        let (nhi, nkvi, hdi, tn) = (nh as i32, nkv as i32, hd as i32, t as u32);
+        let (ei, eps, base) = (e as i32, hp.eps, hp.rope_base);
+        let (nhi, nkvi, hdi) = (nh as i32, nkv as i32, hd as i32);
         let scale = 1.0 / (hd as f32).sqrt();
         for (li, l) in self.layers.iter().enumerate() {
-            let (x, h, q, attn, o) = (s.x, s.h, s.q, s.attn, s.o);
-            let kc = self.kv + (li * 2 * self.n_ctx * kvd * F) as u64;
-            let vc = kc + (self.n_ctx * kvd * F) as u64;
-            let (kd, vd) = (kc + (self.n_past * kvd * F) as u64, vc + (self.n_past * kvd * F) as u64);
+            let kc = self.kv + (li * 2 * self.n_ctx * kvd * H) as u64;
+            let vc = kc + (self.n_ctx * kvd * H) as u64;
+            // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
+            let mut sels = vec![];
+            for &(c0, tc) in &chunks {
+                let (x, h, q, attn, o) = (at(s.x, c0, e), at(s.h, c0, e), s.q, s.attn, s.o);
+                let pos = self.n_past + c0;
+                let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
+                let (kd, vd) = (kc + (pos * kvd * H) as u64, vc + (pos * kvd * H) as u64);
+                let (ks, vs) = (s.kvs, s.kvs + (tc * kvd * F) as u64);
+                let wn = l.attn_norm;
+                launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
+                self.mm(&l.wq, h, q, tc);
+                self.mm(&l.wk, h, ks, tc);
+                self.mm(&l.wv, h, vs, tc);
+                let (qn, kn) = (l.q_norm, l.k_norm);
+                launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
+                launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base]);
+                let nkv_t = (tc * kvd) as i32;
+                let g = ((tc * kvd).div_ceil(256) as u32, 1, 1);
+                launch!(self, self.k.store_f16, g, 256, [kd, ks, nkv_t]);
+                launch!(self, self.k.store_f16, g, 256, [vd, vs, nkv_t]);
+                if tc > 1 && hd == 128 && 32 % (nh / nkv) == 0 {
+                    let g = (nkv as u32, (tc * (nh / nkv)).div_ceil(32) as u32, 1);
+                    launch!(self, self.k.attention_tiled, g, 256, [q, kc, vc, attn, nhi, nkvi, pos0, ti, scale]);
+                } else {
+                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
+                }
+                self.mm(&l.wo, attn, o, tc);
+                let n = (tc * e) as i32;
+                launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
+                let wn = l.ffn_norm;
+                launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
+                self.mm(&l.router, h, s.rl, tc);
+                sels.push(route(&self.dtoh(s.rl, tc * n_expert), n_expert, kk));
+            }
 
-            // --- attention ---
-            let wn = l.attn_norm;
-            launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-            self.mm(&l.wq, h, q, t);
-            self.mm(&l.wk, h, kd, t);
-            self.mm(&l.wv, h, vd, t);
-            let (qn, kn) = (l.q_norm, l.k_norm);
-            launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
-            launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [kd, kn, nkvi, hdi, pos0, eps, base]);
-            launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
-            self.mm(&l.wo, attn, o, t);
-            let n = (t * e) as i32;
-            launch!(self, self.k.add_inplace, ((t * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
-
-            // --- MoE FFN: route on the host, stage the selected experts, run them ---
-            let wn = l.ffn_norm;
-            launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-            self.mm(&l.router, h, s.rl, t);
-            let sel = route(&self.dtoh(s.rl, t * n_expert), n_expert, kk);
-            let mut by_expert: Vec<Vec<(usize, f32)>> = vec![vec![]; n_expert];
-            for (ti, ts) in sel.iter().enumerate() {
+            // --- MoE: experts in waves; each wave runs over every ubatch ---
+            let mut by_expert: Vec<Vec<(usize, f32)>> = vec![vec![]; n_expert]; // (span token, weight)
+            for (ti, ts) in sels.iter().flatten().enumerate() {
                 for &(ex, wgt) in ts {
                     by_expert[ex].push((ti, wgt));
                 }
             }
-            // Rows grouped by expert (ascending); per token, its k rows in expert order.
-            let (mut gidx, mut segs) = (vec![], vec![]);
-            let (mut trow, mut tw) = (vec![vec![]; t], vec![vec![]; t]);
-            for (ex, toks) in by_expert.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
-                segs.push((ex, gidx.len(), toks.len()));
-                for &(ti, wgt) in toks {
-                    trow[ti].push(gidx.len() as i32);
-                    tw[ti].push(wgt);
-                    gidx.push(ti as i32);
-                }
-            }
-            let r = gidx.len();
-            // wp[j]: the slot (gate | up | down) of the expert of gathered row j.
-            let mut wp = vec![0u64; r];
+            let used: Vec<usize> = (0..n_expert).filter(|&ex| !by_expert[ex].is_empty()).collect();
             let gi = self.group_of[li];
+            let (bank, sb) = (self.groups[gi].bank, self.groups[gi].slot_bytes);
+            // ptr[ex]: where expert ex's (gate | up | down) will be when its wave runs.
+            let mut ptr = vec![0u64; n_expert];
+            // Cached ubatches go through the cache policy and run as one wave; larger spans
+            // bypass it (as in the oracle): resident experts are read in place, misses are
+            // streamed through the STAGE staging slots, one wave at a time.
             let cached = t <= CACHE_MAX_BATCH;
-            if cached {
-                let ids: Vec<u32> = sel.iter().flatten().map(|&(e, _)| e as u32).collect();
+            let waves: Vec<&[usize]> = if cached {
+                let ids: Vec<u32> = sels[0].iter().flatten().map(|&(e, _)| e as u32).collect();
                 let p = self.groups[gi].cache.plan(li, &ids, t);
-                let (bank, sb) = (self.groups[gi].bank, self.groups[gi].slot_bytes);
                 for &(ex, slot) in &p.fills {
                     self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64) as u64;
                 }
                 self.stats.hits += p.hits as u64;
                 self.stats.misses += p.fills.len() as u64;
-                for &(ex, r0, nr) in &segs {
-                    let slot = self.groups[gi].cache.slot(li, ex).expect("planned expert resident");
-                    wp[r0..r0 + nr].fill(bank + (slot * sb) as u64);
+                for &ex in &used {
+                    ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).expect("planned expert resident") * sb) as u64;
+                }
+                vec![&used[..]]
+            } else {
+                let waves: Vec<&[usize]> = used.chunks(STAGE).collect();
+                for wave in &waves {
+                    for (j, &ex) in wave.iter().enumerate() {
+                        ptr[ex] = match self.groups[gi].cache.slot(li, ex) {
+                            Some(slot) => bank + (slot * sb) as u64,
+                            None => self.stage + (j * self.stage_bytes) as u64,
+                        };
+                    }
+                }
+                waves
+            };
+            // Routing for every pass, one async copy per layer: a pass is up to `b * kk` gathered
+            // rows of one wave, from the whole span (so each expert sees all its span tokens).
+            // The pinned buffer is free: the router dtoh above waited for the previous layer's copy.
+            let mut passes = vec![]; // (wave, rows, offset of this pass's routing, rows per expert)
+            let mut blob: Vec<u8> = vec![];
+            for (wi, wave) in waves.iter().enumerate() {
+                // (span token, expert, weight), grouped by expert
+                let rows: Vec<(usize, usize, f32)> = wave
+                    .iter()
+                    .flat_map(|&ex| by_expert[ex].iter().map(move |r| (r.0, ex, r.1)))
+                    .collect();
+                for rows in rows.chunks(b * kk) {
+                    let mut off = vec![0i32; t + 1];
+                    for r in rows {
+                        off[r.0 + 1] += 1;
+                    }
+                    for i in 0..t {
+                        off[i + 1] += off[i];
+                    }
+                    let (mut crow, mut cw, mut fill) = (vec![0i32; rows.len()], vec![0f32; rows.len()], off.clone());
+                    for (j, r) in rows.iter().enumerate() {
+                        let k = fill[r.0] as usize;
+                        (crow[k], cw[k]) = (j as i32, r.2);
+                        fill[r.0] += 1;
+                    }
+                    let n_ex = 1 + rows.windows(2).filter(|w| w[0].1 != w[1].1).count();
+                    passes.push((wi, rows.len(), blob.len(), rows.len() / n_ex));
+                    blob.extend(rows.iter().flat_map(|r| (r.0 as i32).to_le_bytes()));
+                    blob.extend(off.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.extend(crow.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.extend(cw.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.resize(blob.len().next_multiple_of(8), 0);
+                    blob.extend(rows.iter().flat_map(|r| ptr[r.1].to_le_bytes()));
                 }
             }
-            // One async copy of the routing. The pinned buffer is free again: the router dtoh
-            // above waited for the previous layer's copy.
-            let (o_tr, o_tw, o_wp) = meta_offsets(r);
             {
                 let m = self.meta_host.as_mut_slice().expect("pinned");
-                let put = |m: &mut [u8], o: usize, v: [u8; 4]| m[o..o + 4].copy_from_slice(&v);
-                for (j, &v) in gidx.iter().enumerate() {
-                    put(m, 4 * j, v.to_le_bytes());
-                }
-                for (j, &v) in trow.concat().iter().enumerate() {
-                    put(m, o_tr + 4 * j, v.to_le_bytes());
-                }
-                for (j, &v) in tw.concat().iter().enumerate() {
-                    put(m, o_tw + 4 * j, v.to_le_bytes());
-                }
-                for (j, &v) in wp.iter().enumerate() {
-                    m[o_wp + 8 * j..o_wp + 8 * j + 8].copy_from_slice(&v.to_le_bytes());
-                }
-                unsafe { result::memcpy_htod_async(s.meta, &m[..o_wp + 8 * r], self.stream.cu_stream()) }.expect("htod async");
+                m[..blob.len()].copy_from_slice(&blob);
+                unsafe { result::memcpy_htod_async(s.meta, &m[..blob.len()], self.stream.cu_stream()) }.expect("htod async");
             }
-            let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
-            let (gi_, tr, twp, wpd) = (s.meta, s.meta + o_tr as u64, s.meta + o_tw as u64, s.meta + o_wp as u64);
-            launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gi_, ei]);
             let wl = &self.w.layers[li];
             let down_off = (self.w.expert(wl, 0)[0].len() * 2) as u64;
-            // Cached ubatches run all experts at once; uncached ones in waves of STAGE, the
-            // misses of each wave streamed through the staging slots.
-            for wave in segs.chunks(if cached { segs.len().max(1) } else { STAGE }) {
-                let (r0, rn) = (wave[0].1, wave.iter().map(|x| x.2).sum::<usize>());
+            let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
+            for (wi, wave) in waves.iter().enumerate() {
                 if !cached {
-                    let g = &self.groups[gi];
-                    for (j, &(ex, w0, nr)) in wave.iter().enumerate() {
-                        let p = match g.cache.slot(li, ex) {
-                            Some(slot) => g.bank + (slot * g.slot_bytes) as u64,
-                            None => {
-                                let p = self.stage + (j * self.stage_bytes) as u64;
-                                self.upload_expert(li, ex, p);
-                                p
-                            }
-                        };
-                        wp[w0..w0 + nr].fill(p);
+                    for (j, &ex) in wave.iter().enumerate() {
+                        if self.groups[gi].cache.slot(li, ex).is_none() {
+                            self.upload_expert(li, ex, self.stage + (j * self.stage_bytes) as u64);
+                        }
                     }
-                    self.htod(wpd + (r0 * 8) as u64, &wp[r0..r0 + rn]);
                 }
-                let (wpw, xin) = (wpd + (r0 * 8) as u64, xg + (r0 * e * F) as u64);
-                let (guw, aw) = (gu + (r0 * 2 * ff * F) as u64, act + (r0 * ff * F) as u64);
-                self.mm_ids(wl.gate.ty, wpw, 0, wl.gate.row_bytes(), e, xin, guw, 2 * ff, rn);
-                let (ffi, rni) = (ff as i32, rn as i32);
-                launch!(self, self.k.swiglu, ((rn * ff).div_ceil(256) as u32, 1, 1), 256, [aw, guw, ffi, rni]);
-                self.mm_ids(wl.down.ty, wpw, down_off, wl.down.row_bytes(), ff, aw, dbuf + (r0 * e * F) as u64, e, rn);
+                for &(_, r, o, per_ex) in passes.iter().filter(|p| p.0 == wi) {
+                    let (x, h) = (s.x, s.h);
+                    let gidx = s.meta + o as u64;
+                    let off = gidx + (4 * r) as u64;
+                    let (crow, cw) = (off + (4 * (t + 1)) as u64, off + (4 * (t + 1) + 4 * r) as u64);
+                    let wp = s.meta + (o + 4 * r + 4 * (t + 1) + 8 * r).next_multiple_of(8) as u64;
+                    launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gidx, ei]);
+                    self.mm_ids(wl.gate.ty, wp, 0, wl.gate.row_bytes(), e, xg, gu, 2 * ff, r, per_ex);
+                    let (ffi, ri) = (ff as i32, r as i32);
+                    launch!(self, self.k.swiglu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
+                    self.mm_ids(wl.down.ty, wp, down_off, wl.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
+                    launch!(self, self.k.moe_combine, (t as u32, 1, 1), 256, [x, dbuf, off, crow, cw, ei]);
+                }
             }
-            let ki = kk as i32;
-            launch!(self, self.k.moe_combine, (tn, 1, 1), 256, [x, dbuf, tr, twp, ki, ei]);
         }
         self.n_past += t;
 
-        let (r0, nr) = if all_logits { (0, t) } else { (t - 1, 1) };
-        let (x, h, wn, nrn) = (s.x + (r0 * e * F) as u64, s.h, self.out_norm, nr as u32);
-        launch!(self, self.k.rmsnorm, (nrn, 1, 1), 256, [h, x, wn, ei, eps]);
-        self.mm(&self.output, h, s.logits, nr);
-        self.dtoh(s.logits, nr * nv)
+        let rows: Vec<(usize, usize)> =
+            if all_logits { (0..t).step_by(LOGIT_ROWS).map(|r0| (r0, LOGIT_ROWS.min(t - r0))).collect() } else { vec![(t - 1, 1)] };
+        let mut out = Vec::with_capacity(rows.iter().map(|r| r.1).sum::<usize>() * nv);
+        for (r0, nr) in rows {
+            let (x, h, wn, nrn) = (at(s.x, r0, e), s.h, self.out_norm, nr as u32);
+            launch!(self, self.k.rmsnorm, (nrn, 1, 1), 256, [h, x, wn, ei, eps]);
+            self.mm(&self.output, h, s.logits, nr);
+            out.extend(self.dtoh(s.logits, nr * nv));
+        }
+        out
     }
 }
 
-/// Byte offsets of trow, tw and wp in the routing buffer for r gathered rows (gidx at 0).
-fn meta_offsets(r: usize) -> (usize, usize, usize) {
-    (4 * r, 8 * r, (12 * r).next_multiple_of(8))
-}
-
-fn meta_bytes(r: usize) -> usize {
-    meta_offsets(r).2 + 8 * r
+/// Bytes of one layer's routing for a span of `t` tokens in ubatches of `b` (see
+/// `forward_span`): per pass, gidx | off | crow | cw (4 bytes each; off has t + 1 entries),
+/// padding to 8, then wp (8 bytes per row). Passes: at most one partial per wave plus
+/// t * kk / (b * kk) full ones.
+fn meta_bytes(t: usize, b: usize, kk: usize, n_expert: usize) -> usize {
+    let passes = n_expert.div_ceil(STAGE) + t.div_ceil(b);
+    t * kk * 20 + passes * (4 * (t + 1) + 8)
 }
 
 /// Copy every expert into pinned RAM in slot layout; None (pageable fallback) if pinning fails.
@@ -584,15 +676,15 @@ impl Engine for GpuModel {
     /// Panics if the KV cache would overflow n_ctx.
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
         self.check_ctx(tokens.len());
-        tokens.chunks(self.max_batch).flat_map(|c| self.forward_chunk(c, true)).collect()
+        tokens.chunks(self.span).flat_map(|c| self.forward_span(c, true)).collect()
     }
 
     fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
         self.check_ctx(tokens.len());
-        let n = tokens.len().div_ceil(self.max_batch);
+        let n = tokens.len().div_ceil(self.span);
         let mut last = vec![];
-        for (i, c) in tokens.chunks(self.max_batch).enumerate() {
-            last = self.forward_chunk(c, false);
+        for (i, c) in tokens.chunks(self.span).enumerate() {
+            last = self.forward_span(c, false);
             if i + 1 < n {
                 last.clear();
             }

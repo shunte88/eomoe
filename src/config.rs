@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::ServeArgs;
 
+/// Fits a stock Claude Code prompt (~19K tokens); with the f16 KV cache it costs what 16K did in f32.
+pub const DEFAULT_CTX: usize = 32768;
+
 /// Top-level YAML config. Every key is optional; unknown keys are ignored.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -58,7 +61,7 @@ impl EomoeConfig {
         let (m, s) = (&self.model, &self.server);
         ServeSettings {
             model: cli.model.clone().or_else(|| m.path.clone()).unwrap_or_else(crate::cli::default_model),
-            ctx_size: cli.ctx_size.or(m.ctx_size).unwrap_or(16384),
+            ctx_size: cli.ctx_size.or(m.ctx_size).unwrap_or(DEFAULT_CTX),
             cache_mib: cli.cache_mib.or(m.cache_mib),
             host: cli.host.clone().or_else(|| s.host.clone()).unwrap_or_else(|| "127.0.0.1".into()),
             port: cli.port.or(s.port).unwrap_or(8080),
@@ -80,7 +83,7 @@ mod tests {
         assert_eq!(s.cache_mib, Some(2000)); // config
         assert_eq!(s.host, "0.0.0.0"); // config
         assert_eq!(s.port, 7000); // CLI beats config
-        assert_eq!((s.ctx_size, s.alias.as_str()), (16384, "local-code")); // defaults
+        assert_eq!((s.ctx_size, s.alias.as_str()), (DEFAULT_CTX, "local-code")); // defaults
         assert_eq!(EomoeConfig::default().resolve_serve(&cli).cache_mib, None);
     }
 

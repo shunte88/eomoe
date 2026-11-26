@@ -3,7 +3,7 @@
 
 model:
   path: "/opt/eomoe/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
-  ctx_size: 16384
+  ctx_size: 32768
   # cache_mib: 4000        # VRAM for the expert cache; default: all free VRAM
 
 server:

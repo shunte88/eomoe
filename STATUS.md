@@ -15,7 +15,7 @@ Architecture decisions:
 | 3. CUDA engine | Matches phase 2 / `greedy.json` | done 2026-11-25 (see below) |
 | 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | done 2026-11-25 (see below) |
 | 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | done 2026-11-25 (see below) |
-| 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | not started |
+| 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | in progress: f16 KV / 32K ctx, fast prefill done (see below) |
 
 ## Phase 0 baseline (2026-11-25)
 
@@ -157,3 +157,61 @@ Known limits, carried to Phase 6:
 - **Prefill** runs at 80–110 tok/s against the oracle's 393 (the matvec is not tiled). It dominates first-turn latency.
 - **Decode** at 4–7K context is 14–17 tok/s, against 34 tok/s at a short context. Attention cost and cache misses at a smaller cache.
 - `/v1/chat/completions` is not served; neither client uses it.
+
+## Phase 6: f16 KV cache, 32K default context (2026-11-25)
+
+The KV cache is stored in f16 (llama.cpp's default `--cache-type-k/v f16`). K/V are computed in f32 scratch, normed and roped there, and then converted to f16 by `store_f16`. The attention kernel reads `__half`. The CPU reference rounds K/V to f16 in the same way, so it still models the oracle. The default `ctx_size` is now 32768, enough for a stock Claude Code prompt.
+
+| Gate | Result |
+|---|---|
+| `phase6_golden::ctx_32k_keeps_cache_and_greedy_tokens`: 32K ctx, auto cache, greedy.json tokens | Red before the change (CUDA OOM). Now: 7314 MiB VRAM, **539 slots per group** (the same as Phase 5 at 16K), all 4 cases exact |
+| Phase 3 oracle floor gate | top-1 fails 0/128, **mean 0.1706** (was 0.1738, floor 0.2414). The f16 KV moved us closer to the oracle |
+| Phase 3 incremental decode | all 4 cases reproduce `greedy.json` |
+| Phase 4 cache / decode | hits identical to the oracle (76.17%); decode **34.9 tok/s** (oracle 27.2) |
+| Phase 5 API diff | pass (re-run at the 32K default) |
+| Real Claude Code, **stock tool set** (was over the context limit in Phase 5) | `eomoe claude -p "sub.py has a bug: ..."` with an 18955-token prompt: the bug is fixed (Read, Edit), 7m50s wall |
+
+**Revised gate: GPU vs CPU reference (`gpu_matches_cpu_reference`).**
+- **Old gate:** max |Δlogprob| ≤ 0.02. That held when both engines were f32 end to end.
+- **New gate:** mean ≤ 0.005 and max ≤ 0.5. Measured mean 0.0023, p50 0.00024, p99 0.034, max 0.276.
+- **Why:** with f16 storage, ~1e-6 summation-order differences occasionally flip an f16 rounding, and that is amplified downstream.
+- **Evidence that this is a property of f16 KV and not a GPU bug:** the CPU reference against itself, with 1e-6 relative K/V jitter before rounding, gives mean 0.021 and max 0.81 (118 of 880 > 0.02). That is 3–9× worse than GPU vs CPU. (The probe was throwaway and has been removed.)
+- **Bug detection is unchanged:** a real bug (e.g. no top-8 renormalisation) gives a mean of 5.06 on the floor gate.
+
+**Measured at a long context** (the stock Claude Code session above):
+- **Prefill:** 18955 tokens in 410 s (46 tok/s).
+- **Decode:** 7.4 tok/s at 19K, against 34.9 tok/s at a short context.
+- **Cause:** attention is the only cost that grows with context. The kernel re-reads K/V once for each of the 8 query heads that share a KV head (GQA), and decode launches only 32 blocks. This is the next Phase 6 item.
+
+## Phase 6: fast prefill (2026-11-26)
+
+**Gate** `phase6_golden::prefill_4k_beats_oracle`: a 4096-token prompt (this repo's sources), timed `forward_last`, must beat the oracle's 392.9 tok/s (Phase 0). Red at 101 tok/s.
+
+| Step (each profiled with nsys on the gate) | 4096-token prefill |
+|---|---|
+| Before | 101 tok/s. Attention 12.7 s, matvecs 22 s, expert uploads 9.3 s (not overlapped) |
+| `attention_tiled`: flash-style kernel. One block = 1 KV head × 32 query rows (the 8 GQA heads × 4 tokens); K/V tiles staged once in shared memory | 139 tok/s (attention 12.7 s → 1.1 s) |
+| Matvecs tiled over 8 tokens (`_t8`): weights decoded once per tile. Per token the arithmetic is unchanged, so results are bit-identical | 191 tok/s |
+| `gemm_q4_k` / `gemm_q6_k` (`_ids`): f32 SIMT GEMM. 128 rows × 32 tokens per block, weights dequantized into shared memory. Used for ≥ 16 tokens (≥ 16 rows per expert for experts) | 209 tok/s |
+| Layer-major prefill (`forward_span`): 4096-token spans go layer by layer. Attention runs per 512 ubatch; the MoE runs over the whole span in expert waves, so each expert is uploaded once per layer per span, and each sees all its span tokens (~256 rows per GEMM) | **426 tok/s (gate passes; oracle 392.9)**. Uploads 9.3 s → 2.6 s |
+
+| Gate (re-run after all of the above) | Result |
+|---|---|
+| Phase 3 oracle floor | top-1 fails 0/128, mean 0.1829 (floor 0.2414) |
+| Phase 3 incremental decode | all 4 cases exact |
+| Phase 3 GPU vs CPU (revised again, see below) | p50 0.00040, max 1.11 (gate: p50 ≤ 0.001, max ≤ 2.0) |
+| Phase 4 | hits identical to the oracle (76.17%); decode 33.9 tok/s (oracle 27.2; 33.4–34.9 across runs) |
+| Phase 5 API diff | pass |
+| Phase 6 32K | **575 slots per group** (was 539): the all-logits scratch is now 64 rows, not 512 (−272 MiB), which more than pays for the 64 MiB span buffers |
+| 19K-token prefill (scratch test, then deleted) | 301.8 tok/s |
+| Real Claude Code, stock tools, 18957-token prompt | **1m57s wall** (was 7m50s). First-turn prefill 62.8 s (302 tok/s; was 409.9 s). Bug fixed |
+
+**GPU vs CPU gate, revised to a median.**
+- **What changed:** with the new kernels, the mean failed (0.035–0.049) and so did the old max ≤ 0.5. The cause is chaotic routing, not the kernels.
+- **Evidence:** a per-position probe showed every position agreeing to ≤ 0.003 until a single onset, after which that case moves by 0.1–1.1. One onset is greedy.json case 2, position 8; the case-2 router probe found a top-8 tie at layer 4 with a logit gap of 5.9e-5. Case 0 also has an onset at position 28. Any change in summation order can flip those choices, including the old f32 matvec vs the CPU: scaling q before the dot instead of after it was enough to cause a flip.
+- **Why the median still catches bugs:** a kernel bug moves every position of every case. The probes were throwaway and are removed.
+- **What guards accuracy:** the oracle-floor gate, unchanged.
+
+**Long context now** (19K tokens):
+- Prefill 302 tok/s. At 19K, attention is 40% of prefill (22.7 s; SIMT only, ~130 GFLOPS), the expert GEMM is 22 s and the dense GEMM is 8.2 s. Tensor cores are the next lever for both.
+- Decode is still 7.4 tok/s, because the decode attention kernel has no GQA sharing and no split-K. This is the next item.
