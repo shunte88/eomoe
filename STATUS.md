@@ -299,3 +299,28 @@ Gates (all pass, run with `--test-threads=1`):
 | Phase 6 | 32K, 576 slots; prefill 4K 501 tok/s; decode after 19K **25.3** (was 22.7); follow-up 112.8 |
 | lib | 12 pass (new: `prefetch_spares_busy_layer_and_feeds_lookup`) |
 | Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, 1m03s wall. Prefill 411 tok/s; follow-ups 110 and 168; decode **25.7–29.4** (was 23.3–25.5) |
+
+## Phase 6: tensor-core expert and projection GEMM (2026-11-26)
+
+`gemm_q4_k` / `gemm_q6_k` (and the `_ids` expert variants) now run on `mma.sync` m16n8k16 instead of SIMT f32. Their launch interface is unchanged. Before this change they took ~88% of prefill GPU time.
+
+| Step | Prefill 4K | GPU vs CPU p50 |
+|---|---|---|
+| Before (SIMT f32, 128 rows x 32 tokens) | 509 tok/s | 0.00034 |
+| mma, weights f16, x hi + lo (2 mmas) | 671 | **0.0040, gate fails** (limit 0.001) |
+| weights hi + lo too (3 mmas: wh.xh + wh.xl + wl.xh) | 614 | 0.00041 |
+| tile 128 rows x 64 tokens (each decoded weight feeds 2x the tokens) | **781** | 0.00041 |
+| tile x 128 tokens (tried, reverted) | 759 | |
+
+Gates (all pass, `--test-threads=1`):
+
+| Gate | Result |
+|---|---|
+| Phase 3 | top-1 fails 0/128, mean 0.1811 (floor 0.2414); incremental decode exact; GPU vs CPU p50 0.00041, max 1.11 |
+| Phase 4 | hits 76.17% (identical to the oracle); decode 38.0 tok/s |
+| Phase 5 API diff | pass |
+| Phase 6 | 32K, 576 slots; prefill 4K **769 tok/s** (oracle 392.9, about 2x); decode after 19K 25.4; follow-up 113.6 |
+| lib | 12 pass |
+| Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, **49 s wall** (was 63 s). First turn: prefill 32.9 s at **576 tok/s** (was 411). Follow-ups 113 and 173; decode 25–29 |
+
+GEMM is still ~79% of prefill time. The next lever is an MMQ-style kernel: integer quants as exact f16 with per-block scales applied to partial sums. That drops the weight lo half and the float dequant.

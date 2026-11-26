@@ -177,12 +177,28 @@ MM_QUANT(q6_k, 1, )
 MM_QUANT(q4_k, 8, _t8)
 MM_QUANT(q6_k, 8, _t8)
 
-// ---- Prefill GEMM: y[t][r] = W[r] . x[t] for many tokens, f32 SIMT, tiles in shared memory.
-// Block: 128 rows x 32 tokens, 128 threads, each 8 rows x 4 tokens. K advances one 32-element
-// sub-block per step: thread i dequantizes row r0+i's sub-block into ws[k][i] (k-major), the
-// block loads x[t0..t0+31][k0..k0+31] into xs. f32 throughout (sum order: k ascending).
+// ---- Prefill GEMM: y[t][r] = W[r] . x[t] for many tokens, on tensor cores (mma.sync m16n8k16,
+// f16 in, f32 accumulate). Block: 128 rows x GB_T (64) tokens, 4 warps; warp w owns rows
+// 32w..32w+31 x all GB_T tokens (2 x GB_N mma tiles). K advances one 32-element sub-block per step:
+// thread i dequantizes row r0+i's sub-block into ws[i][k]; the block loads x[t0..][k0..k0+31].
+// Weights and activations are both split into f16 hi + lo, three mmas (wh.xh + wh.xl + wl.xh):
+// ~f32 accuracy (f16 weights alone moved the GPU-vs-CPU p50 from 0.0003 to 0.004). Row strides of
+// 40 halves keep the fragment loads bank-conflict free.
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void split_h2(float x, float y, uint32_t& hi, uint32_t& lo) {
+    const __half2 h = __floats2half2_rn(x, y);
+    const float2 hf = __half22float2(h);
+    const __half2 l = __floats2half2_rn(x - hf.x, y - hf.y);
+    hi = *(const uint32_t*)&h;
+    lo = *(const uint32_t*)&l;
+}
 #define GB_R 128
-#define GB_T 32
+#define GB_T 64
+#define GB_N (GB_T / 8)
 
 // Element 32j + l of a Q4_K row (l = 0..31) for every l; out[l] .
 __device__ __forceinline__ void deq32_q4_k(const uint8_t* row, int j, float* out) {
@@ -222,77 +238,103 @@ __device__ __forceinline__ void deq32_q6_k(const uint8_t* row, int j, float* out
     }
 }
 
+#define GB_KS 40
 template <void (*DEQ)(const uint8_t*, int, float*)>
 __device__ __forceinline__ void gemm_tile(const uint8_t* w, unsigned long long row_bytes, int k, const float* x,
-                                          float* y, int n_rows, int r0, int t0, int ts, int te, float (*acc)[4],
-                                          float (*ws)[GB_R + 4], float (*xs)[GB_T + 1]) {
+                                          int n_rows, int r0, int t0, int ts, int te, float (*acc)[GB_N][4],
+                                          __half (*ws)[GB_KS], __half (*wl)[GB_KS], __half (*xh)[GB_KS],
+                                          __half (*xl)[GB_KS]) {
     // Accumulates tokens [t0+ts, t0+te) of the tile (others get +0) using weights w.
-    const int tid = threadIdx.x, rg = tid & 15, tg = tid >> 4;
+    const int tid = threadIdx.x, lane = tid & 31, wr = (tid >> 5) * 32, g = lane >> 2, tq = lane & 3;
     float buf[32];
     for (int j = 0; j < k / 32; j++) {
         __syncthreads();
-        if (r0 + tid < n_rows) {
-            DEQ(w + (size_t)(r0 + tid) * row_bytes, j, buf);
+        if (r0 + tid < n_rows) DEQ(w + (size_t)(r0 + tid) * row_bytes, j, buf);
+        else
 #pragma unroll
-            for (int l = 0; l < 32; l++) ws[l][tid] = buf[l];
-        } else {
+            for (int l = 0; l < 32; l++) buf[l] = 0.0f;
 #pragma unroll
-            for (int l = 0; l < 32; l++) ws[l][tid] = 0.0f;
+        for (int l = 0; l < 32; l += 8) {
+            uint4 h, o;
+            split_h2(buf[l], buf[l + 1], h.x, o.x);
+            split_h2(buf[l + 2], buf[l + 3], h.y, o.y);
+            split_h2(buf[l + 4], buf[l + 5], h.z, o.z);
+            split_h2(buf[l + 6], buf[l + 7], h.w, o.w);
+            *(uint4*)&ws[tid][l] = h;
+            *(uint4*)&wl[tid][l] = o;
         }
-        for (int i = tid; i < 32 * GB_T; i += 128) {
-            const int t = i >> 5, l = i & 31;
-            xs[l][t] = (t >= ts && t < te) ? x[(size_t)(t0 + t) * k + 32 * j + l] : 0.0f;
+        for (int i = tid; i < 16 * GB_T; i += 128) {
+            const int t = i >> 4, l = 2 * (i & 15);
+            float2 v = make_float2(0.0f, 0.0f);
+            if (t >= ts && t < te) v = *(const float2*)&x[(size_t)(t0 + t) * k + 32 * j + l];
+            split_h2(v.x, v.y, *(uint32_t*)&xh[t][l], *(uint32_t*)&xl[t][l]);
         }
         __syncthreads();
-#pragma unroll 4
-        for (int l = 0; l < 32; l++) {
-            const float4 wa = *(const float4*)&ws[l][8 * rg], wb = *(const float4*)&ws[l][8 * rg + 4];
-            const float wv[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
 #pragma unroll
-            for (int c = 0; c < 4; c++) {
-                const float xv = xs[l][4 * tg + c];
+        for (int kk = 0; kk < 32; kk += 16) {
+            uint32_t a[2][4], al[2][4];
 #pragma unroll
-                for (int r = 0; r < 8; r++) acc[r][c] += wv[r] * xv;
+            for (int m = 0; m < 2; m++) {
+                const int r = wr + 16 * m + g;
+                a[m][0] = *(const uint32_t*)&ws[r][kk + 2 * tq];
+                a[m][1] = *(const uint32_t*)&ws[r + 8][kk + 2 * tq];
+                a[m][2] = *(const uint32_t*)&ws[r][kk + 2 * tq + 8];
+                a[m][3] = *(const uint32_t*)&ws[r + 8][kk + 2 * tq + 8];
+                al[m][0] = *(const uint32_t*)&wl[r][kk + 2 * tq];
+                al[m][1] = *(const uint32_t*)&wl[r + 8][kk + 2 * tq];
+                al[m][2] = *(const uint32_t*)&wl[r][kk + 2 * tq + 8];
+                al[m][3] = *(const uint32_t*)&wl[r + 8][kk + 2 * tq + 8];
+            }
+#pragma unroll
+            for (int n = 0; n < GB_N; n++) {
+                const int t = 8 * n + g;
+                const uint32_t h0 = *(const uint32_t*)&xh[t][kk + 2 * tq], h1 = *(const uint32_t*)&xh[t][kk + 2 * tq + 8];
+                const uint32_t l0 = *(const uint32_t*)&xl[t][kk + 2 * tq], l1 = *(const uint32_t*)&xl[t][kk + 2 * tq + 8];
+#pragma unroll
+                for (int m = 0; m < 2; m++) {
+                    mma16816(acc[m][n], al[m], h0, h1);
+                    mma16816(acc[m][n], a[m], l0, l1);
+                    mma16816(acc[m][n], a[m], h0, h1);
+                }
             }
         }
     }
 }
 
-__device__ __forceinline__ void gemm_store(float* y, int n_rows, int r0, int t0, int T, float (*acc)[4]) {
-    const int rg = threadIdx.x & 15, tg = threadIdx.x >> 4;
-    for (int c = 0; c < 4; c++) {
-        const int t = t0 + 4 * tg + c;
-        if (t >= T) continue;
-        for (int r = 0; r < 8; r++) {
-            const int row = r0 + 8 * rg + r;
-            if (row < n_rows) y[(size_t)t * n_rows + row] = acc[r][c];
-        }
-    }
+__device__ __forceinline__ void gemm_store(float* y, int n_rows, int r0, int t0, int T, float (*acc)[GB_N][4]) {
+    const int lane = threadIdx.x & 31, wr = (threadIdx.x >> 5) * 32, g = lane >> 2, tq = lane & 3;
+#pragma unroll
+    for (int m = 0; m < 2; m++)
+#pragma unroll
+        for (int n = 0; n < GB_N; n++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const int row = r0 + wr + 16 * m + g + 8 * (c >> 1), t = t0 + 8 * n + 2 * tq + (c & 1);
+                if (row < n_rows && t < T) y[(size_t)t * n_rows + row] = acc[m][n][c];
+            }
 }
 
 // grid (ceil(n_rows / 128), ceil(T / 32)), block 128.
 #define GEMM_QUANT(name)                                                                           \
     extern "C" __global__ void gemm_##name(const uint8_t* w, unsigned long long row_bytes, int k,  \
                                            const float* x, float* y, int n_rows, int T) {          \
-        __shared__ __align__(16) float ws[32][GB_R + 4];                                           \
-        __shared__ float xs[32][GB_T + 1];                                                         \
+        __shared__ __align__(16) __half ws[GB_R][GB_KS], wl[GB_R][GB_KS], xh[GB_T][GB_KS], xl[GB_T][GB_KS]; \
         const int r0 = blockIdx.x * GB_R, t0 = blockIdx.y * GB_T;                                  \
-        float acc[8][4] = {};                                                                      \
-        gemm_tile<deq32_##name>(w, row_bytes, k, x, y, n_rows, r0, t0, 0, min(GB_T, T - t0), acc, ws, xs); \
+        float acc[2][GB_N][4] = {};                                                                 \
+        gemm_tile<deq32_##name>(w, row_bytes, k, x, n_rows, r0, t0, 0, min(GB_T, T - t0), acc, ws, wl, xh, xl); \
         gemm_store(y, n_rows, r0, t0, T, acc);                                                     \
     }                                                                                              \
     /* Gathered rows grouped by expert: each run of equal wp in the tile is one pass. */           \
     extern "C" __global__ void gemm_##name##_ids(const unsigned long long* wp, unsigned long long off, \
                                                  unsigned long long row_bytes, int k, const float* x, \
                                                  float* y, int n_rows, int T) {                    \
-        __shared__ __align__(16) float ws[32][GB_R + 4];                                           \
-        __shared__ float xs[32][GB_T + 1];                                                         \
+        __shared__ __align__(16) __half ws[GB_R][GB_KS], wl[GB_R][GB_KS], xh[GB_T][GB_KS], xl[GB_T][GB_KS]; \
         const int r0 = blockIdx.x * GB_R, t0 = blockIdx.y * GB_T, n = min(GB_T, T - t0);           \
-        float acc[8][4] = {};                                                                      \
+        float acc[2][GB_N][4] = {};                                                                 \
         for (int s = 0; s < n;) {                                                                  \
             int e = s + 1;                                                                         \
             while (e < n && wp[t0 + e] == wp[t0 + s]) e++;                                         \
-            gemm_tile<deq32_##name>((const uint8_t*)(wp[t0 + s] + off), row_bytes, k, x, y, n_rows, r0, t0, s, e, acc, ws, xs); \
+            gemm_tile<deq32_##name>((const uint8_t*)(wp[t0 + s] + off), row_bytes, k, x, n_rows, r0, t0, s, e, acc, ws, wl, xh, xl); \
             s = e;                                                                                 \
         }                                                                                          \
         gemm_store(y, n_rows, r0, t0, T, acc);                                                     \
@@ -474,18 +516,6 @@ extern "C" __global__ void attention_dec(const float* q, const __half* kc, const
 // Q and P are fed as f16 hi + lo pairs (two mmas each): ~f32 accuracy; K and V are exact f16.
 // Requires hd == 128 and 64 % G == 0. grid (nkv, ceil(T*G/64), S), block 128. Split-K as above.
 #define TC_KT 64
-__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void split_h2(float x, float y, uint32_t& hi, uint32_t& lo) {
-    const __half2 h = __floats2half2_rn(x, y);
-    const float2 hf = __half22float2(h);
-    const __half2 l = __floats2half2_rn(x - hf.x, y - hf.y);
-    hi = *(const uint32_t*)&h;
-    lo = *(const uint32_t*)&l;
-}
 extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, float* out,
                                                               int nh, int nkv, int n_past, int T, float scale, float* part) {
     __shared__ __align__(16) __half sk[TC_KT][136];

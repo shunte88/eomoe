@@ -25,6 +25,8 @@ const CACHE_MAX_BATCH: usize = 32;
 const STAGE: usize = 32;
 /// Batches of at least this many tokens (per expert, for experts) use the tiled GEMM.
 const GEMM_MIN: usize = 16;
+/// Tokens per tensor-core GEMM tile (GB_T in kernels/eomoe.cu).
+const GEMM_T: usize = 64;
 /// Tokens per layer-major prefill pass: the experts move once per SPAN tokens. Costs
 /// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
 const SPAN: usize = 4096;
@@ -406,8 +408,8 @@ impl GpuModel {
             (GgmlType::Q6_K, 1) => (&self.k.mm_q6_k, m.n_rows.div_ceil(4), 1),
             (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
             (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
-            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
-            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
             (t, _) => unreachable!("checked at load: {t:?}"),
         };
         launch!(self, f, (gx as u32, gy as u32, 1), 128, [p, rb, k, x, y, n, ti]);
@@ -424,8 +426,8 @@ impl GpuModel {
             (GgmlType::Q6_K, ..4) => (&self.k.mm_q6_k_ids, n_rows.div_ceil(4), ntok),
             (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
             (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
-            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
-            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k_ids, n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k_ids, n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
             (t, _) => unreachable!("checked at load: {t:?}"),
         };
         let (rb, k, n, ti) = (row_bytes as u64, k as i32, n_rows as i32, ntok as i32);
