@@ -1,77 +1,82 @@
-# eomoe - Expert One-Way Context MoE LLM
+# eomoe
 
-A memory-safe, massively scalable implementation of a Mixture of Experts (MoE) Large Language Model system with efficient GPU memory management.
+A single-binary Rust server that runs Qwen3-Coder-30B-A3B (Q4_K_M GGUF, a 30B mixture-of-experts model) on one 8 GB GPU. It speaks the same HTTP APIs as llama-server, so Claude Code, Codex and OpenAI clients work unchanged.
 
-## Features
+Experts live in RAM. The ones in use are cached in VRAM, and misses are streamed over PCIe while compute runs. eomoe replaces the reference llama.cpp setup (`local-code-llm`) and is faster on every measured path (RTX 5060 8 GB; numbers and gates in [STATUS.md](STATUS.md)):
 
-- **Memory-Safe Rust Implementation**: unsafe confined to the CUDA FFI calls in `memory.rs`
-- **GPU Memory Management**: Efficient VRAM/CUDA context swapping with expert loading/unloading
-- **MoE Architecture**: Complete Mixture of Experts model with expert weights and routing
-- **REST API Server**: HTTP endpoints for inference, health checks, and model information
-- **CLI Interface**: Command-line tools for installation, serving, and checking
-- **LRU Caching**: Automatic expert caching and swapping based on usage patterns
+| | llama.cpp oracle | eomoe |
+|---|---|---|
+| Prefill, 4K prompt | 393 tok/s | **953 tok/s** |
+| Decode, short prompt | 27.2 tok/s | **38.1 tok/s** |
+| Decode after a long prompt | 16.0 tok/s (4K) | **25.5 tok/s** (19K) |
+| Context | 16K | **32K** (f16 KV) |
+| Claude Code fix-a-bug session (19K-token prompt) | did not fit in 16K | **44 s** |
 
-## Architecture
-
-The system is designed around:
-
-1. **MemoryManager**: Manages GPU memory allocation and expert swapping between VRAM and system memory
-2. **ExpertCache**: LRU cache implementation for MoE experts
-3. **MoEModel**: Core model structure with expert weights and parameters
-4. **HTTP Server**: REST API endpoints for model inference and management
-5. **CLI Interface**: Command-line tools for system operations
-
-## Components
-
-### Memory Management
-- GPU memory allocation/deallocation using CUDA API calls
-- System memory caching for experts
-- Automatic swapping between GPU VRAM and system memory
-- Memory statistics and monitoring
-
-### Model Loading
-- GGUF file format parsing
-- Expert loading and unloading
-- Model configuration management
-
-### HTTP Server
-- REST API endpoints:
-  - `GET /health` - Health check
-  - `GET /info` - Model information
-  - `POST /inference` - Model inference with tokenization
-
-### CLI Commands
-- `eomoe install` - Install required dependencies
-- `eomoe serve` - Start the HTTP server
-- `eomoe check` - System health check
-
-## Usage
+## Quick start
 
 ```bash
-# Build the project
 cargo build --release
-
-# Start the server (flags only)
-./target/release/eomoe serve --model /path/to/model.gguf --port 8080
-
-# Start from a config file; any flag overrides the file
-./target/release/eomoe --config config.example.yaml serve --port 9000
-EOMOE_CONFIG_PATH=config.example.yaml ./target/release/eomoe serve
-
-# Check system health
-./target/release/eomoe check
-
-# Install dependencies
-./target/release/eomoe install
+./target/release/eomoe install          # model + Claude Code / Codex clients
+./target/release/eomoe serve            # leave running (127.0.0.1:8080)
+./target/release/eomoe claude           # Claude Code on the local server
+./target/release/eomoe codex            # Codex CLI on the local server
+./target/release/eomoe check            # streamed smoke test of both APIs
 ```
 
-## Dependencies
+`install` reuses an existing reference install (`~/.local/share/local-code-llm`) instead of downloading again. eomoe's own home is `$EOMOE_HOME`, by default `~/.local/share/eomoe`.
 
-- Rust 1.70+
-- CUDA runtime libraries (for GPU operations). `.cargo/config.toml` points the linker
-  at `/usr/local/cuda/targets/x86_64-linux/lib`; set `CUDA_LIBRARY_PATH` to override.
-- cuBLAS library (for GPU linear algebra operations)
+## HTTP API
 
-## Implementation Notes
+The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/phase5_golden.rs` diff it against captured oracle traffic (`tests/golden/api.json`).
 
-This implementation provides a complete, memory-safe MoE architecture that can handle large models with limited GPU memory through efficient caching and swapping mechanisms. All components are designed with thread safety in mind, using Arc<Mutex<MoEModel>> patterns for safe concurrent access.
+| Endpoint | API |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI chat: tools, streaming, `stream_options.include_usage`, `timings` |
+| `POST /v1/responses` | OpenAI Responses (Codex) |
+| `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages (Claude Code) |
+| `GET /v1/models`, `/health` | |
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+print(c.chat.completions.create(model="local-code", messages=[{"role": "user", "content": "hi"}]).choices[0].message.content)
+```
+
+The prompt prefix is reused across requests (KV cache), so agent follow-up turns only prefill the new tokens.
+
+## Configuration
+
+Settings come from flags, environment variables, or a YAML file (`--config`, or `EOMOE_CONFIG_PATH`). Flags override environment variables, which override the file. See `config.example.yaml` and `eomoe serve --help`.
+
+| Flag | Env | Default |
+|---|---|---|
+| `--model` | `MODEL_FILE` | `<home>/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` |
+| `--port` | `PORT` | 8080 |
+| `--ctx-size` | `CTX_SIZE` | 32768 |
+| `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
+| `--alias` | | `local-code` |
+
+## How it works
+
+| Module | Role |
+|---|---|
+| `gguf.rs`, `tokenizer.rs`, `template.rs` | GGUF loader, BPE tokenizer, Jinja chat template. Byte-identical to llama.cpp |
+| `qwen3moe.rs`, `quant.rs`, `cpu.rs` | Weight map and routing; the f32 CPU reference forward pass (the correctness oracle) |
+| `gpu.rs`, `kernels/eomoe.cu` | CUDA engine. Kernels are plain `extern "C"` functions loaded by name, so an all-Rust kernel module can replace the `.cu` file |
+| `expert_cache.rs` | VRAM expert cache: frequency-class LRU and next-layer prefetch |
+| `generate.rs`, `toolcall.rs`, `server.rs`, `cli.rs` | Sampling, tool-call parsing, the HTTP API, the CLI |
+
+Main techniques:
+- **Expert cache:** experts are cached per layer group in VRAM. Uploads come from pinned RAM on a copy stream that overlaps compute.
+- **Decode prefetch:** during decode, each layer runs the next layer's router on its own output to predict that layer's experts (84% recall) and prefetches them.
+- **Prefill matrix multiplies:** tensor-core GEMM working directly on the Q4_K/Q6_K integers (MMQ-style), with exact weights and ~f32 activations.
+- **Attention:** tensor-core FlashAttention-2 for prefill; split-K attention for long-context decode.
+
+## Development
+
+```bash
+cargo test --release --lib
+cargo test --release --test phase6_golden -- --ignored --nocapture --test-threads=1   # GPU gates; one model at a time
+```
+
+A phase is done only when its gate passes against the oracle and the evidence is in `STATUS.md`. The golden files come from the reference llama.cpp build via `tools/capture_*.py`. Requirements: Rust, the CUDA toolkit (`nvcc`; set `NVCC` to override its path), and an sm_120 GPU with 8 GB of VRAM. For other GPUs, set `EOMOE_CUDA_ARCH` (e.g. `89`).

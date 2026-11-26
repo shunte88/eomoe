@@ -15,7 +15,7 @@ Architecture decisions:
 | 3. CUDA engine | Matches phase 2 / `greedy.json` | done 2026-11-25 (see below) |
 | 4. Expert cache | Hit rate on `ref_trace.mct` ≥ oracle; decode tok/s ≥ oracle | done 2026-11-25 (see below) |
 | 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | done 2026-11-25 (see below) |
-| 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | in progress: f16 KV / 32K ctx, fast prefill done (see below) |
+| 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | **done**: f16 KV / 32K ctx, prefill 953 tok/s @4K (2.4x), decode 38.1 / 25.5 after 19K, decode prefetch, OpenAI chat API (see below). Not pursued: CPU-miss compute, batching, multi-GPU |
 
 ## Phase 0 baseline (2026-11-25)
 
