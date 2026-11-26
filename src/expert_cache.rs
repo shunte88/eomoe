@@ -103,7 +103,8 @@ impl ExpertCache {
         misses.sort_unstable();
         let mut fills = vec![];
         for e in misses {
-            let s = self.victim(il);
+            let s = self.victim(il, &[]);
+            assert!(s != NIL, "no expert cache victim");
             if self.key_of[s] != NIL {
                 self.slot_of[self.key_of[s]] = NIL;
             }
@@ -117,12 +118,37 @@ impl ExpertCache {
         Plan { hits, fills }
     }
 
+    /// Admit experts predicted for layer `il` ahead of its lookup, without counting a use (the
+    /// lookup will). Experts of `busy`'s current lookup (still being computed) are not evicted.
+    /// Returns (expert, slot) fills to upload before layer `il` runs.
+    pub fn prefetch(&mut self, il: usize, ids: &[usize], busy: usize) -> Vec<(usize, usize)> {
+        let mut fills = vec![];
+        for &e in ids {
+            let key = il * self.n_expert + e;
+            if self.slot_of[key] != NIL {
+                continue;
+            }
+            let s = self.victim(busy, &fills);
+            if s == NIL {
+                break; // every slot is busy
+            }
+            if self.key_of[s] != NIL {
+                self.slot_of[self.key_of[s]] = NIL;
+            }
+            self.key_of[s] = key;
+            self.slot_of[key] = s;
+            self.move_to(s, self.class_of(key));
+            fills.push((e, s));
+        }
+        fills
+    }
+
     fn decayed_crf(&self, key: usize) -> f32 {
         let il = key / self.n_expert;
         self.crf[key] * (-((self.clock[il] - self.last_use[key]) as f32) / HALF_LIFE).exp2()
     }
 
-    /// After a use the CRF is >= 1, so the cast floors log2.
+    /// After a use the CRF is >= 1, so the cast floors log2 (a never-used prefetch: class 0).
     fn class_of(&self, key: usize) -> usize {
         (self.crf[key].log2() as usize).min(N_CLASS - 1)
     }
@@ -132,11 +158,12 @@ impl ExpertCache {
         key != NIL && key / self.n_expert == il && self.seen[key % self.n_expert]
     }
 
-    fn victim(&self, il: usize) -> usize {
+    /// Also skips the slots of `skip` (fills of the current prefetch). NIL if none is evictable.
+    fn victim(&self, il: usize, skip: &[(usize, usize)]) -> usize {
         let mut best = (NIL, -1.0f64);
         for c in 0..N_CLASS {
             let mut s = self.head[c];
-            while s != NIL && self.is_selected(il, self.key_of[s]) {
+            while s != NIL && (self.is_selected(il, self.key_of[s]) || skip.iter().any(|f| f.1 == s)) {
                 s = self.next[s];
             }
             if s == NIL {
@@ -152,7 +179,6 @@ impl ExpertCache {
                 best = (s, score);
             }
         }
-        assert!(best.0 != NIL, "no expert cache victim");
         best.0
     }
 
@@ -170,5 +196,25 @@ impl ExpertCache {
         if self.tail[c] != NIL { self.next[self.tail[c]] = s } else { self.head[c] = s }
         self.tail[c] = s;
         self.list_of[s] = c as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A prefetch never evicts the busy layer's experts, and the later lookup hits on it.
+    #[test]
+    fn prefetch_spares_busy_layer_and_feeds_lookup() {
+        let mut c = ExpertCache::new(2, 8, 4);
+        c.plan(0, &[0, 1, 2, 3], 1); // layer 0 busy, fills all 4 slots
+        let f = c.prefetch(1, &[5, 6], 0);
+        assert!(f.is_empty(), "all slots hold busy layer-0 experts, yet prefetch evicted: {f:?}");
+        c.plan(0, &[0, 1], 1); // now 2 and 3 are evictable
+        let f = c.prefetch(1, &[5, 6], 0);
+        assert_eq!(f.len(), 2);
+        assert!(c.slot(0, 0).is_some() && c.slot(0, 1).is_some());
+        let p = c.plan(1, &[5, 6], 1);
+        assert_eq!((p.hits, p.fills.len()), (2, 0));
     }
 }

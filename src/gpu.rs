@@ -157,6 +157,8 @@ pub struct GpuModel {
     /// Per stage half: uploads done (copy stream) / last reader done (main stream).
     ready: [CudaEvent; 2],
     free: [CudaEvent; 2],
+    /// Decode prefetch of the next layer's predicted experts done (copy stream).
+    pf_ready: CudaEvent,
     stage_bytes: usize,
     stats: CacheStats,
     host: Option<HostExperts>,
@@ -175,6 +177,10 @@ pub struct GpuModel {
 }
 
 const F: usize = std::mem::size_of::<f32>();
+/// Decode prefetches the next layer's top-5 predicted experts: the low-ranked predictions
+/// miss often enough that their bytes cost more PCIe time than they save (sweep on the 19K
+/// gate: top-2 24.3, 4 25.3, 5 25.4, 6 25.3, 8 24.0 tok/s).
+const PREFETCH_TOP: usize = 5;
 const H: usize = 2; // f16
 
 fn err(e: impl std::fmt::Debug) -> String {
@@ -333,6 +339,7 @@ impl GpuModel {
             copy: ctx.new_stream().map_err(err)?,
             ready: [ev()?, ev()?],
             free: [ev()?, ev()?],
+            pf_ready: ev()?,
             stream,
             k,
             layers,
@@ -468,6 +475,7 @@ impl GpuModel {
             let vc = kc + (self.n_ctx * kvd * H) as u64;
             // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
             let mut sels = vec![];
+            let mut pred: Vec<usize> = vec![];
             for &(c0, tc) in &chunks {
                 let (x, h, q, attn, o) = (at(s.x, c0, e), at(s.h, c0, e), s.q, s.attn, s.o);
                 let pos = self.n_past + c0;
@@ -513,7 +521,19 @@ impl GpuModel {
                 let wn = l.ffn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
                 self.mm(&l.router, h, s.rl, tc);
-                sels.push(route(&self.dtoh(s.rl, tc * n_expert), n_expert, kk));
+                // Decode: also predict layer li+1's experts, its router on this post-attention x
+                // (top-8 recall ~84%). Read back with the router logits; prefetched below.
+                let predict = t == 1 && li + 1 < self.layers.len();
+                if predict {
+                    let (o, wn, rl2) = (s.o, self.layers[li + 1].ffn_norm, s.rl + (n_expert * F) as u64);
+                    launch!(self, self.k.rmsnorm, (1, 1, 1), 256, [o, x, wn, ei, eps]);
+                    self.mm(&self.layers[li + 1].router, o, rl2, 1);
+                }
+                let mut r = route(&self.dtoh(s.rl, (tc + predict as usize) * n_expert), n_expert, kk);
+                if predict {
+                    pred = r.pop().unwrap().iter().take(PREFETCH_TOP).map(|p| p.0).collect();
+                }
+                sels.push(r);
             }
 
             // --- MoE: experts in waves; each wave runs over every ubatch ---
@@ -536,9 +556,21 @@ impl GpuModel {
             let mut half: Vec<Option<usize>> = vec![None]; // staging half each wave uses
             let waves: Vec<Vec<usize>> = if cached {
                 let ids: Vec<u32> = sels[0].iter().flatten().map(|&(e, _)| e as u32).collect();
+                self.stream.wait(&self.pf_ready).expect("wait"); // the prefetch's slots are written
                 let p = self.groups[gi].cache.plan(li, &ids, t);
                 for &(ex, slot) in &p.fills {
                     self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64, &self.stream) as u64;
+                }
+                // Prefetch li+1's predicted misses on the copy stream, overlapping this layer's
+                // MoE and the next attention. Victims are never this layer's experts (still to be
+                // read); earlier layers are finished (the router readback synchronized).
+                if !pred.is_empty() {
+                    let g2 = self.group_of[li + 1];
+                    let (bank2, sb2) = (self.groups[g2].bank, self.groups[g2].slot_bytes);
+                    for (ex, slot) in self.groups[g2].cache.prefetch(li + 1, &pred, li) {
+                        self.stats.bytes += self.upload_expert(li + 1, ex, bank2 + (slot * sb2) as u64, &self.copy) as u64;
+                    }
+                    self.pf_ready.record(&self.copy).expect("record");
                 }
                 self.stats.hits += p.hits as u64;
                 self.stats.misses += p.fills.len() as u64;

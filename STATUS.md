@@ -272,3 +272,30 @@ Gates (all pass):
 | Phase 6 | 32K, 576 slots; prefill 4K **510 tok/s**; decode after 19K 22.7 (teacher-forced); follow-up **112 tok/s** |
 | lib | 11 pass |
 | Real Claude Code, stock tools, 18955 tokens (`sub.py`) | **1m03s wall** (was 1m24s). Fixed. First turn: prefill 46.1 s at **411 tok/s** (was 302). Follow-ups: 110 and 165 tok/s. Decode 23.3–25.5 |
+
+## Phase 6: next-layer expert prefetch for decode (2026-11-26)
+
+During decode (one token), each layer also runs layer li+1's router on its own post-attention residual. The result is read back alongside the real router logits, so it costs no extra sync. The predicted experts that are not resident are uploaded on the copy stream into li+1's cache slots, overlapping layer li's MoE and layer li+1's attention.
+- **Prediction quality:** top-8 recall is 83.8% (probe, since removed).
+- **`ExpertCache::prefetch(il, ids, busy)`:** places experts without touching CRF or clock. It never evicts layer `busy`'s experts, which are still to be read; earlier layers are already finished because the router readback synchronized.
+- **Ordering:** the main stream waits on `pf_ready` before planning the next layer.
+- **Prefetch width:** the bottom-ranked predictions miss often enough that their bytes cost more PCIe time than they save. Sweep on the teacher-forced 19K gate:
+
+| Prefetch top-N | 0 (before) | 2 | 4 | **5** | 6 | 8 |
+|---|---|---|---|---|---|---|
+| Decode after 19K, tok/s | 22.7 | 24.3 | 25.3 | **25.4** | 25.3 | 24.0 |
+| Cache hits (prefetched count as hits) | 65.4% | 71.2% | 78.1% | 81.6% | 85.0% | 90.7% |
+| MiB uploaded (64 tokens) | 23426 | 23553 | 24013 | 24565 | 25471 | 29011 |
+
+Still upload-bound: ~400 MB/token is ~28 ms of a 39 ms token at ~14 GB/s. Next lever: more cache slots or fewer bytes per expert.
+
+Gates (all pass, run with `--test-threads=1`):
+
+| Gate | Result |
+|---|---|
+| Phase 3 | top-1 fails 0/128, mean 0.1825 (floor 0.2414); incremental decode exact; GPU vs CPU p50 0.00034, max 1.12 |
+| Phase 4 | hits 76.17% (identical to the oracle); decode **38.0 tok/s** (was 34.2; oracle 27.2) |
+| Phase 5 API diff | pass |
+| Phase 6 | 32K, 576 slots; prefill 4K 501 tok/s; decode after 19K **25.3** (was 22.7); follow-up 112.8 |
+| lib | 12 pass (new: `prefetch_spares_busy_layer_and_feeds_lookup`) |
+| Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, 1m03s wall. Prefill 411 tok/s; follow-ups 110 and 168; decode **25.7–29.4** (was 23.3–25.5) |
