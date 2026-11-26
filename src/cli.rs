@@ -232,6 +232,9 @@ pub fn claude(a: &ClientArgs) -> Result<(), String> {
         c.env(k, "local-code");
     }
     c.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1").env("ENABLE_TOOL_SEARCH", "false");
+    // "local-code" is unknown to Claude Code, which would assume a 1M window and never compact
+    // before the server's context overflows.
+    c.env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", a.ctx_size.to_string());
     exec(c.args(["--model", "local-code"]).args(&a.args))
 }
 

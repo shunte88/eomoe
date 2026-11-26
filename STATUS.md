@@ -519,7 +519,7 @@ Port: `check_key` in `src/server.rs` follows `middleware_validate_api_key` (llam
 - Tunnels (SSH `-L`, Tailscale with `tailscale cert`) are documented in the README rather than built.
 - Regression gates after the change: lib 20/20, phase5 API gate, phase8.
 - Not done: CORS headers (llama-server's `--cors-origins`); the chat page is same-origin. Add them if a browser app on another origin needs the API.
-- Found, pre-existing: Claude Code warns that it does not know "local-code" and assumes a 1M-token window, so it may not auto-compact before our 32K. Follow-up: set the window through Claude Code's gateway model config.
+- Found, pre-existing, now fixed: Claude Code did not know "local-code" and assumed a 1M-token window, so it would not auto-compact before our 32K. `eomoe claude` now sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to `--ctx-size`, and the warning is gone in a headless session.
 
 ## Plan: Phase 11, agent-serving extras from koboldcpp (2026-11-26)
 
