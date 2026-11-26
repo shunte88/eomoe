@@ -60,14 +60,44 @@ fn events(body: &str) -> Vec<(Option<String>, Value)> {
         if let Some(n) = l.strip_prefix("event: ") {
             name = Some(n.to_owned());
         } else if let Some(d) = l.strip_prefix("data: ") {
-            out.push((name.take(), serde_json::from_str(d).unwrap()));
+            out.push((name.take(), if d == "[DONE]" { json!("[DONE]") } else { serde_json::from_str(d).unwrap() }));
         }
     }
     out
 }
 
+/// Chat completion chunks (no event lines): what each delta carries, runs collapsed.
+fn chat_shape(evs: &[(Option<String>, Value)]) -> Vec<String> {
+    let mut v: Vec<String> = vec![];
+    for (name, d) in evs {
+        assert!(name.is_none(), "chat chunks have no event line");
+        let c = &d["choices"][0];
+        let t = if d == "[DONE]" {
+            "[DONE]".into()
+        } else if d["choices"].as_array().is_some_and(|c| c.is_empty()) {
+            "usage".into()
+        } else if !c["finish_reason"].is_null() {
+            format!("finish:{}", c["finish_reason"].as_str().unwrap())
+        } else if c["delta"]["role"].is_string() {
+            "role".into()
+        } else if c["delta"]["tool_calls"].is_array() {
+            "tool_calls".into()
+        } else {
+            "content".into()
+        };
+        if (t == "content" || t == "tool_calls") && v.last() == Some(&t) {
+            continue;
+        }
+        v.push(t);
+    }
+    v
+}
+
 /// Event types, with runs of the same delta type collapsed (delta counts follow the text).
 fn shape(evs: &[(Option<String>, Value)]) -> Vec<String> {
+    if evs.first().is_some_and(|e| e.0.is_none() && e.1["object"] == "chat.completion.chunk") {
+        return chat_shape(evs);
+    }
     let mut v: Vec<String> = vec![];
     for (name, d) in evs {
         let t = d["type"].as_str().unwrap_or("?").to_owned();
@@ -92,6 +122,13 @@ fn summary(path: &str, b: &Value) -> Value {
         let has_text = b["content"].as_array().unwrap().iter().any(|c| c["type"] == "text" && c["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
         json!({"prompt": u["input_tokens"].as_u64().unwrap() + u["cache_read_input_tokens"].as_u64().unwrap(), "stop": b["stop_reason"], "calls": calls, "text": has_text,
                "keys": keys(b), "model": b["model"]})
+    } else if path == "/v1/chat/completions" {
+        let c = &b["choices"][0];
+        let m = &c["message"];
+        let calls: Vec<Value> = m["tool_calls"].as_array().into_iter().flatten().map(|t| json!([t["type"], t["function"]["name"], serde_json::from_str::<Value>(t["function"]["arguments"].as_str().unwrap()).unwrap()])).collect();
+        let has_text = m["content"].as_str().is_some_and(|t| !t.trim().is_empty());
+        json!({"prompt": b["usage"]["prompt_tokens"], "finish": c["finish_reason"], "calls": calls, "text": has_text, "keys": keys(b), "message_keys": keys(m),
+               "usage_keys": keys(&b["usage"]), "timings_keys": keys(&b["timings"]), "object": b["object"], "model": b["model"]})
     } else {
         let out = b["output"].as_array().unwrap();
         let calls: Vec<Value> = out.iter().filter(|o| o["type"] == "function_call").map(|o| json!([o["name"], serde_json::from_str::<Value>(o["arguments"].as_str().unwrap()).unwrap()])).collect();
@@ -137,6 +174,8 @@ fn api_matches_oracle() {
         let last = |e: &[(Option<String>, Value)]| {
             if path == "/v1/messages" {
                 e.iter().rev().find(|x| x.1["type"] == "message_delta").map(|x| x.1["delta"]["stop_reason"].clone())
+            } else if path == "/v1/chat/completions" {
+                e.iter().rev().find(|x| !x.1["choices"][0]["finish_reason"].is_null()).map(|x| json!([x.1["choices"][0]["finish_reason"], keys(&x.1), keys(&x.1["timings"])]))
             } else {
                 e.last().map(|x| summary(path, &x.1["response"]))
             }

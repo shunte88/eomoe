@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Capture the oracle llama-server's HTTP API behaviour into tests/golden/api.json.
 
-Usage: python3 -I tools/capture_api_golden.py [base_url]   (default http://127.0.0.1:8099)
+Usage: python3 -I tools/capture_api_golden.py [base_url] [case-prefix]   (default http://127.0.0.1:8099)
+With a case prefix (e.g. chat_), only those cases are captured and merged into the existing file.
 Start the oracle like `local-code-llm serve` (`--alias local-code --jinja`), on that port.
 
 Every case is greedy (temperature 0), streamed and not, so eomoe can be diffed on: event sequence,
@@ -14,6 +15,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8099"
+ONLY = sys.argv[2] if len(sys.argv) > 2 else None
 OUT = Path(__file__).resolve().parent.parent / "tests" / "golden" / "api.json"
 PROMPT = "What does len([1, 2]) return in Python? Reply briefly."
 
@@ -39,6 +41,13 @@ R_TOOLS = [
          "command": {"type": "array", "items": {"type": "string"}},
          "workdir": {"type": "string"}}, "required": ["command"], "additionalProperties": False}},
 ]
+C_TOOLS = [{"type": "function", "function": t} for t in [
+    {"name": "Bash", "description": "Run a shell command and return its output.",
+     "parameters": A_TOOLS[0]["input_schema"]},
+    {"name": "Read", "description": "Read a file from the local filesystem.",
+     "parameters": A_TOOLS[1]["input_schema"]}]]
+C_CALL = {"id": "call_01", "type": "function", "function": {"name": "Bash", "arguments": json.dumps({"command": "ls /tmp/demo"})}}
+
 R_CALL = {"type": "function_call", "call_id": "call_01", "name": "shell",
           "arguments": json.dumps({"command": ["ls", "/tmp/demo"]})}
 
@@ -73,6 +82,20 @@ CASES = {
             {"type": "function_call_output", "call_id": "call_01", "output": "a.py\nb.rs"},
             {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "How many are there?"}]},
         ]}),
+    "chat_text": ("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": PROMPT}], "max_tokens": 64}),
+    "chat_tool": ("/v1/chat/completions", {
+        "tools": C_TOOLS, "max_tokens": 200,
+        "messages": [{"role": "system", "content": "You are a coding agent. Use the tools to act."},
+                     {"role": "user", "content": [{"type": "text", "text": "List the files in /tmp/demo."}]}]}),
+    "chat_tool_result": ("/v1/chat/completions", {
+        "tools": C_TOOLS, "max_tokens": 120, "stop": ["\n\n\n"],
+        "messages": [
+            {"role": "system", "content": "You are a coding agent. Use the tools to act."},
+            {"role": "user", "content": "List the files in /tmp/demo."},
+            {"role": "assistant", "content": None, "tool_calls": [C_CALL]},
+            {"role": "tool", "tool_call_id": "call_01", "content": "a.py\nb.rs"},
+            {"role": "user", "content": "How many are there?"}]}),
 }
 
 
@@ -101,13 +124,18 @@ def get(path):
         return {"status": r.status, "body": json.loads(r.read())}
 
 
-out = {"cases": {}}
+out = json.loads(OUT.read_text()) if ONLY else {"cases": {}}
 for name, (path, body) in CASES.items():
+    if ONLY and not name.startswith(ONLY):
+        continue
     body = dict(body, model="local-code", temperature=0)
     out["cases"][name] = {"path": path, "request": body,
                           "full": post(path, body, False),
                           "stream": post(path, dict(body, stream=True), True)}
     print(name, "ok")
+if ONLY:
+    OUT.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+    sys.exit(print("merged", ONLY, "into", OUT))
 out["count_tokens"] = post("/v1/messages/count_tokens",
                            {k: v for k, v in CASES["messages_tool"][1].items() if k != "max_tokens"} | {"model": "local-code"}, False)
 out["models"] = get("/v1/models")

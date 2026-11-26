@@ -348,3 +348,20 @@ Gates (all pass, `--test-threads=1`):
 | Phase 6 | 32K, 576 slots; prefill 4K **952.6 tok/s** (oracle 392.9: 2.4x); decode after 19K 25.5; follow-up 115.4 |
 | lib | 12 pass |
 | Real Claude Code, stock tools, 18955 tokens (`sub.py`) | fixed, **45 s wall** (oracle-era 7m50s). First turn: prefill 28.7 s at **660 tok/s**. Follow-ups 113 and 171; decode 25–29 |
+
+## Phase 6: OpenAI `/v1/chat/completions` (2026-11-26)
+
+`POST /v1/chat/completions` (and `/chat/completions`) follows llama-server's `to_json_oaicompat_chat[_stream]`.
+- **Response body:** `choices[0].message` with `content` and `tool_calls`; `usage` with `prompt_tokens_details.cached_tokens`; `timings`.
+- **Stream:** a role chunk, content deltas, a tool-call delta per call, a finish chunk with `timings`, then `[DONE]`.
+- **Usage in the stream:** with `stream_options.include_usage`, a `choices: []` usage chunk comes before `[DONE]`.
+- **Request fields:** `max_completion_tokens`, `max_tokens` or `n_predict`, defaulting to unlimited as llama-server does; `stop` as a string or an array; sampling fields as the other APIs. `n` ≠ 1 is rejected.
+
+**Oracle capture:** `tools/capture_api_golden.py <url> chat_` captured 3 new oracle cases (text, tool call, tool result) and merged them into `tests/golden/api.json` without touching the existing cases. The Phase 5 gate was extended to them, and it was red first (404).
+
+| Gate | Result |
+|---|---|
+| Phase 5 API diff, now 9 cases | **pass**. Chat cases match the oracle on prompt tokens (24 / 397 / 451), finish reason, tool calls (`Bash {"command":"ls -la /tmp/demo"}`, identical), body, message, usage and timings keys, and stream shape |
+| OpenAI Python SDK (`openai`, via uv) | full completion; streamed tool call `get_weather {"city":"Paris"}`, `finish_reason` `tool_calls`, usage chunk received |
+| `eomoe check`, lib tests (12) | pass |
+| Real Claude Code (`/v1/messages`), stock tools | fixed, 44 s wall |

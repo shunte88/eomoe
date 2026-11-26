@@ -1,9 +1,10 @@
-//! HTTP API, wire-compatible with llama-server for the endpoints Claude Code and Codex use:
-//! POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses), /v1/messages/count_tokens;
+//! HTTP API, wire-compatible with llama-server for the endpoints Claude Code, Codex and OpenAI
+//! clients use: POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses),
+//! /v1/chat/completions (OpenAI chat), /v1/messages/count_tokens;
 //! GET /v1/models, /health. Event sequences and JSON shapes follow llama-server
 //! (tools/server/server-task.cpp); tests/golden/api.json holds captured oracle traffic.
 //!
-//! Both APIs are converted to OpenAI chat messages, rendered with the GGUF chat template and run
+//! Every API is converted to OpenAI chat messages, rendered with the GGUF chat template and run
 //! on one model thread, which owns the engine (CUDA work stays on the thread that created it).
 
 use crate::generate::{Finish, Generator, Sampling, Utf8Stream};
@@ -116,11 +117,18 @@ struct Chat {
     stop: Vec<String>,
 }
 
+/// Wall time of a request's prefill (start to first token) and decode (first token to end), ms.
+#[derive(Clone, Copy, Default)]
+struct Timings {
+    prompt_ms: f64,
+    predicted_ms: f64,
+}
+
 /// What a request's stream carries to the API formatter.
 enum Out {
     Start { n_prompt: usize, n_cached: usize },
     Text(String),
-    End { calls: Vec<ToolCall>, finish: Finish, n_out: usize, stop_word: Option<String> },
+    End { calls: Vec<ToolCall>, finish: Finish, n_out: usize, stop_word: Option<String>, timings: Timings },
     /// Generation failed after the response started.
     Error(Value),
 }
@@ -209,10 +217,15 @@ impl App {
             let (mut utf8, mut split, mut n_out) = (Utf8Stream::default(), Splitter::new(has_tools), 0);
             let mut stops = StopMatcher::new(chat.stop);
             let mut finish = None;
+            let (mut t0, mut t1) = (std::time::Instant::now(), None);
             while let Some(g) = grx.recv().await {
                 match g {
-                    Gen::Started { n_cached } => drop(otx.send(Out::Start { n_prompt, n_cached })),
+                    Gen::Started { n_cached } => {
+                        t0 = std::time::Instant::now();
+                        otx.send(Out::Start { n_prompt, n_cached }).ok();
+                    }
                     Gen::Token(t) => {
+                        t1.get_or_insert_with(std::time::Instant::now);
                         if otx.is_closed() {
                             return; // client gone: dropping grx stops the model
                         }
@@ -241,7 +254,9 @@ impl App {
             if !text.is_empty() {
                 otx.send(Out::Text(text)).ok();
             }
-            otx.send(Out::End { calls, finish, n_out, stop_word: stops.hit }).ok();
+            let t1 = t1.unwrap_or_else(std::time::Instant::now);
+            let timings = Timings { prompt_ms: (t1 - t0).as_secs_f64() * 1e3, predicted_ms: t1.elapsed().as_secs_f64() * 1e3 };
+            otx.send(Out::End { calls, finish, n_out, stop_word: stops.hit, timings }).ok();
         });
         Ok(orx)
     }
@@ -424,6 +439,29 @@ fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
     })
 }
 
+/// OpenAI chat completions -> chat: the internal form already; content parts are flattened at
+/// render time.
+fn chatcmpl_to_chat(b: &Value) -> Result<Chat, ApiError> {
+    let messages = b["messages"].as_array().filter(|m| !m.is_empty()).ok_or_else(|| ApiError::bad("'messages' is required"))?;
+    if b["n"].as_u64().is_some_and(|n| n != 1) {
+        return Err(ApiError::bad("Only one completion choice is allowed"));
+    }
+    let tools: Vec<Value> = b["tools"].as_array().into_iter().flatten().filter(|t| t["type"] == "function").cloned().collect();
+    let stop = match &b["stop"] {
+        Value::String(s) => vec![s.clone()],
+        v => v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+    };
+    let max = ["max_completion_tokens", "max_tokens", "n_predict"].iter().find_map(|k| b[*k].as_i64());
+    Ok(Chat {
+        messages: messages.clone().into(),
+        tools: tools.into(),
+        // No limit by default (or -1), as llama-server: generation stops at EOG or a full context.
+        max_tokens: max.filter(|&n| n >= 0).map_or(usize::MAX, |n| n as usize),
+        sampling: sampling(b),
+        stop,
+    })
+}
+
 fn text_of_output(v: &Value) -> Value {
     match v {
         Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<String>().into(),
@@ -451,6 +489,7 @@ struct Acc {
     n_out: usize,
     finish: Option<Finish>,
     stop_word: Option<String>,
+    timings: Timings,
 }
 
 impl Acc {
@@ -458,9 +497,9 @@ impl Acc {
         match out {
             Out::Start { n_prompt, n_cached } => (self.n_prompt, self.n_cached) = (*n_prompt, *n_cached),
             Out::Text(t) => self.text += t,
-            Out::End { calls, finish, n_out, stop_word } => {
+            Out::End { calls, finish, n_out, stop_word, timings } => {
                 self.calls = calls.iter().map(|c| (rand_id(), c.clone())).collect();
-                (self.finish, self.n_out, self.stop_word) = (Some(*finish), *n_out, stop_word.clone());
+                (self.finish, self.n_out, self.stop_word, self.timings) = (Some(*finish), *n_out, stop_word.clone(), *timings);
             }
             Out::Error(_) => {}
         }
@@ -622,6 +661,78 @@ impl Format for Responses {
     }
 }
 
+/// OpenAI chat completions (llama-server to_json_oaicompat_chat[_stream]).
+struct ChatCmpl {
+    id: String,
+    model: String,
+    created: u64,
+    include_usage: bool,
+    a: Acc,
+}
+
+impl ChatCmpl {
+    fn finish_reason(&self) -> &'static str {
+        match self.a.finish {
+            Some(Finish::Length) => "length",
+            _ if !self.a.calls.is_empty() => "tool_calls",
+            _ => "stop",
+        }
+    }
+    fn usage(&self) -> Value {
+        json!({"completion_tokens": self.a.n_out, "prompt_tokens": self.a.n_prompt, "total_tokens": self.a.n_prompt + self.a.n_out, "prompt_tokens_details": {"cached_tokens": self.a.n_cached}})
+    }
+    fn timings(&self) -> Value {
+        let (t, pn, dn) = (&self.a.timings, (self.a.n_prompt - self.a.n_cached).max(1), self.a.n_out.max(1));
+        json!({"cache_n": self.a.n_cached, "prompt_n": self.a.n_prompt - self.a.n_cached, "prompt_ms": t.prompt_ms, "prompt_per_token_ms": t.prompt_ms / pn as f64,
+               "prompt_per_second": pn as f64 * 1e3 / t.prompt_ms.max(1e-3), "predicted_n": self.a.n_out, "predicted_ms": t.predicted_ms,
+               "predicted_per_token_ms": t.predicted_ms / dn as f64, "predicted_per_second": dn as f64 * 1e3 / t.predicted_ms.max(1e-3)})
+    }
+    fn chunk(&self, choices: Value) -> Value {
+        json!({"choices": choices, "created": self.created, "id": self.id, "model": self.model, "system_fingerprint": FINGERPRINT, "object": "chat.completion.chunk"})
+    }
+    fn delta(&self, delta: Value) -> String {
+        format!("data: {}\n\n", self.chunk(json!([{"finish_reason": null, "index": 0, "delta": delta}])))
+    }
+}
+
+/// llama-server's build tag in `system_fingerprint` (the oracle is b1-e6443bd).
+const FINGERPRINT: &str = concat!("eomoe-", env!("CARGO_PKG_VERSION"));
+
+impl Format for ChatCmpl {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        match out {
+            Out::Start { .. } => vec![self.delta(json!({"role": "assistant", "content": null}))],
+            Out::Text(t) => vec![self.delta(json!({"content": t}))],
+            Out::End { .. } => {
+                let mut v: Vec<String> = self.a.calls.iter().enumerate().map(|(k, (id, c))| {
+                    self.delta(json!({"tool_calls": [{"index": k, "id": id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}]}))
+                }).collect();
+                let mut last = self.chunk(json!([{"finish_reason": self.finish_reason(), "index": 0, "delta": {}}]));
+                last["timings"] = self.timings();
+                v.push(format!("data: {last}\n\n"));
+                if self.include_usage {
+                    let mut u = self.chunk(json!([]));
+                    u["usage"] = self.usage();
+                    v.push(format!("data: {u}\n\n"));
+                }
+                v.push("data: [DONE]\n\n".into());
+                v
+            }
+            Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut msg = json!({"role": "assistant", "content": self.a.text});
+        if !self.a.calls.is_empty() {
+            msg["tool_calls"] = self.a.calls.iter().map(|(id, c)| json!({"type": "function", "function": {"name": c.name, "arguments": c.arguments}, "id": id})).collect();
+        }
+        json!({"choices": [{"finish_reason": self.finish_reason(), "index": 0, "message": msg}], "created": self.created, "model": self.model,
+               "system_fingerprint": FINGERPRINT, "object": "chat.completion", "usage": self.usage(), "id": self.id, "timings": self.timings()})
+    }
+}
+
 /// Stream the formatted events, or collect them into the final JSON body.
 async fn respond(rx: Result<tmpsc::UnboundedReceiver<Out>, ApiError>, mut f: impl Format, stream: bool) -> Response {
     let mut rx = match rx {
@@ -688,6 +799,17 @@ async fn responses(State(app): State<Arc<App>>, body: Bytes) -> Response {
     respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
 }
 
+async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let include_usage = b["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+    let f = ChatCmpl { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), created: now(), include_usage, a: Acc::default() };
+    let rx = chatcmpl_to_chat(&b).and_then(|c| app.run(c));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
 async fn count_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
     match parse(&body).and_then(|b| anthropic_to_chat(&b)).and_then(|c| app.prompt(&c)) {
         Ok(p) => Json(json!({"input_tokens": p.len()})).into_response(),
@@ -723,6 +845,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
         .route("/v1/responses/input_tokens", post(input_tokens))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/chat/completions", post(chat_completions))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
         .with_state(app)
 }
