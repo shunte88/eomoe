@@ -480,7 +480,13 @@ Both runs sit at the PCIe limit (~10 GB/s). Four working sets thrash the 4.8 GB 
 - **The 1.5x rested on its own estimate:** ~25 distinct experts per layer for 4 tokens vs 8 for one means ~3x the bytes for 4x the tokens. That works out to 4/3, not 1.5.
 - **The real bound is DRAM, not PCIe.** Per-step profiling (t=4, 57 ms) showed 41 ms of CPU experts, 10 ms of GPU attention plus router, and 7 ms of host overhead. CPU expert reads and DMA uploads share one dual-channel DDR4 bus (~33 GB/s). Uploading more misses (2/5, 3/5) made steps slower, because the DMA starved the CPU. Thread count (8–24) and the split ratio both plateau around 1.3–1.4x.
 - **Hybrid also raised the baseline:** single-stream decode went from 38 to 41.2 tok/s, so the relative bar rose while absolute throughput went up. At N=4 eomoe serves 1.77x the oracle's aggregate.
-- **Next lever, not taken:** two-group layer pipelining, so CPU MoE of group A overlaps GPU attention of group B. It would hide the ~17 ms serial GPU and host window, but experts shared between the groups get read twice. Revisit if multi-agent load matters.
+- **Two-lane layer pipelining: built, measured, reverted (2026-11-26).** The decode rows were split into two lanes. Lane A's CPU experts ran in the background (in FIFO order on the pool) while lane B's attention and router ran on the GPU. Correctness held: p50 0.0003, top-1 124/124 against the CPU reference.
+  - It was slower: 1.24–1.34x across admission fractions, against 1.36–1.40x unpipelined.
+  - The CPU job was fully hidden (wait ≈ 2 ms), but the GPU side grew. With no uploads at all, two-lane attention plus router took 21.8 ms per step under CPU DRAM load, against 9.4 ms serial. Kernel launches and readbacks slow down when the CPU saturates DRAM.
+  - With uploads, they ran at about 6 GB/s, so the GPU lane became the critical path.
+  - Bytes per t=4 step are about 1.17 GB from host DRAM whether or not the work is split (no duplication: 1186 vs 1166 MB), and the CPU kernel already streams at 86% of raw read (27.1 vs 31.5 GB/s, `bench_moe_vs_bandwidth`).
+  - The A/B on the unpipelined code kept admission at 1/5 (59.0–59.3 tok/s) over 1/10 (56.5–59.4).
+  - **The 1.5x gate stays revised to 1.3x.** The remaining levers are fewer host bytes per step, such as a larger effective cache (more VRAM or a second GPU), or CUDA graphs to cut launch cost under DRAM load.
 
 ## Plan: Phase 11, agent-serving extras from koboldcpp (2026-11-26)
 
