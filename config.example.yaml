@@ -10,6 +10,11 @@ server:
   host: "127.0.0.1"
   port: 8080
   alias: "local-code"       # model name clients use
+  # parallel: 4             # requests served at once
+  # api_key: "key1,key2"    # require a key (Bearer or x-api-key); /health and / stay open
+  # api_key_file: "/etc/eomoe/keys"   # one key per line, # comments
+  # ssl_key_file: "/etc/eomoe/key.pem"    # both set: serve HTTPS
+  # ssl_cert_file: "/etc/eomoe/cert.pem"
 
 logging:
   level: "info"

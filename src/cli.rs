@@ -2,8 +2,7 @@
 //! with the same commands, settings and client wiring as the reference `local-code-llm`.
 
 use clap::{Args, Parser, Subcommand};
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command as Proc;
 
@@ -59,19 +58,43 @@ pub struct ServeArgs {
     /// Model name served to clients [config: server.alias, default: local-code]
     #[clap(long)]
     pub alias: Option<String>,
+    /// API keys, comma-separated; requests then need one (Bearer or x-api-key) [config: server.api_key]
+    #[clap(long, env = "LLAMA_API_KEY")]
+    pub api_key: Option<String>,
+    /// File of API keys, one per line, `#` comments [config: server.api_key_file]
+    #[clap(long, env = "LLAMA_ARG_API_KEY_FILE")]
+    pub api_key_file: Option<PathBuf>,
+    /// PEM private key: serve HTTPS (with --ssl-cert-file) [config: server.ssl_key_file]
+    #[clap(long, env = "LLAMA_ARG_SSL_KEY_FILE")]
+    pub ssl_key_file: Option<PathBuf>,
+    /// PEM certificate chain for HTTPS [config: server.ssl_cert_file]
+    #[clap(long, env = "LLAMA_ARG_SSL_CERT_FILE")]
+    pub ssl_cert_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
 pub struct ClientArgs {
-    /// Server port
+    /// Server port on this machine (ignored with --url)
     #[clap(long, env = "PORT", default_value_t = 8080)]
     pub port: u16,
+    /// Server base URL, for a remote or HTTPS server, e.g. https://gpu-box:8080
+    #[clap(long, env = "EOMOE_URL")]
+    pub url: Option<String>,
+    /// API key, if the server was started with --api-key
+    #[clap(long, env = "EOMOE_API_KEY")]
+    pub api_key: Option<String>,
     /// Context size the clients are told about
     #[clap(long, env = "CTX_SIZE", default_value_t = crate::config::DEFAULT_CTX)]
     pub ctx_size: usize,
     /// Arguments passed through to the client
     #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+impl ClientArgs {
+    fn base(&self) -> String {
+        self.url.as_deref().map_or_else(|| format!("http://127.0.0.1:{}", self.port), |u| u.trim_end_matches('/').to_owned())
+    }
 }
 
 /// Where eomoe keeps the model, the clients and their config: $EOMOE_HOME, default
@@ -131,20 +154,17 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// POST `body` and return the `data: ` payloads of the streamed response.
-/// HTTP/1.0, so the server answers close-delimited instead of chunked.
-pub fn post_sse(port: u16, path: &str, body: &serde_json::Value) -> Result<Vec<String>, String> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("{e}. Check that serve is running and ready."))?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(600))).ok();
-    let b = body.to_string();
-    write!(s, "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).map_err(|e| e.to_string())?;
-    let mut lines = BufReader::new(s).lines();
-    let status = lines.next().ok_or("empty response")?.map_err(|e| e.to_string())?;
-    if !status.contains(" 200") {
-        let rest: Vec<String> = lines.map_while(Result::ok).collect();
-        return Err(format!("{status}: {}", rest.last().map(String::as_str).unwrap_or("")));
+/// POST `body` to `base` + `path` and return the `data: ` payloads of the streamed response.
+pub fn post_sse(base: &str, key: Option<&str>, path: &str, body: &serde_json::Value) -> Result<Vec<String>, String> {
+    let mut r = ureq::post(&format!("{base}{path}")).timeout(std::time::Duration::from_secs(600)).set("Content-Type", "application/json");
+    if let Some(k) = key {
+        r = r.set("Authorization", &format!("Bearer {k}"));
     }
-    Ok(lines.map_while(Result::ok).filter_map(|l| l.strip_prefix("data: ").map(str::to_owned)).collect())
+    let resp = r.send_string(&body.to_string()).map_err(|e| match e {
+        ureq::Error::Status(c, r) => format!("{c}: {}", r.into_string().unwrap_or_default()),
+        e => format!("{e}. Check that serve is running and ready."),
+    })?;
+    Ok(BufReader::new(resp.into_reader()).lines().map_while(Result::ok).filter_map(|l| l.strip_prefix("data: ").map(str::to_owned)).collect())
 }
 
 /// The reference `check`: both endpoints must stream non-empty text and complete.
@@ -158,7 +178,7 @@ pub fn check(a: &ClientArgs) -> Result<(), String> {
         body["model"] = "local-code".into();
         body["stream"] = true.into();
         let (mut text, mut completed) = (String::new(), false);
-        for d in post_sse(a.port, path, &body).map_err(|e| format!("{path}: {e}"))? {
+        for d in post_sse(&a.base(), a.api_key.as_deref(), path, &body).map_err(|e| format!("{path}: {e}"))? {
             if d == "[DONE]" {
                 break;
             }
@@ -179,8 +199,11 @@ pub fn check(a: &ClientArgs) -> Result<(), String> {
 
 /// Replace this process with Codex, pointed at the local Responses endpoint.
 pub fn codex(a: &ClientArgs) -> Result<(), String> {
-    let base = format!("http://127.0.0.1:{}", a.port);
+    let base = a.base();
     let mut c = Proc::new(client("codex")?);
+    if let Some(k) = &a.api_key {
+        c.env("EOMOE_API_KEY", k).arg("-c").arg("model_providers.local_llama.env_key=\"EOMOE_API_KEY\"");
+    }
     c.env("CODEX_HOME", home().join("codex")).args(["-m", "local-code"]);
     for kv in [
         "model_provider=\"local_llama\"".to_owned(),
@@ -203,8 +226,8 @@ pub fn claude(a: &ClientArgs) -> Result<(), String> {
         c.env_remove(k);
     }
     c.env("CLAUDE_CONFIG_DIR", home().join("claude"))
-        .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", a.port))
-        .env("ANTHROPIC_AUTH_TOKEN", "local");
+        .env("ANTHROPIC_BASE_URL", a.base())
+        .env("ANTHROPIC_AUTH_TOKEN", a.api_key.as_deref().unwrap_or("local"));
     for k in ["ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"] {
         c.env(k, "local-code");
     }

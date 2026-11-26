@@ -25,8 +25,8 @@ fn run() -> Result<(), String> {
         Command::Codex(a) => cli::codex(a),
         Command::Claude(a) => cli::claude(a),
         Command::Serve(a) => {
-            let s = config.resolve_serve(a);
-            log::info!("model={} ctx={} cache={:?} MiB parallel={}", s.model.display(), s.ctx_size, s.cache_mib, s.parallel);
+            let s = config.resolve_serve(a)?;
+            log::info!("model={} ctx={} cache={:?} MiB parallel={} api_keys={} https={}", s.model.display(), s.ctx_size, s.cache_mib, s.parallel, s.api_keys.len(), s.tls.is_some());
             if !(1..=eomoe::gpu::MAX_SEQ).contains(&s.parallel) {
                 return Err(format!("--parallel must be 1..={}", eomoe::gpu::MAX_SEQ));
             }
@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
                 Ok(m)
             })?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            rt.block_on(server::serve(app, &s.host, s.port))
+            rt.block_on(server::serve(app, &s.host, s.port, s.api_keys, s.tls))
         }
     }
 }

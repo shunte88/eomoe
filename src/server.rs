@@ -828,8 +828,28 @@ async fn models(State(app): State<Arc<App>>) -> Json<Value> {
     }))
 }
 
-pub fn router(app: Arc<App>) -> Router {
+/// llama-server's `middleware_validate_api_key`: with keys set, every path but the health checks
+/// and the page at `/` needs one, as `Authorization: [Bearer ]KEY` or else `X-Api-Key: KEY`.
+async fn check_key(State(keys): State<Arc<Vec<String>>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let ok = {
+        let open = keys.is_empty() || matches!(req.uri().path(), "/health" | "/v1/health" | "/") || req.method() == axum::http::Method::OPTIONS;
+        let hv = |h: &str| req.headers().get(h).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let key = Some(hv("authorization")).filter(|k| !k.is_empty()).unwrap_or_else(|| hv("x-api-key"));
+        open || keys.iter().any(|k| k == key.strip_prefix("Bearer ").unwrap_or(key))
+    };
+    if ok {
+        return next.run(req).await;
+    }
+    log::warn!("unauthorized: Invalid API Key");
+    let body = r#"{"error":{"message":"Invalid API Key","type":"authentication_error","code":401}}"#;
+    (StatusCode::UNAUTHORIZED, [(header::CONTENT_TYPE, "application/json; charset=utf-8")], body).into_response()
+}
+
+/// The HTTP API; `keys` non-empty turns on API-key checks (`--api-key`).
+pub fn router(app: Arc<App>, keys: Vec<String>) -> Router {
+    let keys = Arc::new(keys);
     Router::new()
+        .route("/", get(|| async { axum::response::Html(include_str!("chat.html")) }))
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/v1/health", get(|| async { Json(json!({"status": "ok"})) }))
         .route("/v1/models", get(models))
@@ -843,12 +863,28 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/chat/completions", post(chat_completions))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
         .with_state(app)
+        .layer(axum::middleware::from_fn_with_state(keys, check_key))
 }
 
-pub async fn serve(app: Arc<App>, host: &str, port: u16) -> Result<(), String> {
-    let listener = tokio::net::TcpListener::bind((host, port)).await.map_err(|e| format!("{host}:{port}: {e}"))?;
-    log::info!("listening on http://{}", listener.local_addr().map_err(|e| e.to_string())?);
-    axum::serve(listener, router(app)).await.map_err(|e| e.to_string())
+/// Serve the API on host:port, over HTTPS when `tls` = (PEM key, PEM cert chain) is set.
+pub async fn serve(app: Arc<App>, host: &str, port: u16, keys: Vec<String>, tls: Option<(std::path::PathBuf, std::path::PathBuf)>) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind((host, port)).map_err(|e| format!("{host}:{port}: {e}"))?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let r = router(app, keys);
+    match tls {
+        None => {
+            log::info!("listening on http://{addr}");
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            let l = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
+            axum::serve(l, r).await.map_err(|e| e.to_string())
+        }
+        Some((key, cert)) => {
+            rustls::crypto::ring::default_provider().install_default().ok();
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await.map_err(|e| format!("TLS {} / {}: {e}", cert.display(), key.display()))?;
+            log::info!("listening on https://{addr}");
+            axum_server::from_tcp_rustls(listener, cfg).serve(r.into_make_service()).await.map_err(|e| e.to_string())
+        }
+    }
 }
 
 #[cfg(test)]

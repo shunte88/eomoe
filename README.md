@@ -35,6 +35,7 @@ The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/ph
 | `POST /v1/responses` | OpenAI Responses (Codex) |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages (Claude Code) |
 | `GET /v1/models`, `/health` | |
+| `GET /` | Minimal web chat page |
 
 `/chat/completions`, `/responses` and `/models` are also served without the `/v1` prefix, and `/v1/responses/input_tokens` counts tokens for Codex.
 
@@ -59,10 +60,33 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
 | `--parallel` | `PARALLEL` | 4 (requests served at once; they share the KV pool, 1..=16) |
 | `--alias` | | `local-code` |
+| `--api-key` | `LLAMA_API_KEY` | none (comma-separated keys; requests then need `Authorization: Bearer KEY` or `x-api-key: KEY`) |
+| `--api-key-file` | `LLAMA_ARG_API_KEY_FILE` | none (one key per line, `#` comments) |
+| `--ssl-key-file`, `--ssl-cert-file` | `LLAMA_ARG_SSL_KEY_FILE`, `LLAMA_ARG_SSL_CERT_FILE` | none (both set: HTTPS) |
 
 The YAML file also takes `logging.level` (`RUST_LOG` overrides it).
 
 Deployment: `docker compose up` reads `./config/config.yaml` and `./models` (it needs nvidia-container-toolkit). `eomoe.service` is a systemd unit.
+
+## Remote access
+
+The server binds 127.0.0.1 by default. Ways to reach it from another machine:
+
+- **SSH tunnel** (nothing to configure): on the laptop run `ssh -N -L 8080:127.0.0.1:8080 gpu-box`, then use eomoe as if it were local.
+- **Tailscale:** run `eomoe serve --host <tailscale IP> --api-key KEY`. For HTTPS, `tailscale cert gpu-box.<tailnet>.ts.net` writes a key and a certificate; pass them as `--ssl-key-file` and `--ssl-cert-file`.
+- **LAN:** run `--host 0.0.0.0 --api-key KEY` and preferably add TLS. Keys travel in headers, so use HTTPS outside a trusted network.
+
+Auth matches llama-server: `/health`, `/v1/health` and the chat page at `/` stay open, and anything else without a valid key gets llama-server's 401 body.
+
+On the client machine, `check`, `claude` and `codex` take `--url` and `--api-key` (`EOMOE_URL`, `EOMOE_API_KEY`):
+
+```bash
+eomoe claude --url https://gpu-box.example.ts.net:8080 --api-key KEY
+```
+
+For a self-signed certificate, trust it with `SSL_CERT_FILE=cert.pem` (`check`, `codex`) or `NODE_EXTRA_CA_CERTS=cert.pem` (`claude`).
+
+Open `/` in a browser for a minimal chat page. It streams `/v1/chat/completions`; enter the key there if one is set.
 
 ## How it works
 

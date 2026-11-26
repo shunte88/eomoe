@@ -17,7 +17,7 @@ Architecture decisions:
 | 5. Server + one-stop CLI | Reference `check` passes; real Claude Code + Codex tool sessions | done 2026-11-25 (see below) |
 | 6. Beyond parity | Prefetch, CPU-miss compute, batching, multi-GPU | **done**: f16 KV / 32K ctx, prefill 953 tok/s @4K (2.4x), decode 38.1 / 25.5 after 19K, decode prefetch, OpenAI chat API (see below). Not pursued: CPU-miss compute, batching, multi-GPU |
 | 7. Concurrent requests (continuous batching) | N concurrent streams: each stream's greedy tokens equal its solo run; aggregate decode at N=4 > llama-server `--parallel 4` (29.0 tok/s) and ≥ 1.25x eomoe's own N=1 (**revised from 1.5x, flagged**); no single-stream regression | **done 2026-11-26**: N=4 51.3 tok/s at the server (1.77x oracle, 1.29x own N=1); hybrid CPU experts lift single-stream decode to 41.2 / 28.8 after 19K (see below) |
-| 8. Remote access | llama-server-compatible `--api-key` (401 body byte-identical), optional TLS, client commands take `--url`/`--api-key`, built-in web chat page | planned (future) |
+| 8. Remote access | llama-server-compatible `--api-key` (401 body byte-identical), optional TLS, client commands take `--url`/`--api-key`, built-in web chat page | **done 2026-11-26**: 11/11 oracle auth cases identical; HTTPS + key verified with check, Claude Code and Codex (see below) |
 | 9. Request pool | `eomoe pool` routes requests across N nodes with prefix affinity + load; aggregate throughput scales ~linearly with nodes | planned (future; needs a 2nd machine for the gate) |
 | 10. Expert-parallel pool | Experts sharded across nodes' VRAM over 10–100 GbE: removes PCIe miss uploads; runs models bigger than one box (e.g. Qwen3-Coder-480B-A35B, same qwen3moe arch) | planned (future; latency probe first) |
 | 11. Agent-serving extras (from a koboldcpp review) | `/v1/completions` with FIM for editor completion; RAM KV snapshots so evicted conversations come back without re-prefill; JSON-schema-constrained output (`response_format`); Ollama `/api/chat` + `/api/tags` adapter. Each one is gated against llama-server or Ollama wire captures | planned (future) |
@@ -487,6 +487,39 @@ Both runs sit at the PCIe limit (~10 GB/s). Four working sets thrash the 4.8 GB 
   - Bytes per t=4 step are about 1.17 GB from host DRAM whether or not the work is split (no duplication: 1186 vs 1166 MB), and the CPU kernel already streams at 86% of raw read (27.1 vs 31.5 GB/s, `bench_moe_vs_bandwidth`).
   - The A/B on the unpipelined code kept admission at 1/5 (59.0–59.3 tok/s) over 1/10 (56.5–59.4).
   - **The 1.5x gate stays revised to 1.3x.** The remaining levers are fewer host bytes per step, such as a larger effective cache (more VRAM or a second GPU), or CUDA graphs to cut launch cost under DRAM load.
+
+## Phase 8 done: remote access (2026-11-26)
+
+**Gate:** `tests/phase8_golden.rs` `api_key_matches_oracle` sends 11 requests and diffs them against `tests/golden/auth.json`. That file was captured from the oracle llama-server `--api-key k1,k2` by `tools/capture_auth_golden.py`.
+
+The cases cover:
+- no key;
+- a wrong Bearer key, and a wrong `x-api-key`;
+- a bare `Authorization: KEY`;
+- each valid key in each header;
+- Authorization overriding a valid `x-api-key`;
+- `/health`, `/v1/health` and `/` open, and `/models` closed.
+
+Status, content type and the exact 401 body match on all 11. The gate is red-capable: one changed byte in the 401 body fails `no_key: body`. The engine is a stub, so the gate needs the model file but not the GPU.
+
+Port: `check_key` in `src/server.rs` follows `middleware_validate_api_key` (llama.cpp `e6443bd` `tools/server/server-http.cpp`). Flags and environment variables match llama-server: `--api-key` (CSV, `LLAMA_API_KEY`), `--api-key-file`, `--ssl-key-file` and `--ssl-cert-file`. TLS is rustls on the ring provider, through axum-server.
+
+**End to end, against the real server** (`serve --api-key sekrit --ssl-key-file … --ssl-cert-file …`, self-signed leaf certificate):
+
+| Client | Result |
+|---|---|
+| `curl` without a key: `/v1/models`, `/health`, `/` | 401 with the oracle body; 200; chat page |
+| `eomoe check --url https://localhost:8097 --api-key sekrit` (`SSL_CERT_FILE`) | Both endpoints stream; exit 0 |
+| Same with `--api-key nope` | `401: {"error":{"message":"Invalid API Key",…}}`, exit 1 |
+| `eomoe claude --url … --api-key sekrit -p "…calc.py bug…"` (`NODE_EXTRA_CA_CERTS`) | Correct answer (subtraction instead of addition), 8.0 s |
+| `eomoe codex --url … --api-key sekrit exec …` | Correct answer, 11.0 s |
+| Chat page request: streamed `/v1/chat/completions` with Bearer | Streams "Hi there! 👋 …" |
+
+- `check` now uses ureq (rustls, system CA store plus `SSL_CERT_FILE`) instead of hand-written HTTP/1.0, so it handles HTTPS and auth headers.
+- Tunnels (SSH `-L`, Tailscale with `tailscale cert`) are documented in the README rather than built.
+- Regression gates after the change: lib 20/20, phase5 API gate, phase8.
+- Not done: CORS headers (llama-server's `--cors-origins`); the chat page is same-origin. Add them if a browser app on another origin needs the API.
+- Found, pre-existing: Claude Code warns that it does not know "local-code" and assumes a 1M-token window, so it may not auto-compact before our 32K. Follow-up: set the window through Claude Code's gateway model config.
 
 ## Plan: Phase 11, agent-serving extras from koboldcpp (2026-11-26)
 
