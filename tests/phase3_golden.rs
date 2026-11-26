@@ -98,3 +98,56 @@ fn gpu_incremental_decode_matches_oracle_tokens() {
         assert_eq!(got, want, "case {ci}");
     }
 }
+
+/// Hybrid decode (Phase 7b): four streams decoded together, cache misses computed on the CPU
+/// (`cpu_moe`) from the first step (a small cache forces many). Each row's logits are gated like
+/// gpu_matches_cpu_reference against the CPU reference over the same sequence.
+#[test]
+#[ignore = "needs model file + GPU"]
+fn gpu_hybrid_batched_decode_matches_cpu_reference() {
+    const P50_TOL: f32 = 0.001;
+    const MAX_TOL: f32 = 2.0;
+    let mut c = CpuModel::new(Gguf::open(model_path()).unwrap()).unwrap();
+    let mut gm = GpuModel::with_cache(Gguf::open(model_path()).unwrap(), 1024, 1000).unwrap();
+    gm.set_n_seq(4);
+    gm.set_hybrid(true);
+    let nv = c.n_vocab();
+    let cases: Vec<(Vec<u32>, Vec<u32>)> = (golden("greedy.json").as_array().unwrap().iter())
+        .map(|k| (serde_json::from_value(k["prompt_tokens"].clone()).unwrap(), serde_json::from_value(k["tokens"].clone()).unwrap()))
+        .collect();
+    let steps = cases.iter().map(|(_, g)| g.len() - 1).min().unwrap();
+    // CPU reference: logits of every position of prompt + generated tokens.
+    let refs: Vec<Vec<f32>> = cases.iter().map(|(p, g)| {
+        c.reset();
+        c.forward(&[&p[..], &g[..steps]].concat())
+    }).collect();
+    for (i, (p, _)) in cases.iter().enumerate() {
+        gm.select(i);
+        gm.forward_last(p);
+    }
+    let (mut diffs, mut worst, mut top1) = (vec![], 0f32, 0);
+    for k in 0..steps {
+        let rows: Vec<(usize, u32)> = cases.iter().enumerate().map(|(i, (_, g))| (i, g[k])).collect();
+        let l = gm.decode_batch(&rows);
+        for (i, (p, _)) in cases.iter().enumerate() {
+            let pos = p.len() + k; // the row that predicts token k+1
+            let (la, lb) = (log_softmax(&refs[i][pos * nv..(pos + 1) * nv]), log_softmax(&l[i * nv..(i + 1) * nv]));
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            top1 += (am(&la) == am(&lb)) as usize;
+            let mut idx: Vec<usize> = (0..nv).collect();
+            idx.select_nth_unstable_by(4, |x, y| la[*y].total_cmp(&la[*x]));
+            for &j in &idx[..5] {
+                let d = (la[j] - lb[j]).abs();
+                worst = worst.max(d);
+                diffs.push(d);
+            }
+        }
+    }
+    diffs.sort_by(f32::total_cmp);
+    let p50 = diffs[(diffs.len() - 1) / 2];
+    let s = gm.cache_stats();
+    println!("hybrid batched decode vs CPU: p50 {p50:.5}, max {worst:.5}, top-1 {top1}/{}, cache hits {:.1}%",
+        steps * cases.len(), 100.0 * s.hits as f64 / (s.hits + s.misses) as f64);
+    assert!(p50 <= P50_TOL && worst <= MAX_TOL, "hybrid decode diverges: p50 {p50} max {worst}");
+    assert!(top1 * 100 >= steps * cases.len() * 95, "hybrid top-1 agreement {top1}/{}", steps * cases.len());
+}

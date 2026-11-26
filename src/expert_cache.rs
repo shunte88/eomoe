@@ -19,6 +19,8 @@ pub struct Plan {
     pub hits: usize,
     /// (expert, slot), ascending by expert.
     pub fills: Vec<(usize, usize)>,
+    /// Misses past the `admit` cap: not given a slot (the caller computes them elsewhere).
+    pub rest: Vec<usize>,
 }
 
 pub struct ExpertCache {
@@ -74,7 +76,7 @@ impl ExpertCache {
     /// Give a slot to every expert selected by `ids` (n_tokens x n_used) in layer `il`.
     /// The returned fills must be uploaded before the experts are computed.
     /// Panics if the lookup selects more distinct experts than there are slots.
-    pub fn plan(&mut self, il: usize, ids: &[u32], n_tokens: usize) -> Plan {
+    pub fn plan(&mut self, il: usize, ids: &[u32], n_tokens: usize, admit: usize) -> Plan {
         self.seen.fill(false);
         let mut uniq = vec![];
         for &e in ids {
@@ -100,6 +102,13 @@ impl ExpertCache {
                 }
             }
         }
+        // Admit the misses most likely to be reused (highest CRF); the rest stay out.
+        let mut rest = vec![];
+        if misses.len() > admit {
+            misses.sort_by(|&a, &b| self.crf[il * self.n_expert + b].total_cmp(&self.crf[il * self.n_expert + a]));
+            rest = misses.split_off(admit);
+            rest.sort_unstable();
+        }
         misses.sort_unstable();
         let mut fills = vec![];
         for e in misses {
@@ -115,7 +124,7 @@ impl ExpertCache {
             fills.push((e, s));
         }
         self.clock[il] += n_tokens as i64;
-        Plan { hits, fills }
+        Plan { hits, fills, rest }
     }
 
     /// Admit experts predicted for layer `il` ahead of its lookup, without counting a use (the
@@ -142,6 +151,7 @@ impl ExpertCache {
         }
         fills
     }
+
 
     fn decayed_crf(&self, key: usize) -> f32 {
         let il = key / self.n_expert;
@@ -207,14 +217,26 @@ mod tests {
     #[test]
     fn prefetch_spares_busy_layer_and_feeds_lookup() {
         let mut c = ExpertCache::new(2, 8, 4);
-        c.plan(0, &[0, 1, 2, 3], 1); // layer 0 busy, fills all 4 slots
+        c.plan(0, &[0, 1, 2, 3], 1, usize::MAX); // layer 0 busy, fills all 4 slots
         let f = c.prefetch(1, &[5, 6], 0);
         assert!(f.is_empty(), "all slots hold busy layer-0 experts, yet prefetch evicted: {f:?}");
-        c.plan(0, &[0, 1], 1); // now 2 and 3 are evictable
+        c.plan(0, &[0, 1], 1, usize::MAX); // now 2 and 3 are evictable
         let f = c.prefetch(1, &[5, 6], 0);
         assert_eq!(f.len(), 2);
         assert!(c.slot(0, 0).is_some() && c.slot(0, 1).is_some());
-        let p = c.plan(1, &[5, 6], 1);
+        let p = c.plan(1, &[5, 6], 1, usize::MAX);
         assert_eq!((p.hits, p.fills.len()), (2, 0));
+    }
+
+    /// Misses beyond `admit` are left out (computed elsewhere) without evicting anything.
+    #[test]
+    fn capped_plan_keeps_residents() {
+        let mut c = ExpertCache::new(1, 8, 4);
+        c.plan(0, &[0, 1, 2, 3], 1, usize::MAX);
+        let p = c.plan(0, &[0, 4, 5, 6], 1, 1);
+        assert_eq!((p.hits, p.fills.len(), p.rest.len()), (1, 1, 2));
+        let resident = (0..8).filter(|&e| c.slot(0, e).is_some()).count();
+        assert_eq!(resident, 4);
+        assert!(p.rest.iter().all(|&e| c.slot(0, e).is_none()));
     }
 }

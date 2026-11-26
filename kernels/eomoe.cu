@@ -412,7 +412,13 @@ extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int
 // The caches are f16 (llama.cpp's default KV type), so 32K ctx costs what 16K did in f32.
 // ponytail: K/V re-read per query head (no GQA sharing); tile for long contexts.
 #define ATT_WARPS 8
-extern "C" __global__ void attention(const float* q, const __half* kc, const __half* vc, float* out,
+// Paged KV: a sequence's position p lives at slot pt[p / KV_PAGE] * KV_PAGE + p % KV_PAGE of the
+// layer's K / V pool (pages shared by all sequences; tiles never straddle a page).
+#define KV_PAGE 256
+__device__ __forceinline__ size_t kv_slot(const int* pt, int p) {
+    return (size_t)pt[p / KV_PAGE] * KV_PAGE + p % KV_PAGE;
+}
+extern "C" __global__ void attention(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
                                      int nh, int nkv, int hd, int n_past, float scale) {
     __shared__ float sm[ATT_WARPS], sl[ATT_WARPS], sacc[ATT_WARPS][256];
     const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -423,7 +429,7 @@ extern "C" __global__ void attention(const float* q, const __half* kc, const __h
     const int n_ctx = n_past + t + 1;
     float m = -INFINITY, l = 0.0f;
     for (int p = w; p < n_ctx; p += ATT_WARPS) {
-        const size_t off = ((size_t)p * nkv + hk) * hd;
+        const size_t off = (kv_slot(pt, p) * nkv + hk) * hd;
         float s = 0.0f;
         for (int d = 0; d < nd; d++) s += qv[d] * __half2float(kc[off + lane + 32 * d]);
         s = warp_sum(s) * scale;
@@ -457,7 +463,7 @@ extern "C" __global__ void attention(const float* q, const __half* kc, const __h
 // Split-K (decode): with S > 1, block z covers its S-th of the positions and writes its softmax
 // state (m, l, unnormalized acc[128]) to part[(z * T * nh + row) * 130]; attn_merge combines.
 #define FA_KT 32
-extern "C" __global__ void attention_dec(const float* q, const __half* kc, const __half* vc, float* out,
+extern "C" __global__ void attention_dec(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
                                          int nh, int nkv, int n_past, int T, float scale, float* part) {
     constexpr int R = 1, NR = 8 * R;
     __shared__ float sq[NR][128];
@@ -487,7 +493,7 @@ extern "C" __global__ void attention_dec(const float* q, const __half* kc, const
             const int j = i >> 4, c = i & 15, p = p0 + j;
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
             if (p < pe) {
-                const size_t off = ((size_t)p * nkv + hk) * 128 + 8 * c;
+                const size_t off = (kv_slot(pt, p) * nkv + hk) * 128 + 8 * c;
                 kv4 = *(const uint4*)(kc + off);
                 vv4 = *(const uint4*)(vc + off);
             }
@@ -550,7 +556,7 @@ extern "C" __global__ void attention_dec(const float* q, const __half* kc, const
 // Q and P are fed as f16 hi + lo pairs (two mmas each): ~f32 accuracy; K and V are exact f16.
 // Requires hd == 128 and 64 % G == 0. grid (nkv, ceil(T*G/64), S), block 128. Split-K as above.
 #define TC_KT 64
-extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, float* out,
+extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
                                                               int nh, int nkv, int n_past, int T, float scale, float* part) {
     __shared__ __align__(16) __half sk[TC_KT][136];
     __shared__ __align__(16) __half svt[128][TC_KT + 8];
@@ -584,7 +590,7 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
             const int j = i >> 4, c = i & 15, p = p0 + j;
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
             if (p < pe) {
-                const size_t off = ((size_t)p * nkv + hk) * 128 + 8 * c;
+                const size_t off = (kv_slot(pt, p) * nkv + hk) * 128 + 8 * c;
                 kv4 = *(const uint4*)(kc + off);
                 vv4 = *(const uint4*)(vc + off);
             }

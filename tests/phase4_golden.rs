@@ -60,7 +60,7 @@ fn cache_hit_rate_on_ref_trace_beats_oracle() {
     let group_of = |l: usize| groups.iter().position(|g| g.contains(&l)).unwrap();
     let (mut hits, mut total) = (0usize, 0usize);
     for lk in &lookups {
-        let p = caches[group_of(lk.layer)].plan(lk.layer, &lk.ids, lk.ids.len() / lk.n_used);
+        let p = caches[group_of(lk.layer)].plan(lk.layer, &lk.ids, lk.ids.len() / lk.n_used, usize::MAX);
         if lk.ids.len() <= 8 * lk.n_used {
             hits += p.hits;
             total += p.hits + p.fills.len();

@@ -36,6 +36,14 @@ const SPAN: usize = 4096;
 const ATT_SPLIT: usize = 128;
 /// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
 const LOGIT_ROWS: usize = 64;
+/// KV positions per page (kernels/eomoe.cu KV_PAGE). Sequences take pages from one shared pool.
+const KV_PAGE: usize = 256;
+/// Hybrid: the fraction of a layer's cache misses uploaded and run on the GPU; the rest run on
+/// the CPU meanwhile. ~0.2 ms to upload an expert vs ~0.15 ms on the CPU (4 decode rows).
+const ADMIT_NUM: usize = 1;
+const ADMIT_DEN: usize = 5;
+/// Sequences the page tables are sized for (`set_n_seq`).
+pub const MAX_SEQ: usize = 16;
 /// VRAM left free after sizing the expert cache to "as much as fits".
 const VRAM_RESERVE: usize = 192 << 20;
 
@@ -150,8 +158,15 @@ pub struct GpuModel {
     layers: Vec<DLayer>,
     out_norm: Ptr,
     output: Mat,
-    /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16.
+    /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16, in KV_PAGE pages that the
+    /// sequences' page tables map their positions to.
     kv: Ptr,
+    /// Page tables, MAX_SEQ rows of n_ctx / KV_PAGE i32 (device copy of `seqs[i].pages`).
+    pt: Ptr,
+    seqs: Vec<SeqKv>,
+    free_pages: Vec<i32>,
+    /// The sequence `forward` and `truncate` act on.
+    cur: usize,
     groups: Vec<Group>,
     group_of: Vec<usize>,
     /// STAGE slots of the largest expert, for uncached ubatches: two halves, so one wave's
@@ -168,16 +183,28 @@ pub struct GpuModel {
     host: Option<HostExperts>,
     /// Page-locked staging for the per-layer routing upload.
     meta_host: PinnedHostSlice<u8>,
+    /// Hybrid decode: experts that miss the cache run on the CPU (`cpu_moe`) while the GPU runs
+    /// the resident ones and a share of the misses (ADMIT_NUM/ADMIT_DEN), uploaded to become
+    /// resident. Off: misses are uploaded and run on the GPU, batch-invariant.
+    hybrid: bool,
+    /// Page-locked staging for the CPU experts' output rows.
+    cpu_out: std::cell::RefCell<PinnedHostSlice<f32>>,
     s: Scratch,
     n_ctx: usize,
     max_batch: usize,
     /// Tokens per layer-major pass (`forward_span`).
     span: usize,
-    n_past: usize,
     /// Owns every device allocation the raw pointers above point into.
     _bufs: Vec<CudaSlice<u8>>,
     /// Bytes allocated on the device.
     pub vram_bytes: usize,
+}
+
+/// One sequence's share of the KV pool.
+#[derive(Default)]
+struct SeqKv {
+    n_past: usize,
+    pages: Vec<i32>,
 }
 
 const F: usize = std::mem::size_of::<f32>();
@@ -283,7 +310,9 @@ impl GpuModel {
             return Err(format!("head_dim {} unsupported by the attention kernel", hp.head_dim));
         }
         let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
+        let n_ctx = n_ctx.next_multiple_of(KV_PAGE);
         let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * H)?;
+        let pt = alloc(MAX_SEQ * (n_ctx / KV_PAGE) * 4)?;
         let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
         let layout = |l: &crate::qwen3moe::Layer| (l.gate.ty, l.up.ty, l.down.ty, ebytes(l));
         let mut layouts = vec![];
@@ -320,6 +349,7 @@ impl GpuModel {
             logits: alloc(LOGIT_ROWS.min(b) * hp.n_vocab * F)?,
             meta: alloc(meta_bytes(span, b, kk, hp.n_expert))?,
         };
+        let cpu_out = unsafe { ctx.alloc_pinned_with_flags::<f32>(CACHE_MAX_BATCH * e, 0) }.map_err(err)?;
         let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(span, b, kk, hp.n_expert), 0) }.map_err(err)?;
         // The expert banks get what is left: the requested MiB, capped by free VRAM.
         let (free, _) = result::mem_get_info().map_err(err)?;
@@ -355,6 +385,10 @@ impl GpuModel {
             out_norm,
             output,
             kv,
+            pt,
+            seqs: vec![SeqKv::default()],
+            free_pages: (0..(n_ctx / KV_PAGE) as i32).rev().collect(),
+            cur: 0,
             groups,
             group_of,
             stage,
@@ -362,11 +396,12 @@ impl GpuModel {
             stats: CacheStats::default(),
             host,
             meta_host,
+            hybrid: true,
+            cpu_out: cpu_out.into(),
             s,
             n_ctx,
             max_batch: b,
             span,
-            n_past: 0,
             _bufs: bufs,
             vram_bytes: vram.get(),
             w,
@@ -454,18 +489,104 @@ impl GpuModel {
         v
     }
 
-    fn check_ctx(&self, n: usize) {
-        assert!(self.n_past + n <= self.n_ctx, "context overflow: {} + {n} > {}", self.n_past, self.n_ctx);
+    /// Hybrid CPU/GPU expert compute for decode (default on). Off is batch-invariant: a stream's
+    /// tokens do not depend on what else is batched with it.
+    pub fn set_hybrid(&mut self, on: bool) {
+        self.hybrid = on;
+    }
+
+    /// Run `experts` of layer `li` on the CPU for their rows of `h` (the span's FFN input, read
+    /// back) while the GPU runs the rest, then add their output to the hidden state.
+    fn cpu_experts(&self, li: usize, experts: &[usize], by_expert: &[Vec<(usize, f32)>], h: &[f32]) {
+        let hp = &self.w.hp;
+        let (e, t) = (hp.n_embd, h.len() / hp.n_embd);
+        let wl = &self.w.layers[li];
+        let ty = [wl.gate.ty, wl.up.ty, wl.down.ty];
+        let jobs: Vec<crate::cpu_moe::ExpertJob> = experts
+            .iter()
+            .map(|&ex| {
+                let parts = self.w.expert(wl, ex);
+                let w = match &self.host {
+                    Some(hx) => {
+                        let n: usize = parts.iter().map(|b| b.len()).sum();
+                        let all = &hx.buf.as_slice().expect("pinned")[hx.base[li] + ex * n..][..n];
+                        let (g, rest) = all.split_at(parts[0].len());
+                        let (u, d) = rest.split_at(parts[1].len());
+                        [g, u, d]
+                    }
+                    None => parts,
+                };
+                crate::cpu_moe::ExpertJob { w, ty, rows: by_expert[ex].clone() }
+            })
+            .collect();
+        let mut buf = self.cpu_out.borrow_mut();
+        let out = &mut buf.as_mut_slice().expect("pinned")[..t * e];
+        out.fill(0.0);
+        crate::cpu_moe::moe(&jobs, h, e, hp.n_ff_exp, out);
+        let (x, o, n) = (self.s.x, self.s.o, (t * e) as i32);
+        unsafe { result::memcpy_htod_async(o, &*out, self.stream.cu_stream()) }.expect("htod async");
+        launch!(self, self.k.add_inplace, ((t * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
+    }
+
+    /// Serve up to `n` sequences at once (`Engine::n_seq`); drops every cached sequence.
+    pub fn set_n_seq(&mut self, n: usize) {
+        assert!((1..=MAX_SEQ).contains(&n), "1..={MAX_SEQ} sequences");
+        for s in 0..self.seqs.len() {
+            self.select(s);
+            self.truncate(0);
+        }
+        self.seqs.resize_with(n, SeqKv::default);
+        self.cur = 0;
+    }
+
+    /// Give sequence `seq` pages for `n` more positions and upload its page table.
+    /// Panics if its context or the shared pool would overflow.
+    fn grow(&mut self, seq: usize, n: usize) {
+        let sq = &mut self.seqs[seq];
+        assert!(sq.n_past + n <= self.n_ctx, "context overflow: {} + {n} > {}", sq.n_past, self.n_ctx);
+        let need = (sq.n_past + n).div_ceil(KV_PAGE);
+        if need > sq.pages.len() {
+            while sq.pages.len() < need {
+                sq.pages.push(self.free_pages.pop().expect("KV page pool exhausted"));
+            }
+            let row = self.pt + (seq * (self.n_ctx / KV_PAGE) * 4) as u64;
+            self.stream.synchronize().expect("sync"); // the previous pass may still read the table
+            let pages = sq.pages.clone();
+            self.htod(row, &pages);
+        }
     }
 
     /// Run up to `span` tokens layer by layer: attention in ubatches of `max_batch`, then the
     /// MoE of the whole span in expert waves, so each expert is uploaded at most once per layer
     /// (a 4096-token prefill moves the experts once, not once per ubatch). Returns the logits of
-    /// every token, or of the last only.
-    fn forward_span(&mut self, tokens: &[u32], all_logits: bool) -> Vec<f32> {
+    /// every token, or of each segment's last.
+    ///
+    /// The span is segments (sequence, tokens), each continuing its own sequence: projections,
+    /// routing and experts run over all their tokens together; RoPE, the KV store and attention
+    /// run per segment, through its sequence's page table.
+    fn forward_span(&mut self, segs: &[(usize, &[u32])], all_logits: bool) -> Vec<f32> {
+        for &(sq, toks) in segs {
+            self.grow(sq, toks.len());
+        }
+        let tokens: Vec<u32> = segs.iter().flat_map(|s| s.1.iter().copied()).collect();
         let hp = &self.w.hp;
         let (e, hd, nh, nkv, ff, kk) = (hp.n_embd, hp.head_dim, hp.n_head, hp.n_head_kv, hp.n_ff_exp, hp.n_expert_used);
         let (kvd, t, b) = (nkv * hd, tokens.len(), self.max_batch);
+        // Per ubatch: its pieces of segments, (sequence, first row in the ubatch, rows, position).
+        let mut pieces: Vec<Vec<(usize, usize, usize, usize)>> = vec![];
+        let (mut row, mut c0) = (0, 0);
+        for &(sq, toks) in segs {
+            let mut done = 0;
+            while done < toks.len() {
+                if row == 0 || row - c0 == b {
+                    c0 = row;
+                    pieces.push(vec![]);
+                }
+                let n = (toks.len() - done).min(b - (row - c0));
+                pieces.last_mut().unwrap().push((sq, row - c0, n, self.seqs[sq].n_past + done));
+                (row, done) = (row + n, done + n);
+            }
+        }
         let s = self.s;
         let nv = hp.n_vocab;
         let n_expert = hp.n_expert;
@@ -473,7 +594,7 @@ impl GpuModel {
         let at = |p: Ptr, c0: usize, width: usize| p + (c0 * width * F) as u64;
 
         let mut xe = vec![0f32; t * e];
-        for (row, &tok) in xe.chunks_exact_mut(e).zip(tokens) {
+        for (row, &tok) in xe.chunks_exact_mut(e).zip(&tokens) {
             dequant_row(self.w.tok_embd.ty, self.w.g.row(&self.w.tok_embd, tok as usize), row);
         }
         self.htod(s.x, &xe);
@@ -481,32 +602,47 @@ impl GpuModel {
         let (ei, eps, base) = (e as i32, hp.eps, hp.rope_base);
         let (nhi, nkvi, hdi) = (nh as i32, nkv as i32, hd as i32);
         let scale = 1.0 / (hd as f32).sqrt();
+        let pt_row = |sq: usize| self.pt + (sq * (self.n_ctx / KV_PAGE) * 4) as u64;
         for (li, l) in self.layers.iter().enumerate() {
             let kc = self.kv + (li * 2 * self.n_ctx * kvd * H) as u64;
             let vc = kc + (self.n_ctx * kvd * H) as u64;
             // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
             let mut sels = vec![];
             let mut pred: Vec<usize> = vec![];
-            for &(c0, tc) in &chunks {
-                let (x, h, q, attn, o) = (at(s.x, c0, e), at(s.h, c0, e), s.q, s.attn, s.o);
-                let pos = self.n_past + c0;
-                let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
-                let (kd, vd) = (kc + (pos * kvd * H) as u64, vc + (pos * kvd * H) as u64);
+            let mut hrows: Vec<f32> = vec![];
+            let mut cpu_ex: Vec<usize> = vec![];
+            for (&(c0, tc), ps) in chunks.iter().zip(&pieces) {
+                let (x, h, o) = (at(s.x, c0, e), at(s.h, c0, e), s.o);
+                let tn = tc as u32;
                 let (ks, vs) = (s.kvs, s.kvs + (tc * kvd * F) as u64);
                 let wn = l.attn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-                self.mm(&l.wq, h, q, tc);
+                self.mm(&l.wq, h, s.q, tc);
                 self.mm(&l.wk, h, ks, tc);
                 self.mm(&l.wv, h, vs, tc);
-                let (qn, kn) = (l.q_norm, l.k_norm);
-                launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
-                launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base]);
-                let nkv_t = (tc * kvd) as i32;
-                let g = ((tc * kvd).div_ceil(256) as u32, 1, 1);
-                launch!(self, self.k.store_f16, g, 256, [kd, ks, nkv_t]);
-                launch!(self, self.k.store_f16, g, 256, [vd, vs, nkv_t]);
-                let gq = nh / nkv;
-                if hd == 128 && 8 % gq == 0 {
+                for &(sq, r0, tc, pos) in ps {
+                  let pages = &self.seqs[sq].pages;
+                  let pt = pt_row(sq);
+                  let (q, attn, ks, vs) = (at(s.q, r0, nh * hd), at(s.attn, r0, nh * hd), at(ks, r0, kvd), at(vs, r0, kvd));
+                  let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
+                  let (qn, kn) = (l.q_norm, l.k_norm);
+                  launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
+                  launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base]);
+                  // Store K and V, one launch per page the rows land in.
+                  let mut p = pos;
+                  while p < pos + tc {
+                      let n = (KV_PAGE - p % KV_PAGE).min(pos + tc - p);
+                      let slot = pages[p / KV_PAGE] as usize * KV_PAGE + p % KV_PAGE;
+                      let (kd, vd) = (kc + (slot * kvd * H) as u64, vc + (slot * kvd * H) as u64);
+                      let (ksp, vsp) = (at(ks, p - pos, kvd), at(vs, p - pos, kvd));
+                      let nkv_t = (n * kvd) as i32;
+                      let g = ((n * kvd).div_ceil(256) as u32, 1, 1);
+                      launch!(self, self.k.store_f16, g, 256, [kd, ksp, nkv_t]);
+                      launch!(self, self.k.store_f16, g, 256, [vd, vsp, nkv_t]);
+                      p += n;
+                  }
+                  let gq = nh / nkv;
+                  if hd == 128 && 8 % gq == 0 {
                     // Decode (<= 4 tokens): attention_dec, one row per warp. Prefill: tensor-core
                     // attention_tc. Both split the positions when blocks are few, partials in s.gu
                     // (idle during attention).
@@ -518,14 +654,16 @@ impl GpuModel {
                     let want = if small { usize::MAX } else { (240 / (nkv * gy)).max(1) };
                     let sk = (pos + tc).div_ceil(if small { ATT_SPLIT } else { 512 }).min(want).min(cap).max(1);
                     let (part, ski) = (s.gu, sk as i32);
-                    launch!(self, *f, (nkv as u32, gy as u32, sk as u32), bs, [q, kc, vc, attn, nhi, nkvi, pos0, ti, scale, part]);
+                    launch!(self, *f, (nkv as u32, gy as u32, sk as u32), bs, [q, kc, vc, pt, attn, nhi, nkvi, pos0, ti, scale, part]);
                     if sk > 1 {
                         let rows = (tc * nh) as i32;
                         launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), 128, [part, attn, rows, ski]);
                     }
-                } else {
-                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
+                  } else {
+                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, pt, attn, nhi, nkvi, hdi, pos0, scale]);
+                  }
                 }
+                let attn = s.attn;
                 self.mm(&l.wo, attn, o, tc);
                 let n = (tc * e) as i32;
                 launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
@@ -541,6 +679,9 @@ impl GpuModel {
                     self.mm(&self.layers[li + 1].router, o, rl2, 1);
                 }
                 let mut r = route(&self.dtoh(s.rl, (tc + predict as usize) * n_expert), n_expert, kk);
+                if self.hybrid && t <= CACHE_MAX_BATCH {
+                    hrows = self.dtoh(h, t * e); // the CPU experts' input (stream just synced)
+                }
                 if predict {
                     pred = r.pop().unwrap().iter().take(PREFETCH_TOP).map(|p| p.0).collect();
                 }
@@ -568,10 +709,20 @@ impl GpuModel {
             let waves: Vec<Vec<usize>> = if cached {
                 let ids: Vec<u32> = sels[0].iter().flatten().map(|&(e, _)| e as u32).collect();
                 self.stream.wait(&self.pf_ready).expect("wait"); // the prefetch's slots are written
-                let p = self.groups[gi].cache.plan(li, &ids, t);
+                // Hybrid: split the misses so PCIe (upload, then GPU) and the CPU finish together.
+                let admit = if self.hybrid {
+                    let mut seen = vec![false; n_expert];
+                    let miss = ids.iter().filter(|&&ex| !std::mem::replace(&mut seen[ex as usize], true) && self.groups[gi].cache.slot(li, ex as usize).is_none()).count();
+                    (miss * ADMIT_NUM).div_ceil(ADMIT_DEN)
+                } else {
+                    usize::MAX
+                };
+                let p = self.groups[gi].cache.plan(li, &ids, t, admit);
+                let mut copied = false;
                 for &(ex, slot) in &p.fills {
                     self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64, &self.stream) as u64;
                 }
+                cpu_ex.extend(&p.rest);
                 // Prefetch li+1's predicted misses on the copy stream, overlapping this layer's
                 // MoE and the next attention. Victims are never this layer's experts (still to be
                 // read); earlier layers are finished (the router readback synchronized).
@@ -580,15 +731,19 @@ impl GpuModel {
                     let (bank2, sb2) = (self.groups[g2].bank, self.groups[g2].slot_bytes);
                     for (ex, slot) in self.groups[g2].cache.prefetch(li + 1, &pred, li) {
                         self.stats.bytes += self.upload_expert(li + 1, ex, bank2 + (slot * sb2) as u64, &self.copy) as u64;
+                        copied = true;
                     }
+                }
+                if copied {
                     self.pf_ready.record(&self.copy).expect("record");
                 }
                 self.stats.hits += p.hits as u64;
-                self.stats.misses += p.fills.len() as u64;
-                for &ex in &used {
+                self.stats.misses += (p.fills.len() + p.rest.len()) as u64;
+                let gpu: Vec<usize> = used.iter().copied().filter(|ex| !cpu_ex.contains(ex)).collect();
+                for &ex in &gpu {
                     ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).expect("planned expert resident") * sb) as u64;
                 }
-                vec![used]
+                vec![gpu]
             } else {
                 let (res, miss): (Vec<usize>, Vec<usize>) = used.iter().partition(|&&ex| self.groups[gi].cache.slot(li, ex).is_some());
                 for &ex in &res {
@@ -681,11 +836,27 @@ impl GpuModel {
                     upload(wi + 2);
                 }
             }
+            if !cpu_ex.is_empty() {
+                self.cpu_experts(li, &cpu_ex, &by_expert, &hrows);
+            }
         }
-        self.n_past += t;
+        for &(sq, toks) in segs {
+            self.seqs[sq].n_past += toks.len();
+        }
 
-        let rows: Vec<(usize, usize)> =
-            if all_logits { (0..t).step_by(LOGIT_ROWS).map(|r0| (r0, LOGIT_ROWS.min(t - r0))).collect() } else { vec![(t - 1, 1)] };
+        // Logit rows: all, or each segment's last, in runs of consecutive rows.
+        let want: Vec<usize> = if all_logits {
+            (0..t).collect()
+        } else {
+            segs.iter().scan(0, |r, s| { *r += s.1.len(); Some(*r - 1) }).collect()
+        };
+        let mut rows: Vec<(usize, usize)> = vec![];
+        for r in want {
+            match rows.last_mut() {
+                Some(l) if l.0 + l.1 == r && l.1 < LOGIT_ROWS => l.1 += 1,
+                _ => rows.push((r, 1)),
+            }
+        }
         let mut out = Vec::with_capacity(rows.iter().map(|r| r.1).sum::<usize>() * nv);
         for (r0, nr) in rows {
             let (x, h, wn, nrn) = (at(s.x, r0, e), s.h, self.out_norm, nr as u32);
@@ -759,26 +930,51 @@ impl Engine for GpuModel {
         self.n_ctx
     }
 
+    fn n_seq(&self) -> usize {
+        self.seqs.len()
+    }
+
+    fn kv_page(&self) -> usize {
+        KV_PAGE
+    }
+
+    fn select(&mut self, seq: usize) {
+        assert!(seq < self.seqs.len());
+        self.cur = seq;
+    }
+
     fn truncate(&mut self, n_past: usize) {
-        self.n_past = self.n_past.min(n_past);
+        let sq = &mut self.seqs[self.cur];
+        sq.n_past = sq.n_past.min(n_past);
+        let keep = sq.n_past.div_ceil(KV_PAGE);
+        self.free_pages.extend(sq.pages.drain(keep..));
     }
 
     /// Panics if the KV cache would overflow n_ctx.
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
-        self.check_ctx(tokens.len());
-        tokens.chunks(self.span).flat_map(|c| self.forward_span(c, true)).collect()
+        let sq = self.cur;
+        assert!(self.seqs[sq].n_past + tokens.len() <= self.n_ctx, "context overflow");
+        tokens.chunks(self.span).flat_map(|c| self.forward_span(&[(sq, c)], true)).collect()
     }
 
     fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
-        self.check_ctx(tokens.len());
+        let sq = self.cur;
+        assert!(self.seqs[sq].n_past + tokens.len() <= self.n_ctx, "context overflow");
         let n = tokens.len().div_ceil(self.span);
         let mut last = vec![];
         for (i, c) in tokens.chunks(self.span).enumerate() {
-            last = self.forward_span(c, false);
+            last = self.forward_span(&[(sq, c)], false);
             if i + 1 < n {
                 last.clear();
             }
         }
         last
+    }
+
+    fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Vec<f32> {
+        let toks: Vec<[u32; 1]> = rows.iter().map(|r| [r.1]).collect();
+        let segs: Vec<(usize, &[u32])> = rows.iter().zip(&toks).map(|(r, t)| (r.0, &t[..])).collect();
+        assert!(segs.len() <= self.span);
+        self.forward_span(&segs, false)
     }
 }

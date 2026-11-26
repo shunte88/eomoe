@@ -31,6 +31,7 @@ pub struct ServerSection {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub alias: Option<String>,
+    pub parallel: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,6 +50,7 @@ pub struct ServeSettings {
     pub host: String,
     pub port: u16,
     pub alias: String,
+    pub parallel: usize,
 }
 
 impl EomoeConfig {
@@ -66,6 +68,7 @@ impl EomoeConfig {
             host: cli.host.clone().or_else(|| s.host.clone()).unwrap_or_else(|| "127.0.0.1".into()),
             port: cli.port.or(s.port).unwrap_or(8080),
             alias: cli.alias.clone().or_else(|| s.alias.clone()).unwrap_or_else(|| "local-code".into()),
+            parallel: cli.parallel.or(s.parallel).unwrap_or(4),
         }
     }
 }
@@ -77,7 +80,7 @@ mod tests {
     #[test]
     fn cli_overrides_config_overrides_defaults() {
         let cfg: EomoeConfig = serde_yaml::from_str("model:\n  path: /cfg/model.gguf\n  cache_mib: 2000\nserver:\n  host: 0.0.0.0\n  port: 9000\n").unwrap();
-        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, alias: None };
+        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, parallel: None, alias: None };
         let s = cfg.resolve_serve(&cli);
         assert_eq!(s.model, PathBuf::from("/cfg/model.gguf")); // config
         assert_eq!(s.cache_mib, Some(2000)); // config

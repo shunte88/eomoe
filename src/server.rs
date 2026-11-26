@@ -7,7 +7,7 @@
 //! Every API is converted to OpenAI chat messages, rendered with the GGUF chat template and run
 //! on one model thread, which owns the engine (CUDA work stays on the thread that created it).
 
-use crate::generate::{Finish, Generator, Sampling, Utf8Stream};
+use crate::generate::{Batcher, Event, Finish, Request, Sampling, Utf8Stream};
 use crate::qwen3moe::Engine;
 use crate::template::ChatTemplate;
 use crate::tokenizer::Tokenizer;
@@ -23,24 +23,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use tokio::sync::mpsc as tmpsc;
 
-/// A generation request for the model thread.
-struct Job {
-    prompt: Vec<u32>,
-    max_tokens: usize,
-    sampling: Sampling,
-    tx: tmpsc::UnboundedSender<Gen>,
-}
-
-enum Gen {
-    Started { n_cached: usize },
-    Token(u32),
-    Done(Finish),
-}
-
 pub struct App {
     tok: Tokenizer,
     tpl: ChatTemplate,
-    jobs: mpsc::Sender<Job>,
+    jobs: mpsc::Sender<Request>,
     alias: String,
     n_ctx: usize,
 }
@@ -56,21 +42,32 @@ impl App {
         // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
         let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"].iter().filter_map(|t| tok.token_id(t)).collect();
         eog.push(tok.eos);
-        let (jobs, rx) = mpsc::channel::<Job>();
+        let (jobs, rx) = mpsc::channel::<Request>();
         let (ready_tx, ready) = mpsc::channel();
         let eog_t = eog;
         std::thread::Builder::new()
             .name("eomoe-model".into())
             .spawn(move || {
-                let mut g = match load() {
+                let mut b = match load() {
                     Ok(e) => {
                         ready_tx.send(Ok(e.n_ctx())).ok();
-                        Generator::new(e)
+                        Batcher::new(e, eog_t)
                     }
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
-                for job in rx {
-                    model_job(&mut g, job, &eog_t);
+                // A request that panics the engine kills this thread; open streams report an
+                // error and later requests get "model thread stopped".
+                loop {
+                    if b.idle() {
+                        match rx.recv() {
+                            Ok(r) => b.submit(r),
+                            Err(_) => return,
+                        }
+                    }
+                    while let Ok(r) = rx.try_recv() {
+                        b.submit(r);
+                    }
+                    b.step();
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -79,33 +76,30 @@ impl App {
     }
 }
 
-// ponytail: one model thread runs jobs in arrival order (llama-server --parallel 1); the queue is
-// unbounded. Continuous batching across requests is Phase 6.
-fn model_job<E: Engine>(g: &mut Generator<E>, job: Job, eog: &[u32]) {
-    let tx = job.tx;
-    let n_cached = g.reusable(&job.prompt);
-    if tx.send(Gen::Started { n_cached }).is_err() {
-        return;
-    }
-    let (t0, mut t1, mut n) = (std::time::Instant::now(), None, 0usize);
-    let r = g.generate(&job.prompt, job.max_tokens, &job.sampling, |t| eog.contains(&t), |t| {
-        t1.get_or_insert_with(std::time::Instant::now);
-        n += 1;
-        tx.send(Gen::Token(t)).is_ok()
+/// A request for the model thread whose events go to `tx`, logging its timings when done.
+fn request(prompt: Vec<u32>, max_tokens: usize, sampling: Sampling, tx: tmpsc::UnboundedSender<Event>) -> Request {
+    let (n_prompt, t0) = (prompt.len(), std::time::Instant::now());
+    let (mut n_cached, mut t1, mut n) = (0, None, 0usize);
+    let sink = Box::new(move |ev: Event| {
+        match ev {
+            Event::Started { n_cached: c } => n_cached = c,
+            Event::Token(_) => {
+                t1.get_or_insert_with(std::time::Instant::now);
+                n += 1;
+            }
+            Event::Done(f) => {
+                let t1 = t1.unwrap_or_else(std::time::Instant::now);
+                let (pre, dec) = (t1 - t0, t1.elapsed());
+                log::info!(
+                    "prompt {n_prompt} tok ({n_cached} cached), queue+prefill {:.1}s ({:.0} tok/s), {n} out ({:.1} tok/s), {f:?}",
+                    pre.as_secs_f32(), (n_prompt - n_cached) as f32 / pre.as_secs_f32(),
+                    n.saturating_sub(1) as f32 / dec.as_secs_f32().max(1e-6)
+                );
+            }
+        }
+        tx.send(ev).is_ok()
     });
-    // A request that panics the engine kills this thread; its stream reports an error and later
-    // requests get "model thread stopped".
-    let t1 = t1.unwrap_or_else(std::time::Instant::now);
-    let (pre, dec) = (t1 - t0, t1.elapsed());
-    let n_new = job.prompt.len() - n_cached;
-    log::info!(
-        "prompt {} tok ({} cached), prefill {:.1}s ({:.0} tok/s), {} out ({:.1} tok/s), {:?}",
-        job.prompt.len(), n_cached, pre.as_secs_f32(), n_new as f32 / pre.as_secs_f32(), n,
-        n.saturating_sub(1) as f32 / dec.as_secs_f32().max(1e-6), r.as_ref().map(|x| x.0)
-    );
-    if let Ok((finish, _)) = r {
-        tx.send(Gen::Done(finish)).ok();
-    }
+    Request { prompt, max_tokens, sampling, sink }
 }
 
 /// One chat request in the internal (OpenAI chat) form.
@@ -209,8 +203,7 @@ impl App {
         let (gtx, mut grx) = tmpsc::unbounded_channel();
         let (otx, orx) = tmpsc::unbounded_channel();
         let n_prompt = prompt.len();
-        let job = Job { prompt, max_tokens: chat.max_tokens, sampling: chat.sampling, tx: gtx };
-        self.jobs.send(job).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
+        self.jobs.send(request(prompt, chat.max_tokens, chat.sampling, gtx)).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
         let app = self.clone();
         let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
         tokio::spawn(async move {
@@ -220,11 +213,11 @@ impl App {
             let (mut t0, mut t1) = (std::time::Instant::now(), None);
             while let Some(g) = grx.recv().await {
                 match g {
-                    Gen::Started { n_cached } => {
+                    Event::Started { n_cached } => {
                         t0 = std::time::Instant::now();
                         otx.send(Out::Start { n_prompt, n_cached }).ok();
                     }
-                    Gen::Token(t) => {
+                    Event::Token(t) => {
                         t1.get_or_insert_with(std::time::Instant::now);
                         if otx.is_closed() {
                             return; // client gone: dropping grx stops the model
@@ -240,7 +233,7 @@ impl App {
                             break;
                         }
                     }
-                    Gen::Done(f) => finish = Some(f),
+                    Event::Done(f) => finish = Some(f),
                 }
             }
             let Some(finish) = finish else {

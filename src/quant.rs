@@ -13,7 +13,7 @@ fn h(b: &[u8], i: usize) -> f32 {
 }
 
 #[inline]
-fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {

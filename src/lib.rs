@@ -7,6 +7,7 @@ pub mod expert_cache;
 pub mod cli;
 pub mod config;
 pub mod cpu;
+pub mod cpu_moe;
 pub mod generate;
 pub mod gguf;
 pub mod gpu;

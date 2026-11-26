@@ -57,6 +57,7 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | `--port` | `PORT` | 8080 |
 | `--ctx-size` | `CTX_SIZE` | 32768 |
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
+| `--parallel` | `PARALLEL` | 4 (requests served at once; they share the KV pool, 1..=16) |
 | `--alias` | | `local-code` |
 
 The YAML file also takes `logging.level` (`RUST_LOG` overrides it).

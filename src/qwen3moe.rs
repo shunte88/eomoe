@@ -13,6 +13,28 @@ pub trait Engine {
     fn reset(&mut self) {
         self.truncate(0)
     }
+    /// Sequences the KV cache can hold at once. They share the `n_ctx` positions.
+    fn n_seq(&self) -> usize {
+        1
+    }
+    /// KV is allocated to sequences in pages of this many positions.
+    fn kv_page(&self) -> usize {
+        1
+    }
+    /// Make `seq` (< n_seq) the sequence `forward` and `truncate` act on.
+    fn select(&mut self, seq: usize) {
+        assert_eq!(seq, 0, "single-sequence engine");
+    }
+    /// One token for each of several sequences, in one pass where the engine can:
+    /// rows (seq, token) -> rows x n_vocab logits.
+    fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Vec<f32> {
+        let mut out = vec![];
+        for &(s, t) in rows {
+            self.select(s);
+            out.extend(self.forward_last(&[t]));
+        }
+        out
+    }
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32>;
     /// Logits of the last token only: prefill without T x n_vocab logits.
     fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
