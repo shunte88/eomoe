@@ -36,6 +36,8 @@ The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/ph
 | `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages (Claude Code) |
 | `GET /v1/models`, `/health` | |
 
+`/chat/completions`, `/responses` and `/models` are also served without the `/v1` prefix, and `/v1/responses/input_tokens` counts tokens for Codex.
+
 ```python
 from openai import OpenAI
 c = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
@@ -51,10 +53,15 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | Flag | Env | Default |
 |---|---|---|
 | `--model` | `MODEL_FILE` | `<home>/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` |
+| `--host` | | 127.0.0.1 |
 | `--port` | `PORT` | 8080 |
 | `--ctx-size` | `CTX_SIZE` | 32768 |
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
 | `--alias` | | `local-code` |
+
+The YAML file also takes `logging.level` (`RUST_LOG` overrides it).
+
+Deployment: `docker compose up` reads `./config/config.yaml` and `./models` (it needs nvidia-container-toolkit). `eomoe.service` is a systemd unit.
 
 ## How it works
 

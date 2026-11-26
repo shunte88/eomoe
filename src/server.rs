@@ -708,14 +708,15 @@ impl Format for ChatCmpl {
                 let mut v: Vec<String> = self.a.calls.iter().enumerate().map(|(k, (id, c))| {
                     self.delta(json!({"tool_calls": [{"index": k, "id": id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}]}))
                 }).collect();
-                let mut last = self.chunk(json!([{"finish_reason": self.finish_reason(), "index": 0, "delta": {}}]));
-                last["timings"] = self.timings();
-                v.push(format!("data: {last}\n\n"));
+                let mut tail = vec![self.chunk(json!([{"finish_reason": self.finish_reason(), "index": 0, "delta": {}}]))];
                 if self.include_usage {
                     let mut u = self.chunk(json!([]));
                     u["usage"] = self.usage();
-                    v.push(format!("data: {u}\n\n"));
+                    tail.push(u);
                 }
+                // llama-server puts timings on the last chunk: the usage chunk when there is one.
+                tail.last_mut().unwrap()["timings"] = self.timings();
+                v.extend(tail.iter().map(|c| format!("data: {c}\n\n")));
                 v.push("data: [DONE]\n\n".into());
                 v
             }

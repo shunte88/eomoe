@@ -138,7 +138,7 @@ fn summary(path: &str, b: &Value) -> Value {
 }
 
 fn keys(v: &Value) -> Vec<String> {
-    let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+    let mut k: Vec<String> = v.as_object().into_iter().flat_map(|o| o.keys().cloned()).collect();
     k.sort();
     k
 }
@@ -175,7 +175,8 @@ fn api_matches_oracle() {
             if path == "/v1/messages" {
                 e.iter().rev().find(|x| x.1["type"] == "message_delta").map(|x| x.1["delta"]["stop_reason"].clone())
             } else if path == "/v1/chat/completions" {
-                e.iter().rev().find(|x| !x.1["choices"][0]["finish_reason"].is_null()).map(|x| json!([x.1["choices"][0]["finish_reason"], keys(&x.1), keys(&x.1["timings"])]))
+                let usage = e.iter().find(|x| x.1["choices"].as_array().is_some_and(|c| c.is_empty())).map(|x| json!([keys(&x.1), keys(&x.1["usage"])]));
+                e.iter().rev().find(|x| !x.1["choices"][0]["finish_reason"].is_null()).map(|x| json!([x.1["choices"][0]["finish_reason"], keys(&x.1), keys(&x.1["timings"]), usage]))
             } else {
                 e.last().map(|x| summary(path, &x.1["response"]))
             }

@@ -84,6 +84,9 @@ CASES = {
         ]}),
     "chat_text": ("/v1/chat/completions", {
         "messages": [{"role": "user", "content": PROMPT}], "max_tokens": 64}),
+    "chat_usage": ("/v1/chat/completions", {
+        "messages": [{"role": "user", "content": PROMPT}], "max_tokens": 16,
+        "stream_options": {"include_usage": True}}),
     "chat_tool": ("/v1/chat/completions", {
         "tools": C_TOOLS, "max_tokens": 200,
         "messages": [{"role": "system", "content": "You are a coding agent. Use the tools to act."},

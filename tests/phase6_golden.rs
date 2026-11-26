@@ -109,3 +109,68 @@ fn followup_prefill_on_19k_prefix() {
     println!("follow-up prefill 128 tok on 18.9K: {tps:.1} tok/s (target {FOLLOWUP_TARGET})");
     assert!(tps >= FOLLOWUP_TARGET, "follow-up prefill {tps:.1} tok/s < {FOLLOWUP_TARGET}");
 }
+
+fn log_softmax(l: &[f32]) -> Vec<f32> {
+    let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let lse = m + l.iter().map(|x| ((x - m) as f64).exp()).sum::<f64>().ln() as f32;
+    l.iter().map(|x| x - lse).collect()
+}
+
+/// p50 |dlogprob| over the CPU's top-5, per position row of logits.
+fn top5_diffs(cpu: &[f32], gpu: &[f32], nv: usize) -> Vec<f32> {
+    let mut v = vec![];
+    for (ra, rb) in cpu.chunks_exact(nv).zip(gpu.chunks_exact(nv)) {
+        let (la, lb) = (log_softmax(ra), log_softmax(rb));
+        let mut idx: Vec<usize> = (0..nv).collect();
+        idx.select_nth_unstable_by(4, |x, y| la[*y].total_cmp(&la[*x]));
+        v.extend(idx[..5].iter().map(|&i| (la[i] - lb[i]).abs()));
+    }
+    v
+}
+
+fn p50(mut v: Vec<f32>) -> f32 {
+    v.sort_by(f32::total_cmp);
+    v[v.len() / 2]
+}
+
+/// The greedy.json cases are <= 55 tokens, so they never reach the expert GEMM (>= 16 rows per
+/// expert), split-K attention (decode: past 128 positions; prefill: a short batch on a long
+/// context) or `attn_merge`. Against the f32 CPU reference: a 640-token prefill of real code, a
+/// 16-token follow-up prefill (attention_tc split in 2) and 16 decode steps (attention_dec split
+/// in 6).
+///
+/// Routing near-ties make long contexts chaotic: any change in summation order flips a top-8 choice
+/// somewhere, and attention spreads it to every later position. Prefilling the same 640 tokens in
+/// chunks of 1, 3, 4, 8, 32 or 640 (identical math, different split points) moves the p50 at
+/// positions 512+ anywhere from 0.0005 to 0.01. So the strict 0.001 holds only before chaos sets in
+/// (positions 0-127, p50 ~0.0002); later segments are gated at 0.02, well above chaos and far below
+/// a broken kernel (dropping one attn_merge partial gives > 0.1).
+#[test]
+#[ignore]
+fn long_context_matches_cpu_reference() {
+    const N: usize = 640;
+    const FOLLOW: usize = 16;
+    const DEC: usize = 16;
+    let g = Gguf::open(model_path()).unwrap();
+    let tok = eomoe::tokenizer::Tokenizer::from_gguf(&g).unwrap();
+    let src = std::fs::read_to_string("tests/golden/long_prompt.txt").unwrap();
+    let all = tok.encode(&src, false);
+    let (prompt, follow, dec) = (&all[..N], &all[N..N + FOLLOW], &all[N + FOLLOW..N + FOLLOW + DEC]);
+    let mut c = eomoe::cpu::CpuModel::new(Gguf::open(model_path()).unwrap()).unwrap();
+    let mut m = GpuModel::new(g, 4096).unwrap();
+    let nv = m.n_vocab();
+    let pre = top5_diffs(&c.forward(prompt), &m.forward(prompt), nv);
+    let fol = top5_diffs(&c.forward(follow), &m.forward(follow), nv);
+    let mut de = vec![];
+    for &t in dec {
+        de.extend(top5_diffs(&c.forward(&[t]), &m.forward(&[t]), nv));
+    }
+    let max = pre.iter().chain(&fol).chain(&de).cloned().fold(0f32, f32::max);
+    let (early, late, fol, de) = (p50(pre[..128 * 5].to_vec()), p50(pre[128 * 5..].to_vec()), p50(fol), p50(de));
+    println!("long ctx GPU vs CPU p50: prefill 0-127 {early:.5}, 128-{N} {late:.5}; follow-up {FOLLOW} {fol:.5}; decode {DEC} {de:.5}; max {max:.4}");
+    assert!(early <= 0.001, "prefill before chaos: p50 {early}");
+    for (name, v) in [("prefill 128+", late), ("follow-up", fol), ("decode", de)] {
+        assert!(v <= 0.02, "{name}: p50 {v}");
+    }
+    assert!(max <= 2.0, "max {max}");
+}

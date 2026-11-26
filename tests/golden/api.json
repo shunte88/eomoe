@@ -3457,6 +3457,442 @@
      }
     ]
    }
+  },
+  "chat_usage": {
+   "path": "/v1/chat/completions",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What does len([1, 2]) return in Python? Reply briefly."
+     }
+    ],
+    "max_tokens": 16,
+    "stream_options": {
+     "include_usage": true
+    },
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "choices": [
+      {
+       "finish_reason": "length",
+       "index": 0,
+       "message": {
+        "role": "assistant",
+        "content": "`len([1, 2])` returns `2`.\n\nThe `len"
+       }
+      }
+     ],
+     "created": 1795674895,
+     "model": "local-code",
+     "system_fingerprint": "b1-e6443bd",
+     "object": "chat.completion",
+     "usage": {
+      "completion_tokens": 16,
+      "prompt_tokens": 24,
+      "total_tokens": 40,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "id": "chatcmpl-kYMPNjtorXLOpN6HWtNAGUnDb0T9hIXY",
+     "timings": {
+      "cache_n": 0,
+      "prompt_n": 24,
+      "prompt_ms": 5366.627,
+      "prompt_per_token_ms": 223.60945833333335,
+      "prompt_per_second": 4.472082743965623,
+      "predicted_n": 16,
+      "predicted_ms": 3941.795,
+      "predicted_per_token_ms": 262.78633333333335,
+      "predicted_per_second": 3.805372932889711
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "role": "assistant",
+          "content": null
+         }
+        }
+       ],
+       "created": 1795674895,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "`"
+         }
+        }
+       ],
+       "created": 1795674895,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "len"
+         }
+        }
+       ],
+       "created": 1795674895,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "(["
+         }
+        }
+       ],
+       "created": 1795674895,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "1"
+         }
+        }
+       ],
+       "created": 1795674896,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ","
+         }
+        }
+       ],
+       "created": 1795674896,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " "
+         }
+        }
+       ],
+       "created": 1795674896,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "2"
+         }
+        }
+       ],
+       "created": 1795674896,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "])"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "`"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " returns"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " `"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "2"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "`.\n\n"
+         }
+        }
+       ],
+       "created": 1795674897,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "The"
+         }
+        }
+       ],
+       "created": 1795674898,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " `"
+         }
+        }
+       ],
+       "created": 1795674898,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "len"
+         }
+        }
+       ],
+       "created": 1795674898,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": "length",
+         "index": 0,
+         "delta": {}
+        }
+       ],
+       "created": 1795674898,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [],
+       "created": 1795674898,
+       "id": "chatcmpl-0R0LenBHTFiIY52G8stmYPxdRQY6tRdQ",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk",
+       "usage": {
+        "completion_tokens": 16,
+        "prompt_tokens": 24,
+        "total_tokens": 40,
+        "prompt_tokens_details": {
+         "cached_tokens": 23
+        }
+       },
+       "timings": {
+        "cache_n": 23,
+        "prompt_n": 1,
+        "prompt_ms": 165.894,
+        "prompt_per_token_ms": 165.894,
+        "prompt_per_second": 6.027945555595742,
+        "predicted_n": 16,
+        "predicted_ms": 2859.761,
+        "predicted_per_token_ms": 190.65073333333333,
+        "predicted_per_second": 5.245193566874994
+       }
+      }
+     },
+     {
+      "event": null,
+      "data": "[DONE]"
+     }
+    ]
+   }
   }
  },
  "count_tokens": {

@@ -365,3 +365,25 @@ Gates (all pass, `--test-threads=1`):
 | OpenAI Python SDK (`openai`, via uv) | full completion; streamed tool call `get_weather {"city":"Paris"}`, `finish_reason` `tool_calls`, usage chunk received |
 | `eomoe check`, lib tests (12) | pass |
 | Real Claude Code (`/v1/messages`), stock tools | fixed, 44 s wall |
+
+## Rework: Phase 6 review (2026-11-26)
+
+I ran a two-axis review (standards and spec) of `331537d..HEAD`. These are the real findings that came out of it, with their fixes:
+
+| Finding | Fix | Evidence |
+|---|---|---|
+| Split-K attention, `attn_merge` and the expert GEMM had no correctness gate: the greedy.json prompts (≤ 55 tokens) never reach them | New gate `phase6_golden::long_context_matches_cpu_reference`, against the f32 CPU reference: a 640-token prefill of real code, a 16-token follow-up (attention_tc, split 2) and 16 decode steps (attention_dec, split 6) | p50: prefill 0-127 **0.00018**, 128-640 0.00158, follow-up 0.00277, decode 0.00343; max 0.30. **Red check:** making `attn_merge` drop its last partial gives follow-up 8.7 and decode 4.0, and the gate fails |
+| With `stream_options.include_usage`, `timings` sat on the finish chunk; llama-server puts it on the last chunk (the usage chunk) | Timings are now attached to whichever chunk is last | New oracle case `chat_usage` in api.json (insertions only). The phase5 gate now also compares the usage chunk's keys. Red before the fix, green after |
+| `max_tokens: 0` produced 1 token | The generator checks before it samples | Unit test, red then green |
+| Pageable expert-upload fallback (used when pinning fails) used a synchronous copy on the legacy stream, unordered against the staging-half events | `memcpy_htod_async` on the copy stream, the same as the pinned path | Code path only runs if pinning fails; all gates pass |
+| Stale README, a placeholder "test" script, a wrong-schema test config, a redundant build wrapper, an outdated summary | README rewritten; the other files deleted | |
+
+**Gate revision (flagged):** at long context, the GPU-vs-CPU median is chaotic in exactly the way Phase 3 described. Prefilling the same 640 tokens in chunks of 1, 3, 4, 8, 32 or 640 does identical math with different split points, yet moves p50 at positions 512+ anywhere between 0.0005 and 0.01. Repeated runs from the same state are bit-identical, and there are no float atomics. Before chaos sets in (positions 0-127), batched prefill matches the CPU at 0.00018. So the new gate holds those positions to the strict 0.001 and the later segments to 0.02. That is well above the chaos band and far below a broken kernel (> 0.1).
+
+Not changed (judgement calls): the length of `forward_span` and its routing-blob offsets written in three places; the 11-argument `mm_ids`; prefetched slots counting as cache hits in the stats.
+
+All gates after the rework:
+- **Phase 3:** top-1 fails 0/128, mean 0.1829 (floor 0.2414); GPU vs CPU p50 0.00035.
+- **Phase 4:** hits 76.17% (oracle 76.17%); decode 37.8 tok/s (oracle 27.2).
+- **Phase 5:** pass, 10 cases.
+- **Phase 6:** 32K ctx 7313 MiB, 576 slots; prefill 4K 922 tok/s (oracle 393); decode after 19K 25.5 tok/s; follow-up 114.5 tok/s; long-context correctness passes.

@@ -32,9 +32,9 @@ const GEMM_TI: usize = 64;
 /// Tokens per layer-major prefill pass: the experts move once per SPAN tokens. Costs
 /// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
 const SPAN: usize = 4096;
-/// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
 /// Positions per split-K block of decode attention.
 const ATT_SPLIT: usize = 128;
+/// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
 const LOGIT_ROWS: usize = 64;
 /// VRAM left free after sizing the expert cache to "as much as fits".
 const VRAM_RESERVE: usize = 192 << 20;
@@ -394,8 +394,10 @@ impl GpuModel {
             }
             None => {
                 let mut off = 0;
+                // Pageable fallback (pinning failed). Still async on `st`, so the staging-half
+                // events order it after the wave that last read `dst`.
                 for b in parts {
-                    self.htod(dst + off as u64, b);
+                    unsafe { result::memcpy_htod_async(dst + off as u64, b, st.cu_stream()) }.expect("htod async");
                     off += b.len();
                 }
             }

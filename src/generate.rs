@@ -79,6 +79,9 @@ impl<E: Engine> Generator<E> {
         let mut rng = s.seed;
         let mut n = 0;
         let finish = loop {
+            if max_tokens == 0 {
+                break Finish::Length;
+            }
             let tok = sample(&mut logits, s, &mut rng);
             if is_eog(tok) {
                 break Finish::Stop;
@@ -224,6 +227,8 @@ mod tests {
         g.engine.computed.clear();
         let (_, _, reused) = run(&mut g, &[1, 2, 3, 4, 0], 1);
         assert_eq!((reused, g.engine.computed[0]), (4, 0));
+        // max_tokens 0: no tokens at all.
+        assert_eq!(run(&mut g, &[1, 2], 0).0, Vec::<u32>::new());
         assert_eq!(g.generate(&[0; 16], 1, &Sampling::default(), |_| false, |_| true), Err(ContextExceeded { n_prompt: 16, n_ctx: 16 }));
     }
 
