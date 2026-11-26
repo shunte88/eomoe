@@ -1,6 +1,7 @@
 //! HTTP API, wire-compatible with llama-server for the endpoints Claude Code, Codex and OpenAI
 //! clients use: POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses),
-//! /v1/chat/completions (OpenAI chat), /v1/messages/count_tokens;
+//! /v1/chat/completions (OpenAI chat), /v1/messages/count_tokens; raw prompts on
+//! /v1/completions (OpenAI text) and /completion, /infill (llama.cpp native, FIM);
 //! GET /v1/models, /health. Event sequences and JSON shapes follow llama-server
 //! (tools/server/server-task.cpp); tests/golden/api.json holds captured oracle traffic.
 //!
@@ -189,7 +190,11 @@ impl App {
 
     /// Queue `chat` on the model thread; the receiver yields Start, Text..., End.
     fn run(self: &Arc<Self>, chat: Chat) -> Result<tmpsc::UnboundedReceiver<Out>, ApiError> {
-        let prompt = self.prompt(&chat)?;
+        self.generate(self.prompt(&chat)?, chat)
+    }
+
+    /// Generate from `prompt` with `chat`'s tools, limits and sampling (its messages unused).
+    fn generate(self: &Arc<Self>, prompt: Vec<u32>, chat: Chat) -> Result<tmpsc::UnboundedReceiver<Out>, ApiError> {
         if prompt.len() >= self.n_ctx {
             let mut e = ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -440,19 +445,24 @@ fn chatcmpl_to_chat(b: &Value) -> Result<Chat, ApiError> {
         return Err(ApiError::bad("Only one completion choice is allowed"));
     }
     let tools: Vec<Value> = b["tools"].as_array().into_iter().flatten().filter(|t| t["type"] == "function").cloned().collect();
+    Ok(Chat { messages: messages.clone().into(), tools: tools.into(), ..raw_chat(b) })
+}
+
+/// Limits, sampling and stop strings of any OpenAI or llama.cpp request; no messages or tools.
+fn raw_chat(b: &Value) -> Chat {
     let stop = match &b["stop"] {
         Value::String(s) => vec![s.clone()],
         v => v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
     };
     let max = ["max_completion_tokens", "max_tokens", "n_predict"].iter().find_map(|k| b[*k].as_i64());
-    Ok(Chat {
-        messages: messages.clone().into(),
-        tools: tools.into(),
+    Chat {
+        messages: Value::Null,
+        tools: json!([]),
         // No limit by default (or -1), as llama-server: generation stops at EOG or a full context.
         max_tokens: max.filter(|&n| n >= 0).map_or(usize::MAX, |n| n as usize),
         sampling: sampling(b),
         stop,
-    })
+    }
 }
 
 fn text_of_output(v: &Value) -> Value {
@@ -496,6 +506,24 @@ impl Acc {
             }
             Out::Error(_) => {}
         }
+    }
+
+    // OpenAI finish_reason, usage and llama-server timings (chat and text completions).
+    fn oai_finish(&self) -> &'static str {
+        match self.finish {
+            Some(Finish::Length) => "length",
+            _ if !self.calls.is_empty() => "tool_calls",
+            _ => "stop",
+        }
+    }
+    fn oai_usage(&self) -> Value {
+        json!({"completion_tokens": self.n_out, "prompt_tokens": self.n_prompt, "total_tokens": self.n_prompt + self.n_out, "prompt_tokens_details": {"cached_tokens": self.n_cached}})
+    }
+    fn oai_timings(&self) -> Value {
+        let (t, pn, dn) = (&self.timings, (self.n_prompt - self.n_cached).max(1), self.n_out.max(1));
+        json!({"cache_n": self.n_cached, "prompt_n": self.n_prompt - self.n_cached, "prompt_ms": t.prompt_ms, "prompt_per_token_ms": t.prompt_ms / pn as f64,
+               "prompt_per_second": pn as f64 * 1e3 / t.prompt_ms.max(1e-3), "predicted_n": self.n_out, "predicted_ms": t.predicted_ms,
+               "predicted_per_token_ms": t.predicted_ms / dn as f64, "predicted_per_second": dn as f64 * 1e3 / t.predicted_ms.max(1e-3)})
     }
 }
 
@@ -664,22 +692,6 @@ struct ChatCmpl {
 }
 
 impl ChatCmpl {
-    fn finish_reason(&self) -> &'static str {
-        match self.a.finish {
-            Some(Finish::Length) => "length",
-            _ if !self.a.calls.is_empty() => "tool_calls",
-            _ => "stop",
-        }
-    }
-    fn usage(&self) -> Value {
-        json!({"completion_tokens": self.a.n_out, "prompt_tokens": self.a.n_prompt, "total_tokens": self.a.n_prompt + self.a.n_out, "prompt_tokens_details": {"cached_tokens": self.a.n_cached}})
-    }
-    fn timings(&self) -> Value {
-        let (t, pn, dn) = (&self.a.timings, (self.a.n_prompt - self.a.n_cached).max(1), self.a.n_out.max(1));
-        json!({"cache_n": self.a.n_cached, "prompt_n": self.a.n_prompt - self.a.n_cached, "prompt_ms": t.prompt_ms, "prompt_per_token_ms": t.prompt_ms / pn as f64,
-               "prompt_per_second": pn as f64 * 1e3 / t.prompt_ms.max(1e-3), "predicted_n": self.a.n_out, "predicted_ms": t.predicted_ms,
-               "predicted_per_token_ms": t.predicted_ms / dn as f64, "predicted_per_second": dn as f64 * 1e3 / t.predicted_ms.max(1e-3)})
-    }
     fn chunk(&self, choices: Value) -> Value {
         json!({"choices": choices, "created": self.created, "id": self.id, "model": self.model, "system_fingerprint": FINGERPRINT, "object": "chat.completion.chunk"})
     }
@@ -701,14 +713,14 @@ impl Format for ChatCmpl {
                 let mut v: Vec<String> = self.a.calls.iter().enumerate().map(|(k, (id, c))| {
                     self.delta(json!({"tool_calls": [{"index": k, "id": id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}]}))
                 }).collect();
-                let mut tail = vec![self.chunk(json!([{"finish_reason": self.finish_reason(), "index": 0, "delta": {}}]))];
+                let mut tail = vec![self.chunk(json!([{"finish_reason": self.a.oai_finish(), "index": 0, "delta": {}}]))];
                 if self.include_usage {
                     let mut u = self.chunk(json!([]));
-                    u["usage"] = self.usage();
+                    u["usage"] = self.a.oai_usage();
                     tail.push(u);
                 }
                 // llama-server puts timings on the last chunk: the usage chunk when there is one.
-                tail.last_mut().unwrap()["timings"] = self.timings();
+                tail.last_mut().unwrap()["timings"] = self.a.oai_timings();
                 v.extend(tail.iter().map(|c| format!("data: {c}\n\n")));
                 v.push("data: [DONE]\n\n".into());
                 v
@@ -722,8 +734,154 @@ impl Format for ChatCmpl {
         if !self.a.calls.is_empty() {
             msg["tool_calls"] = self.a.calls.iter().map(|(id, c)| json!({"type": "function", "function": {"name": c.name, "arguments": c.arguments}, "id": id})).collect();
         }
-        json!({"choices": [{"finish_reason": self.finish_reason(), "index": 0, "message": msg}], "created": self.created, "model": self.model,
-               "system_fingerprint": FINGERPRINT, "object": "chat.completion", "usage": self.usage(), "id": self.id, "timings": self.timings()})
+        json!({"choices": [{"finish_reason": self.a.oai_finish(), "index": 0, "message": msg}], "created": self.created, "model": self.model,
+               "system_fingerprint": FINGERPRINT, "object": "chat.completion", "usage": self.a.oai_usage(), "id": self.id, "timings": self.a.oai_timings()})
+    }
+}
+
+impl App {
+    /// A raw prompt: a string (special tokens parsed) or token ids, as llama-server takes them.
+    fn raw_prompt(&self, p: &Value) -> Result<Vec<u32>, ApiError> {
+        match p {
+            Value::String(s) => Ok(self.tok.encode(s, true)),
+            Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_u64) => Ok(a.iter().map(|t| t.as_u64().unwrap() as u32).collect()),
+            Value::Array(a) if a.len() == 1 => self.raw_prompt(&a[0]),
+            Value::Null => Err(ApiError::bad("\"prompt\" is required")),
+            _ => Err(ApiError::bad("\"prompt\" must be a string or an array of token ids (one prompt per request)")),
+        }
+    }
+
+    /// The repo-level FIM prompt of an /infill request (llama-server format_prompt_infill, with
+    /// its defaults: n_batch 2048, n_predict -1, no SPM order, no BOS for this vocab).
+    fn infill_prompt(&self, b: &Value) -> Result<Vec<u32>, ApiError> {
+        if !b["prompt"].is_null() && !b["prompt"].is_string() {
+            return Err(ApiError::bad("\"prompt\" must be a string"));
+        }
+        let (Some(pre), Some(suf)) = (b["input_prefix"].as_str(), b["input_suffix"].as_str()) else {
+            return Err(ApiError::bad("\"input_prefix\" and \"input_suffix\" are required strings"));
+        };
+        let extra = match &b["input_extra"] {
+            Value::Null => &vec![],
+            Value::Array(a) => a,
+            _ => return Err(ApiError::bad("\"input_extra\" must be an array of {\"filename\": string, \"text\": string}")),
+        };
+        let special = |t: &str| self.tok.token_id(t).ok_or_else(|| ApiError::new(StatusCode::NOT_IMPLEMENTED, "not_supported_error", format!("Infill is not supported by this model: {t} is missing")));
+        let (rep, sep, fpre, fsuf, fmid) = (special("<|repo_name|>")?, special("<|file_sep|>")?, special("<|fim_prefix|>")?, special("<|fim_suffix|>")?, special("<|fim_middle|>")?);
+        let enc = |s: &str| self.tok.encode(s, false);
+        let mut ext = vec![rep];
+        ext.extend(enc("myproject\n"));
+        for c in extra {
+            let Some(text) = c["text"].as_str() else {
+                return Err(ApiError::bad("extra_context chunk must contain a \"text\" field with a string value"));
+            };
+            if !c["filename"].is_null() && !c["filename"].is_string() {
+                return Err(ApiError::bad("extra_context chunk's \"filename\" field must be a string"));
+            }
+            ext.push(sep);
+            ext.extend(enc(&format!("{}\n", c["filename"].as_str().unwrap_or("tmp"))));
+            ext.extend(enc(text));
+        }
+        ext.push(sep);
+        ext.extend(enc("filename\n"));
+        const N_BATCH: usize = 2048;
+        let prompt = self.tok.encode(b["prompt"].as_str().unwrap_or(""), true);
+        let (pre, suf) = (enc(pre), enc(suf));
+        let n_pre = pre.len().min(3 * (N_BATCH / 4));
+        let n_suf = suf.len().min((N_BATCH / 4).saturating_sub(2 + prompt.len()));
+        let n_ext = ext.len().min((self.n_ctx + 2).saturating_sub(N_BATCH));
+        let mut out = ext[ext.len() - n_ext..].to_vec();
+        out.push(fpre);
+        out.extend(&pre[pre.len() - n_pre..]);
+        out.extend(prompt);
+        out.push(fsuf);
+        out.extend(&suf[..n_suf]);
+        out.push(fmid);
+        Ok(out)
+    }
+}
+
+/// OpenAI text completions (llama-server to_json_oaicompat[_stream]).
+struct TextCmpl {
+    id: String,
+    model: String,
+    created: u64,
+    a: Acc,
+}
+
+impl TextCmpl {
+    fn chunk(&self, text: &str, finish: Value) -> Value {
+        json!({"choices": [{"text": text, "index": 0, "logprobs": null, "finish_reason": finish}], "created": self.created, "model": self.model,
+               "system_fingerprint": FINGERPRINT, "object": "text_completion", "id": self.id})
+    }
+}
+
+impl Format for TextCmpl {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        match out {
+            Out::Start { .. } => vec![],
+            Out::Text(t) => vec![format!("data: {}\n\n", self.chunk(t, Value::Null))],
+            Out::End { .. } => {
+                let mut v = vec![];
+                // llama-server: the partial result that hit a stop word carries the timings.
+                if self.a.stop_word.is_some() {
+                    let mut p = self.chunk("", Value::Null);
+                    p["timings"] = self.a.oai_timings();
+                    v.push(format!("data: {p}\n\n"));
+                }
+                let mut c = self.chunk("", self.a.oai_finish().into());
+                (c["usage"], c["timings"]) = (self.a.oai_usage(), self.a.oai_timings());
+                v.extend([format!("data: {c}\n\n"), "data: [DONE]\n\n".into()]);
+                v
+            }
+            Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut b = self.chunk(&self.a.text, self.a.oai_finish().into());
+        (b["usage"], b["timings"]) = (self.a.oai_usage(), self.a.oai_timings());
+        b
+    }
+}
+
+/// llama.cpp native /completion and /infill (llama-server server_task_result_cmpl_*::to_json_non_oaicompat).
+struct Native {
+    model: String,
+    prompt: String,
+    n_text: usize,
+    a: Acc,
+}
+
+impl Format for Native {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        match out {
+            Out::Start { .. } => vec![],
+            Out::Text(t) => {
+                self.n_text += 1;
+                let c = json!({"index": 0, "content": t, "tokens": [], "stop": false, "id_slot": -1, "tokens_predicted": self.n_text, "tokens_evaluated": self.a.n_prompt});
+                vec![format!("data: {c}\n\n")]
+            }
+            Out::End { .. } => {
+                let mut b = self.body();
+                b["content"] = "".into();
+                vec![format!("data: {b}\n\n")]
+            }
+            Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
+        }
+    }
+
+    fn body(&self) -> Value {
+        let a = &self.a;
+        let stop_type = match (a.finish, &a.stop_word) {
+            (_, Some(_)) => "word",
+            (Some(Finish::Length), _) => "limit",
+            _ => "eos",
+        };
+        json!({"index": 0, "content": a.text, "tokens": [], "id_slot": 0, "stop": true, "model": self.model, "tokens_predicted": a.n_out, "tokens_evaluated": a.n_prompt,
+               "prompt": self.prompt, "has_new_line": a.text.contains('\n'), "truncated": false, "stop_type": stop_type, "stopping_word": a.stop_word.as_deref().unwrap_or(""),
+               "tokens_cached": (a.n_prompt + a.n_out).saturating_sub(1), "timings": a.oai_timings()})
     }
 }
 
@@ -804,6 +962,30 @@ async fn chat_completions(State(app): State<Arc<App>>, body: Bytes) -> Response 
     respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
 }
 
+async fn completions_oai(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let f = TextCmpl { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), created: now(), a: Acc::default() };
+    let rx = app.raw_prompt(&b["prompt"]).and_then(|p| app.generate(p, raw_chat(&b)));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
+/// /completion (raw prompt) and /infill (FIM prompt) in llama.cpp's native format.
+async fn native(app: Arc<App>, body: Bytes, infill: bool) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let p = match if infill { app.infill_prompt(&b) } else { app.raw_prompt(&b["prompt"]) } {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let f = Native { model: app.alias.clone(), prompt: String::from_utf8_lossy(&app.tok.decode_bytes(&p)).into_owned(), n_text: 0, a: Acc::default() };
+    respond(app.generate(p, raw_chat(&b)), f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
 async fn count_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
     match parse(&body).and_then(|b| anthropic_to_chat(&b)).and_then(|c| app.prompt(&c)) {
         Ok(p) => Json(json!({"input_tokens": p.len()})).into_response(),
@@ -861,6 +1043,10 @@ pub fn router(app: Arc<App>, keys: Vec<String>) -> Router {
         .route("/v1/responses/input_tokens", post(input_tokens))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions_oai))
+        .route("/completion", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, false)))
+        .route("/completions", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, false)))
+        .route("/infill", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, true)))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
         .with_state(app)
         .layer(axum::middleware::from_fn_with_state(keys, check_key))

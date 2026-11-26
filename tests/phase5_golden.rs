@@ -6,64 +6,18 @@
 //!
 //! Needs the GPU and the model: cargo test --release --test phase5_golden -- --ignored
 
+mod common;
+use common::{events, Server};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
 
 const PORT: u16 = 8097;
 
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.0.kill().ok();
-        self.0.wait().ok();
-    }
-}
-
 fn start() -> Server {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_eomoe"))
-        .args(["serve", "--port", &PORT.to_string()])
-        .env("RUST_LOG", "info")
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let err = c.stderr.take().unwrap();
-    let s = Server(c);
-    for l in BufReader::new(err).lines() {
-        let l = l.unwrap();
-        eprintln!("{l}");
-        if l.contains("listening on") {
-            return s;
-        }
-    }
-    panic!("server exited before listening");
+    common::start(PORT)
 }
 
-/// (status, body) over HTTP/1.0, so the body is close-delimited.
 fn http(method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
-    let mut s = TcpStream::connect(("127.0.0.1", PORT)).unwrap();
-    let b = body.map(Value::to_string).unwrap_or_default();
-    write!(s, "{method} {path} HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).unwrap();
-    let mut r = String::new();
-    s.read_to_string(&mut r).unwrap();
-    let (head, body) = r.split_once("\r\n\r\n").unwrap();
-    (head[9..12].parse().unwrap(), body.to_owned())
-}
-
-/// SSE events as (event line, data JSON).
-fn events(body: &str) -> Vec<(Option<String>, Value)> {
-    let mut out = vec![];
-    let mut name = None;
-    for l in body.lines() {
-        if let Some(n) = l.strip_prefix("event: ") {
-            name = Some(n.to_owned());
-        } else if let Some(d) = l.strip_prefix("data: ") {
-            out.push((name.take(), if d == "[DONE]" { json!("[DONE]") } else { serde_json::from_str(d).unwrap() }));
-        }
-    }
-    out
+    common::http(PORT, method, path, body)
 }
 
 /// Chat completion chunks (no event lines): what each delta carries, runs collapsed.

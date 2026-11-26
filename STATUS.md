@@ -20,7 +20,7 @@ Architecture decisions:
 | 8. Remote access | llama-server-compatible `--api-key` (401 body byte-identical), optional TLS, client commands take `--url`/`--api-key`, built-in web chat page | **done 2026-11-26**: 11/11 oracle auth cases identical; HTTPS + key verified with check, Claude Code and Codex (see below) |
 | 9. Request pool | `eomoe pool` routes requests across N nodes with prefix affinity + load; aggregate throughput scales ~linearly with nodes | planned (future; needs a 2nd machine for the gate) |
 | 10. Expert-parallel pool | Experts sharded across nodes' VRAM over 10–100 GbE: removes PCIe miss uploads; runs models bigger than one box (e.g. Qwen3-Coder-480B-A35B, same qwen3moe arch) | planned (future; latency probe first) |
-| 11. Agent-serving extras (from a koboldcpp review) | `/v1/completions` with FIM for editor completion; RAM KV snapshots so evicted conversations come back without re-prefill; JSON-schema-constrained output (`response_format`); Ollama `/api/chat` + `/api/tags` adapter. Each one is gated against llama-server or Ollama wire captures | planned (future) |
+| 11. Agent-serving extras (from a koboldcpp review) | `/v1/completions` with FIM for editor completion; RAM KV snapshots so evicted conversations come back without re-prefill; JSON-schema-constrained output (`response_format`); Ollama `/api/chat` + `/api/tags` adapter. Each one is gated against llama-server or Ollama wire captures | (a) completions + FIM done; KV snapshots, constrained output, Ollama next |
 
 ## Phase 0 baseline (2026-11-25)
 
@@ -520,6 +520,30 @@ Port: `check_key` in `src/server.rs` follows `middleware_validate_api_key` (llam
 - Regression gates after the change: lib 20/20, phase5 API gate, phase8.
 - Not done: CORS headers (llama-server's `--cors-origins`); the chat page is same-origin. Add them if a browser app on another origin needs the API.
 - Found, pre-existing, now fixed: Claude Code did not know "local-code" and assumed a 1M-token window, so it would not auto-compact before our 32K. `eomoe claude` now sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to `--ctx-size`, and the warning is gone in a headless session.
+
+## Phase 11a done: raw completions and FIM (2026-11-26)
+
+**Gate:** `tests/phase11_golden.rs` `completions_match_oracle` replays `tests/golden/completions.json`, captured from the oracle llama-server by `tools/capture_completions_golden.py`. Seven cases, each non-streamed and streamed:
+- `/v1/completions`: plain prompt, a stop word, and a prompt with special tokens;
+- `/completion` with a string, `/completions` with token ids;
+- `/infill`, without and with `input_extra` (two files, one with no filename);
+- three validation errors (no `input_prefix`, an extra chunk without `text`, no `prompt`): status and error type.
+
+Per case it compares the prompt token count; for `/infill`, the detokenized prompt byte-for-byte, which pins the repo-level FIM construction (`format_prompt_infill`). It also compares the finish/stop type, the stopping word, key sets (body, choice, usage, timings), and the streamed event sequence. Generated text must be non-empty; greedy text differs across backends (Phase 3 floor), though here every case produced the oracle's text or a near copy.
+
+Result: 7/7 cases and 3/3 errors match. The gate is red-capable: changing the FIM repo header to `myproj` fails all four infill comparisons.
+
+Gate revisions, flagged:
+- Native bodies leave out `generation_settings` (llama.cpp's sampler-parameter dump, about 50 fields we do not have).
+- Streamed native chunks send `tokens: []`, not the token id.
+- Error messages are not compared. For a missing field the oracle returns a nlohmann exception string, because its validation does not return early.
+
+Implementation, in `src/server.rs`:
+- `App::generate` takes token prompts, and `run` (chat) renders the template and then calls it, so all endpoints share one pipeline.
+- `infill_prompt` uses llama-server's defaults: n_batch 2048, server n_predict -1, no SPM, and no BOS for this vocab.
+- When a stop word ends a stream, the oracle puts `timings` on the last partial chunk; `TextCmpl` copies that.
+- The test server helpers moved to `tests/common`.
+- Regression gates: lib 20/20, phase5, phase8.
 
 ## Plan: Phase 11, agent-serving extras from koboldcpp (2026-11-26)
 

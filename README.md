@@ -34,6 +34,8 @@ The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/ph
 | `POST /v1/chat/completions` | OpenAI chat: tools, streaming, `stream_options.include_usage`, `timings` |
 | `POST /v1/responses` | OpenAI Responses (Codex) |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages (Claude Code) |
+| `POST /v1/completions` | OpenAI text completions: raw prompt (string or token ids), streaming |
+| `POST /completion`, `/infill` | llama.cpp native completion and fill-in-the-middle (`input_prefix`, `input_suffix`, `input_extra`), for llama.vim / llama.vscode |
 | `GET /v1/models`, `/health` | |
 | `GET /` | Minimal web chat page |
 

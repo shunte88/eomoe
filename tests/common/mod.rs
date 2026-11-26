@@ -2,6 +2,10 @@
 #![allow(dead_code)]
 
 use eomoe::qwen3moe::Engine;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
 
 pub fn model_path() -> String {
     std::env::var("EOMOE_TEST_MODEL").unwrap_or_else(|_| {
@@ -93,3 +97,58 @@ pub fn greedy_floor_gate(m: &mut impl Engine) {
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
+
+pub struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+/// `eomoe serve` on `port`, returned once it is listening; killed on drop.
+pub fn start(port: u16) -> Server {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_eomoe"))
+        .args(["serve", "--port", &port.to_string()])
+        .env("RUST_LOG", "info")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let err = c.stderr.take().unwrap();
+    let s = Server(c);
+    for l in BufReader::new(err).lines() {
+        let l = l.unwrap();
+        eprintln!("{l}");
+        if l.contains("listening on") {
+            return s;
+        }
+    }
+    panic!("server exited before listening");
+}
+
+/// (status, body) over HTTP/1.0, so the body is close-delimited.
+pub fn http(port: u16, method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let b = body.map(Value::to_string).unwrap_or_default();
+    write!(s, "{method} {path} HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len()).unwrap();
+    let mut r = String::new();
+    s.read_to_string(&mut r).unwrap();
+    let (head, body) = r.split_once("\r\n\r\n").unwrap();
+    (head[9..12].parse().unwrap(), body.to_owned())
+}
+
+/// SSE events as (event line, data JSON).
+pub fn events(body: &str) -> Vec<(Option<String>, Value)> {
+    let mut out = vec![];
+    let mut name = None;
+    for l in body.lines() {
+        if let Some(n) = l.strip_prefix("event: ") {
+            name = Some(n.to_owned());
+        } else if let Some(d) = l.strip_prefix("data: ") {
+            out.push((name.take(), if d == "[DONE]" { json!("[DONE]") } else { serde_json::from_str(d).unwrap() }));
+        }
+    }
+    out
+}
+
