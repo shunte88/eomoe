@@ -1,0 +1,2171 @@
+//! CUDA engine for qwen3moe. Same numerics as the CPU reference (f32 activations and KV
+//! cache, weights dequantized on the fly), with the dense weights resident in VRAM and the
+//! experts in host RAM, cached in VRAM slots by `ExpertCache` (ubatches up to 32 tokens; larger
+//! ones read the cached experts and stream the rest through staging slots, as llama.cpp).
+//!
+//! Kernel seam: kernels are loaded by name from an embedded fatbin built from
+//! kernels/eomoe.cu (build.rs); an all-Rust module exporting the same names can replace it.
+
+use crate::expert_cache::ExpertCache;
+use crate::gguf::{GgmlType, Gguf, TensorInfo};
+use crate::quant::dequant_row;
+use crate::qwen3moe::{route, Engine, Weights};
+use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
+use rayon::prelude::*;
+use cudarc::nvrtc::Ptx;
+use std::sync::Arc;
+
+static FATBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/eomoe.fatbin"));
+
+type Ptr = CUdeviceptr;
+
+/// Larger ubatches touch most experts of a layer: caching them would evict the decode set.
+const CACHE_MAX_BATCH: usize = 32;
+/// Staging slots for the misses of uncached (large) ubatches, used in waves.
+const STAGE: usize = 32;
+/// Batches of at least this many tokens (per expert, for experts) use the tiled GEMM.
+const GEMM_MIN: usize = 16;
+/// Tokens per layer-major prefill pass: the experts move once per SPAN tokens. Costs
+/// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
+const SPAN: usize = 4096;
+/// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
+/// Positions per split-K block of decode attention.
+const ATT_SPLIT: usize = 128;
+const LOGIT_ROWS: usize = 64;
+/// VRAM left free after sizing the expert cache to "as much as fits".
+const VRAM_RESERVE: usize = 192 << 20;
+
+/// Layers whose experts have the same layout share one bank of slots and one cache.
+struct Group {
+    cache: ExpertCache,
+    bank: Ptr,
+    /// gate | up | down bytes of one expert.
+    slot_bytes: usize,
+}
+
+/// Every expert in page-locked RAM in slot layout (gate | up | down), so a miss is one async
+/// DMA at full PCIe speed (pageable copies are ~30% slower and block the host).
+/// ponytail: pins all expert bytes (~16 GiB for Qwen3-30B); a RAM-tight host gets the
+/// pageable fallback, add a config switch / partial pinning if that needs tuning.
+struct HostExperts {
+    buf: PinnedHostSlice<u8>,
+    /// [n_layer] offset of expert 0 of the layer.
+    base: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// Bytes uploaded into cache slots.
+    pub bytes: u64,
+}
+
+macro_rules! launch {
+    ($s:expr, $f:expr, $grid:expr, $block:expr, [$($a:ident),*]) => {{
+        let cfg = LaunchConfig { grid_dim: $grid, block_dim: ($block, 1, 1), shared_mem_bytes: 0 };
+        let mut b = $s.stream.launch_builder(&$f);
+        $(b.arg(&$a);)*
+        unsafe { b.launch(cfg) }.expect("kernel launch");
+    }};
+}
+
+struct Kernels {
+    mm_f32: CudaFunction,
+    mm_q4_k: CudaFunction,
+    mm_q6_k: CudaFunction,
+    mm_q4_k_ids: CudaFunction,
+    mm_q6_k_ids: CudaFunction,
+    mm_q4_k_t8: CudaFunction,
+    mm_q6_k_t8: CudaFunction,
+    mm_q4_k_ids_t8: CudaFunction,
+    mm_q6_k_ids_t8: CudaFunction,
+    gemm_q4_k: CudaFunction,
+    gemm_q6_k: CudaFunction,
+    gemm_q4_k_ids: CudaFunction,
+    gemm_q6_k_ids: CudaFunction,
+    rmsnorm: CudaFunction,
+    qk_norm_rope: CudaFunction,
+    attention: CudaFunction,
+    attention_dec: CudaFunction,
+    attention_tc: CudaFunction,
+    attn_merge: CudaFunction,
+    store_f16: CudaFunction,
+    add_inplace: CudaFunction,
+    gather_rows: CudaFunction,
+    swiglu: CudaFunction,
+    moe_combine: CudaFunction,
+}
+
+/// A quantized matrix in VRAM: n_rows rows of k elements.
+#[derive(Clone, Copy)]
+struct Mat {
+    p: Ptr,
+    ty: GgmlType,
+    row_bytes: usize,
+    k: usize,
+    n_rows: usize,
+}
+
+struct DLayer {
+    attn_norm: Ptr,
+    wq: Mat,
+    wk: Mat,
+    wv: Mat,
+    wo: Mat,
+    q_norm: Ptr,
+    k_norm: Ptr,
+    ffn_norm: Ptr,
+    router: Mat,
+}
+
+#[derive(Clone, Copy)]
+struct Scratch {
+    x: Ptr,
+    h: Ptr,
+    q: Ptr,
+    attn: Ptr,
+    /// This chunk's K | V (f32) before roping and storing into the f16 cache.
+    kvs: Ptr,
+    o: Ptr,
+    rl: Ptr,
+    /// Gathered rows: inputs, [gate | up] outputs, swiglu activations, down outputs.
+    xg: Ptr,
+    gu: Ptr,
+    act: Ptr,
+    db: Ptr,
+    logits: Ptr,
+    /// Per layer routing, see `forward_span` and `meta_bytes`.
+    meta: Ptr,
+}
+
+pub struct GpuModel {
+    w: Weights,
+    stream: Arc<CudaStream>,
+    k: Kernels,
+    layers: Vec<DLayer>,
+    out_norm: Ptr,
+    output: Mat,
+    /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16.
+    kv: Ptr,
+    groups: Vec<Group>,
+    group_of: Vec<usize>,
+    /// STAGE slots of the largest expert, for uncached ubatches: two halves, so one wave's
+    /// misses upload on `copy` while the previous wave computes on `stream`.
+    stage: Ptr,
+    copy: Arc<CudaStream>,
+    /// Per stage half: uploads done (copy stream) / last reader done (main stream).
+    ready: [CudaEvent; 2],
+    free: [CudaEvent; 2],
+    stage_bytes: usize,
+    stats: CacheStats,
+    host: Option<HostExperts>,
+    /// Page-locked staging for the per-layer routing upload.
+    meta_host: PinnedHostSlice<u8>,
+    s: Scratch,
+    n_ctx: usize,
+    max_batch: usize,
+    /// Tokens per layer-major pass (`forward_span`).
+    span: usize,
+    n_past: usize,
+    /// Owns every device allocation the raw pointers above point into.
+    _bufs: Vec<CudaSlice<u8>>,
+    /// Bytes allocated on the device.
+    pub vram_bytes: usize,
+}
+
+const F: usize = std::mem::size_of::<f32>();
+const H: usize = 2; // f16
+
+fn err(e: impl std::fmt::Debug) -> String {
+    format!("CUDA: {e:?}")
+}
+
+impl GpuModel {
+    /// `with_cache` with the oracle's 4800 MiB expert cache.
+    pub fn new(g: Gguf, n_ctx: usize) -> Result<Self, String> {
+        Self::with_cache(g, n_ctx, 4800)
+    }
+
+    /// Load the dense weights to GPU 0, allocate a KV cache for `n_ctx` positions and up to
+    /// `cache_mib` of expert slots (capped by free VRAM, so `usize::MAX >> 20` = all that fits),
+    /// split so each group caches the same fraction of its experts.
+    pub fn with_cache(g: Gguf, n_ctx: usize, cache_mib: usize) -> Result<Self, String> {
+        let w = Weights::load(g)?;
+        let ctx = CudaContext::new(0).map_err(err)?;
+        let stream = ctx.default_stream();
+        let m = ctx.load_module(Ptx::from_binary(FATBIN.to_vec())).map_err(err)?;
+        let f = |n: &str| m.load_function(n).map_err(err);
+        let k = Kernels {
+            mm_f32: f("mm_f32")?,
+            mm_q4_k: f("mm_q4_k")?,
+            mm_q6_k: f("mm_q6_k")?,
+            mm_q4_k_ids: f("mm_q4_k_ids")?,
+            mm_q6_k_ids: f("mm_q6_k_ids")?,
+            mm_q4_k_t8: f("mm_q4_k_t8")?,
+            mm_q6_k_t8: f("mm_q6_k_t8")?,
+            mm_q4_k_ids_t8: f("mm_q4_k_ids_t8")?,
+            mm_q6_k_ids_t8: f("mm_q6_k_ids_t8")?,
+            gemm_q4_k: f("gemm_q4_k")?,
+            gemm_q6_k: f("gemm_q6_k")?,
+            gemm_q4_k_ids: f("gemm_q4_k_ids")?,
+            gemm_q6_k_ids: f("gemm_q6_k_ids")?,
+            rmsnorm: f("rmsnorm")?,
+            qk_norm_rope: f("qk_norm_rope")?,
+            attention: f("attention")?,
+            attention_dec: f("attention_dec")?,
+            attention_tc: f("attention_tc")?,
+            attn_merge: f("attn_merge")?,
+            store_f16: f("store_f16")?,
+            add_inplace: f("add_inplace")?,
+            gather_rows: f("gather_rows")?,
+            swiglu: f("swiglu")?,
+            moe_combine: f("moe_combine")?,
+        };
+
+        let mut bufs = vec![];
+        let vram = std::cell::Cell::new(0usize);
+        let mut alloc = |bytes: usize| -> Result<Ptr, String> {
+            let b = stream.alloc_zeros::<u8>(bytes.max(1)).map_err(err)?;
+            let p = b.device_ptr(&stream).0;
+            bufs.push(b);
+            vram.set(vram.get() + bytes);
+            Ok(p)
+        };
+        let mut upload = |t: &TensorInfo| -> Result<Ptr, String> {
+            let p = alloc(t.size)?;
+            unsafe { result::memcpy_htod_sync(p, w.g.data(t)) }.map_err(err)?;
+            Ok(p)
+        };
+        let mat = |t: &TensorInfo, p: Ptr| -> Result<Mat, String> {
+            check_ty(t)?;
+            Ok(Mat { p, ty: t.ty, row_bytes: t.row_bytes(), k: t.dims[0] as usize, n_rows: t.size / t.row_bytes() })
+        };
+        let mut layers = vec![];
+        for l in &w.layers {
+            layers.push(DLayer {
+                attn_norm: upload(&l.attn_norm)?,
+                wq: mat(&l.wq, upload(&l.wq)?)?,
+                wk: mat(&l.wk, upload(&l.wk)?)?,
+                wv: mat(&l.wv, upload(&l.wv)?)?,
+                wo: mat(&l.wo, upload(&l.wo)?)?,
+                q_norm: upload(&l.q_norm)?,
+                k_norm: upload(&l.k_norm)?,
+                ffn_norm: upload(&l.ffn_norm)?,
+                router: mat(&l.router, upload(&l.router)?)?,
+            });
+            for t in [&l.gate, &l.up, &l.down] {
+                if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K) {
+                    return Err(format!("{}: {:?} experts have no CUDA kernel yet", t.name, t.ty));
+                }
+            }
+            // gate and up are read as one [gate | up] matrix of each slot.
+            if l.gate.ty != l.up.ty || l.gate.dims != l.up.dims {
+                return Err(format!("{}: gate and up experts differ in type or shape", l.gate.name));
+            }
+        }
+        let out_norm = upload(&w.out_norm)?;
+        let output = mat(&w.output, upload(&w.output)?)?;
+        let dense = vram.get();
+
+        let hp = &w.hp;
+        if hp.head_dim % 32 != 0 || hp.head_dim > 256 {
+            return Err(format!("head_dim {} unsupported by the attention kernel", hp.head_dim));
+        }
+        let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
+        let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * H)?;
+        let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
+        let layout = |l: &crate::qwen3moe::Layer| (l.gate.ty, l.up.ty, l.down.ty, ebytes(l));
+        let mut layouts = vec![];
+        let group_of: Vec<usize> = w
+            .layers
+            .iter()
+            .map(|l| layouts.iter().position(|x| *x == layout(l)).unwrap_or_else(|| {
+                layouts.push(layout(l));
+                layouts.len() - 1
+            }))
+            .collect();
+        let host_bytes: usize = w.layers.iter().map(|l| ebytes(l) * hp.n_expert).sum();
+        let stage_bytes = layouts.iter().map(|l| l.3).max().unwrap_or(0);
+        let host = pin_experts(&ctx, &w, host_bytes);
+        let stage = alloc(STAGE * stage_bytes)?;
+        let (b, span) = (n_ctx.min(512), n_ctx.min(SPAN));
+        let s = Scratch {
+            x: alloc(span * e * F)?,
+            h: alloc(span * e * F)?,
+            q: alloc(b * nq * F)?,
+            attn: alloc(b * nq * F)?,
+            kvs: alloc(2 * b * kvd * F)?,
+            o: alloc(b * e * F)?,
+            rl: alloc(b * hp.n_expert * F)?,
+            xg: alloc(b * kk * e * F)?,
+            gu: alloc(b * kk * 2 * hp.n_ff_exp * F)?,
+            act: alloc(b * kk * hp.n_ff_exp * F)?,
+            db: alloc(b * kk * e * F)?,
+            logits: alloc(LOGIT_ROWS.min(b) * hp.n_vocab * F)?,
+            meta: alloc(meta_bytes(span, b, kk, hp.n_expert))?,
+        };
+        let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(span, b, kk, hp.n_expert), 0) }.map_err(err)?;
+        // The expert banks get what is left: the requested MiB, capped by free VRAM.
+        let (free, _) = result::mem_get_info().map_err(err)?;
+        let budget = (cache_mib << 20).min(free.saturating_sub(VRAM_RESERVE));
+        if budget < cache_mib << 20 {
+            if cache_mib != usize::MAX >> 20 { log::warn!("gpu: expert cache capped at {} MiB of free VRAM (asked {cache_mib})", budget >> 20); }
+        }
+        let frac = (budget as f64 / host_bytes as f64).min(1.0);
+        let mut groups = vec![];
+        for (gi, lay) in layouts.iter().enumerate() {
+            let n_layers = group_of.iter().filter(|&&x| x == gi).count();
+            // At least one cached ubatch's worth of distinct experts.
+            let min_slots = hp.n_expert.min(hp.n_expert_used * CACHE_MAX_BATCH);
+            let n_slots = ((frac * (n_layers * hp.n_expert) as f64) as usize).max(min_slots);
+            groups.push(Group { cache: ExpertCache::new(hp.n_layer, hp.n_expert, n_slots), bank: alloc(n_slots * lay.3)?, slot_bytes: lay.3 });
+        }
+        log::info!(
+            "gpu: dense weights {} MiB, expert cache {} MiB ({:?} slots per group), total {} MiB (n_ctx {n_ctx}, batch {b})",
+            dense >> 20,
+            groups.iter().map(|g| g.cache.n_slots() * g.slot_bytes).sum::<usize>() >> 20,
+            groups.iter().map(|g| g.cache.n_slots()).collect::<Vec<_>>(),
+            vram.get() >> 20
+        );
+        let ev = || ctx.new_event(None).map_err(err);
+        Ok(Self {
+            copy: ctx.new_stream().map_err(err)?,
+            ready: [ev()?, ev()?],
+            free: [ev()?, ev()?],
+            stream,
+            k,
+            layers,
+            out_norm,
+            output,
+            kv,
+            groups,
+            group_of,
+            stage,
+            stage_bytes,
+            stats: CacheStats::default(),
+            host,
+            meta_host,
+            s,
+            n_ctx,
+            max_batch: b,
+            span,
+            n_past: 0,
+            _bufs: bufs,
+            vram_bytes: vram.get(),
+            w,
+        })
+    }
+
+    /// Expert cache counters since load (cached ubatches only).
+    pub fn cache_stats(&self) -> CacheStats {
+        self.stats
+    }
+
+    /// Expert cache slots per layer group.
+    pub fn cache_slots(&self) -> Vec<usize> {
+        self.groups.iter().map(|g| g.cache.n_slots()).collect()
+    }
+
+    /// Queue a copy of expert `ex` of layer `li` (gate | up | down) to `dst`; returns its bytes.
+    fn upload_expert(&self, li: usize, ex: usize, dst: Ptr, st: &CudaStream) -> usize {
+        let parts = self.w.expert(&self.w.layers[li], ex);
+        let n: usize = parts.iter().map(|b| b.len()).sum();
+        match &self.host {
+            Some(h) => {
+                let src = &h.buf.as_slice().expect("pinned")[h.base[li] + ex * n..][..n];
+                unsafe { result::memcpy_htod_async(dst, src, st.cu_stream()) }.expect("htod async");
+            }
+            None => {
+                let mut off = 0;
+                for b in parts {
+                    self.htod(dst + off as u64, b);
+                    off += b.len();
+                }
+            }
+        }
+        n
+    }
+
+    fn mm(&self, m: &Mat, x: Ptr, y: Ptr, ntok: usize) {
+        // Quantized kernels: one warp per row, MM_ROWS (= 4) rows per block; tiles of 8 tokens
+        // (prefill) or one token (decode) per grid row.
+        let (p, rb, k, n, ti) = (m.p, m.row_bytes as u64, m.k as i32, m.n_rows as i32, ntok as i32);
+        if m.ty == GgmlType::F32 {
+            return launch!(self, self.k.mm_f32, (m.n_rows as u32, ntok as u32, 1), 256, [p, rb, k, x, y, n]);
+        }
+        let (f, gx, gy) = match (m.ty, ntok) {
+            (GgmlType::Q4_K, 1) => (&self.k.mm_q4_k, m.n_rows.div_ceil(4), 1),
+            (GgmlType::Q6_K, 1) => (&self.k.mm_q6_k, m.n_rows.div_ceil(4), 1),
+            (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (t, _) => unreachable!("checked at load: {t:?}"),
+        };
+        launch!(self, f, (gx as u32, gy as u32, 1), 128, [p, rb, k, x, y, n, ti]);
+    }
+
+    /// Grouped expert matvec: gathered row j reads the weights at wp[j] + off. The kernel is
+    /// picked by rows per expert: tiles share decoded weights only within one expert (the
+    /// GEMM re-decodes them per expert a tile straddles; the 8-token tile falls back to one
+    /// token at a time), so decode's ~1 row per expert runs one row per grid row.
+    #[allow(clippy::too_many_arguments)]
+    fn mm_ids(&self, ty: GgmlType, wp: Ptr, off: u64, row_bytes: usize, k: usize, x: Ptr, y: Ptr, n_rows: usize, ntok: usize, per_expert: usize) {
+        let (f, gx, gy) = match (ty, per_expert) {
+            (GgmlType::Q4_K, ..4) => (&self.k.mm_q4_k_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::Q6_K, ..4) => (&self.k.mm_q6_k_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::Q4_K, ..GEMM_MIN) => (&self.k.mm_q4_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k_ids, n_rows.div_ceil(128), ntok.div_ceil(32)),
+            (t, _) => unreachable!("checked at load: {t:?}"),
+        };
+        let (rb, k, n, ti) = (row_bytes as u64, k as i32, n_rows as i32, ntok as i32);
+        launch!(self, f, (gx as u32, gy as u32, 1), 128, [wp, off, rb, k, x, y, n, ti]);
+    }
+
+    fn htod<T>(&self, dst: Ptr, src: &[T]) {
+        unsafe { result::memcpy_htod_sync(dst, src) }.expect("htod");
+    }
+
+    fn dtoh(&self, src: Ptr, n: usize) -> Vec<f32> {
+        let mut v = vec![0f32; n];
+        self.stream.synchronize().expect("sync");
+        unsafe { result::memcpy_dtoh_sync(&mut v, src) }.expect("dtoh");
+        v
+    }
+
+    fn check_ctx(&self, n: usize) {
+        assert!(self.n_past + n <= self.n_ctx, "context overflow: {} + {n} > {}", self.n_past, self.n_ctx);
+    }
+
+    /// Run up to `span` tokens layer by layer: attention in ubatches of `max_batch`, then the
+    /// MoE of the whole span in expert waves, so each expert is uploaded at most once per layer
+    /// (a 4096-token prefill moves the experts once, not once per ubatch). Returns the logits of
+    /// every token, or of the last only.
+    fn forward_span(&mut self, tokens: &[u32], all_logits: bool) -> Vec<f32> {
+        let hp = &self.w.hp;
+        let (e, hd, nh, nkv, ff, kk) = (hp.n_embd, hp.head_dim, hp.n_head, hp.n_head_kv, hp.n_ff_exp, hp.n_expert_used);
+        let (kvd, t, b) = (nkv * hd, tokens.len(), self.max_batch);
+        let s = self.s;
+        let nv = hp.n_vocab;
+        let n_expert = hp.n_expert;
+        let chunks: Vec<(usize, usize)> = (0..t).step_by(b).map(|c0| (c0, b.min(t - c0))).collect();
+        let at = |p: Ptr, c0: usize, width: usize| p + (c0 * width * F) as u64;
+
+        let mut xe = vec![0f32; t * e];
+        for (row, &tok) in xe.chunks_exact_mut(e).zip(tokens) {
+            dequant_row(self.w.tok_embd.ty, self.w.g.row(&self.w.tok_embd, tok as usize), row);
+        }
+        self.htod(s.x, &xe);
+
+        let (ei, eps, base) = (e as i32, hp.eps, hp.rope_base);
+        let (nhi, nkvi, hdi) = (nh as i32, nkv as i32, hd as i32);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for (li, l) in self.layers.iter().enumerate() {
+            let kc = self.kv + (li * 2 * self.n_ctx * kvd * H) as u64;
+            let vc = kc + (self.n_ctx * kvd * H) as u64;
+            // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
+            let mut sels = vec![];
+            for &(c0, tc) in &chunks {
+                let (x, h, q, attn, o) = (at(s.x, c0, e), at(s.h, c0, e), s.q, s.attn, s.o);
+                let pos = self.n_past + c0;
+                let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
+                let (kd, vd) = (kc + (pos * kvd * H) as u64, vc + (pos * kvd * H) as u64);
+                let (ks, vs) = (s.kvs, s.kvs + (tc * kvd * F) as u64);
+                let wn = l.attn_norm;
+                launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
+                self.mm(&l.wq, h, q, tc);
+                self.mm(&l.wk, h, ks, tc);
+                self.mm(&l.wv, h, vs, tc);
+                let (qn, kn) = (l.q_norm, l.k_norm);
+                launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
+                launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base]);
+                let nkv_t = (tc * kvd) as i32;
+                let g = ((tc * kvd).div_ceil(256) as u32, 1, 1);
+                launch!(self, self.k.store_f16, g, 256, [kd, ks, nkv_t]);
+                launch!(self, self.k.store_f16, g, 256, [vd, vs, nkv_t]);
+                let gq = nh / nkv;
+                if hd == 128 && 8 % gq == 0 {
+                    // Decode (<= 4 tokens): attention_dec, one row per warp. Prefill: tensor-core
+                    // attention_tc. Both split the positions when blocks are few, partials in s.gu
+                    // (idle during attention).
+                    let small = tc <= 4;
+                    let cap = self.max_batch * hp.n_expert_used * 2 * hp.n_ff_exp / (tc * nh * 130);
+                    let (f, gy, bs) = if small { (&self.k.attention_dec, (tc * gq).div_ceil(8), 256) }
+                        else { (&self.k.attention_tc, (tc * gq).div_ceil(64), 128) };
+                    // Fill the GPU: split positions until ~240 blocks (decode: every ATT_SPLIT).
+                    let want = if small { usize::MAX } else { (240 / (nkv * gy)).max(1) };
+                    let sk = (pos + tc).div_ceil(if small { ATT_SPLIT } else { 512 }).min(want).min(cap).max(1);
+                    let (part, ski) = (s.gu, sk as i32);
+                    launch!(self, *f, (nkv as u32, gy as u32, sk as u32), bs, [q, kc, vc, attn, nhi, nkvi, pos0, ti, scale, part]);
+                    if sk > 1 {
+                        let rows = (tc * nh) as i32;
+                        launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), 128, [part, attn, rows, ski]);
+                    }
+                } else {
+                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
+                }
+                self.mm(&l.wo, attn, o, tc);
+                let n = (tc * e) as i32;
+                launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
+                let wn = l.ffn_norm;
+                launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
+                self.mm(&l.router, h, s.rl, tc);
+                sels.push(route(&self.dtoh(s.rl, tc * n_expert), n_expert, kk));
+            }
+
+            // --- MoE: experts in waves; each wave runs over every ubatch ---
+            let mut by_expert: Vec<Vec<(usize, f32)>> = vec![vec![]; n_expert]; // (span token, weight)
+            for (ti, ts) in sels.iter().flatten().enumerate() {
+                for &(ex, wgt) in ts {
+                    by_expert[ex].push((ti, wgt));
+                }
+            }
+            let used: Vec<usize> = (0..n_expert).filter(|&ex| !by_expert[ex].is_empty()).collect();
+            let gi = self.group_of[li];
+            let (bank, sb) = (self.groups[gi].bank, self.groups[gi].slot_bytes);
+            // ptr[ex]: where expert ex's (gate | up | down) will be when its wave runs.
+            let mut ptr = vec![0u64; n_expert];
+            // Cached ubatches go through the cache policy and run as one wave; larger spans
+            // bypass it (as in the oracle): resident experts are read in place (wave 0), misses
+            // are streamed through the staging halves in waves of HALF, alternating halves.
+            let cached = t <= CACHE_MAX_BATCH;
+            const HALF: usize = STAGE / 2;
+            let mut half: Vec<Option<usize>> = vec![None]; // staging half each wave uses
+            let waves: Vec<Vec<usize>> = if cached {
+                let ids: Vec<u32> = sels[0].iter().flatten().map(|&(e, _)| e as u32).collect();
+                let p = self.groups[gi].cache.plan(li, &ids, t);
+                for &(ex, slot) in &p.fills {
+                    self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64, &self.stream) as u64;
+                }
+                self.stats.hits += p.hits as u64;
+                self.stats.misses += p.fills.len() as u64;
+                for &ex in &used {
+                    ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).expect("planned expert resident") * sb) as u64;
+                }
+                vec![used]
+            } else {
+                let (res, miss): (Vec<usize>, Vec<usize>) = used.iter().partition(|&&ex| self.groups[gi].cache.slot(li, ex).is_some());
+                for &ex in &res {
+                    ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).unwrap() * sb) as u64;
+                }
+                let mut waves = vec![res];
+                for (k, wave) in miss.chunks(HALF).enumerate() {
+                    for (j, &ex) in wave.iter().enumerate() {
+                        ptr[ex] = self.stage + (((k % 2) * HALF + j) * self.stage_bytes) as u64;
+                    }
+                    half.push(Some(k % 2));
+                    waves.push(wave.to_vec());
+                }
+                waves
+            };
+            // Routing for every pass, one async copy per layer: a pass is up to `b * kk` gathered
+            // rows of one wave, from the whole span (so each expert sees all its span tokens).
+            // The pinned buffer is free: the router dtoh above waited for the previous layer's copy.
+            let mut passes = vec![]; // (wave, rows, offset of this pass's routing, rows per expert)
+            let mut blob: Vec<u8> = vec![];
+            for (wi, wave) in waves.iter().enumerate() {
+                // (span token, expert, weight), grouped by expert
+                let rows: Vec<(usize, usize, f32)> = wave
+                    .iter()
+                    .flat_map(|&ex| by_expert[ex].iter().map(move |r| (r.0, ex, r.1)))
+                    .collect();
+                for rows in rows.chunks(b * kk) {
+                    let mut off = vec![0i32; t + 1];
+                    for r in rows {
+                        off[r.0 + 1] += 1;
+                    }
+                    for i in 0..t {
+                        off[i + 1] += off[i];
+                    }
+                    let (mut crow, mut cw, mut fill) = (vec![0i32; rows.len()], vec![0f32; rows.len()], off.clone());
+                    for (j, r) in rows.iter().enumerate() {
+                        let k = fill[r.0] as usize;
+                        (crow[k], cw[k]) = (j as i32, r.2);
+                        fill[r.0] += 1;
+                    }
+                    let n_ex = 1 + rows.windows(2).filter(|w| w[0].1 != w[1].1).count();
+                    passes.push((wi, rows.len(), blob.len(), rows.len() / n_ex));
+                    blob.extend(rows.iter().flat_map(|r| (r.0 as i32).to_le_bytes()));
+                    blob.extend(off.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.extend(crow.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.extend(cw.iter().flat_map(|v| v.to_le_bytes()));
+                    blob.resize(blob.len().next_multiple_of(8), 0);
+                    blob.extend(rows.iter().flat_map(|r| ptr[r.1].to_le_bytes()));
+                }
+            }
+            {
+                let m = self.meta_host.as_mut_slice().expect("pinned");
+                m[..blob.len()].copy_from_slice(&blob);
+                unsafe { result::memcpy_htod_async(s.meta, &m[..blob.len()], self.stream.cu_stream()) }.expect("htod async");
+            }
+            let wl = &self.w.layers[li];
+            let down_off = (self.w.expert(wl, 0)[0].len() * 2) as u64;
+            let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
+            // Copy stream: wave k's misses into its half once the half's last reader is done.
+            let upload = |k: usize| {
+                if let Some(Some(hf)) = half.get(k) {
+                    self.copy.wait(&self.free[*hf]).expect("wait");
+                    for (j, &ex) in waves[k].iter().enumerate() {
+                        self.upload_expert(li, ex, self.stage + ((hf * HALF + j) * self.stage_bytes) as u64, &self.copy);
+                    }
+                    self.ready[*hf].record(&self.copy).expect("record");
+                }
+            };
+            upload(1);
+            upload(2);
+            for (wi, _) in waves.iter().enumerate() {
+                if let Some(hf) = half[wi] {
+                    self.stream.wait(&self.ready[hf]).expect("wait");
+                }
+                for &(_, r, o, per_ex) in passes.iter().filter(|p| p.0 == wi) {
+                    let (x, h) = (s.x, s.h);
+                    let gidx = s.meta + o as u64;
+                    let off = gidx + (4 * r) as u64;
+                    let (crow, cw) = (off + (4 * (t + 1)) as u64, off + (4 * (t + 1) + 4 * r) as u64);
+                    let wp = s.meta + (o + 4 * r + 4 * (t + 1) + 8 * r).next_multiple_of(8) as u64;
+                    launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gidx, ei]);
+                    self.mm_ids(wl.gate.ty, wp, 0, wl.gate.row_bytes(), e, xg, gu, 2 * ff, r, per_ex);
+                    let (ffi, ri) = (ff as i32, r as i32);
+                    launch!(self, self.k.swiglu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
+                    self.mm_ids(wl.down.ty, wp, down_off, wl.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
+                    launch!(self, self.k.moe_combine, (t as u32, 1, 1), 256, [x, dbuf, off, crow, cw, ei]);
+                }
+                if let Some(hf) = half[wi] {
+                    self.free[hf].record(&self.stream).expect("record");
+                    upload(wi + 2);
+                }
+            }
+        }
+        self.n_past += t;
+
+        let rows: Vec<(usize, usize)> =
+            if all_logits { (0..t).step_by(LOGIT_ROWS).map(|r0| (r0, LOGIT_ROWS.min(t - r0))).collect() } else { vec![(t - 1, 1)] };
+        let mut out = Vec::with_capacity(rows.iter().map(|r| r.1).sum::<usize>() * nv);
+        for (r0, nr) in rows {
+            let (x, h, wn, nrn) = (at(s.x, r0, e), s.h, self.out_norm, nr as u32);
+            launch!(self, self.k.rmsnorm, (nrn, 1, 1), 256, [h, x, wn, ei, eps]);
+            self.mm(&self.output, h, s.logits, nr);
+            out.extend(self.dtoh(s.logits, nr * nv));
+        }
+        out
+    }
+}
+
+/// Bytes of one layer's routing for a span of `t` tokens in ubatches of `b` (see
+/// `forward_span`): per pass, gidx | off | crow | cw (4 bytes each; off has t + 1 entries),
+/// padding to 8, then wp (8 bytes per row). Passes: at most one partial per wave plus
+/// t * kk / (b * kk) full ones.
+fn meta_bytes(t: usize, b: usize, kk: usize, n_expert: usize) -> usize {
+    let passes = 1 + n_expert.div_ceil(STAGE / 2) + t.div_ceil(b);
+    t * kk * 20 + passes * (4 * (t + 1) + 8)
+}
+
+/// Copy every expert into pinned RAM in slot layout; None (pageable fallback) if pinning fails.
+fn pin_experts(ctx: &Arc<CudaContext>, w: &Weights, total: usize) -> Option<HostExperts> {
+    let t0 = std::time::Instant::now();
+    let mut buf = match unsafe { ctx.alloc_pinned_with_flags::<u8>(total, 0) } {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("gpu: pinning {} MiB of experts failed ({e:?}), using pageable copies", total >> 20);
+            return None;
+        }
+    };
+    let (mut base, mut off) = (vec![], 0);
+    for l in &w.layers {
+        base.push(off);
+        off += w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>() * w.hp.n_expert;
+    }
+    let dst = buf.as_mut_slice().expect("pinned");
+    let mut chunks = vec![];
+    let mut rest = &mut dst[..];
+    for l in &w.layers {
+        for ex in 0..w.hp.n_expert {
+            let parts = w.expert(l, ex);
+            let (c, r) = rest.split_at_mut(parts.iter().map(|b| b.len()).sum());
+            chunks.push((c, parts));
+            rest = r;
+        }
+    }
+    chunks.into_par_iter().for_each(|(c, parts)| {
+        let mut o = 0;
+        for b in parts {
+            c[o..o + b.len()].copy_from_slice(b);
+            o += b.len();
+        }
+    });
+    log::info!("gpu: pinned {} MiB of experts in {:.1}s", total >> 20, t0.elapsed().as_secs_f32());
+    Some(HostExperts { buf, base })
+}
+
+fn check_ty(t: &TensorInfo) -> Result<(), String> {
+    match t.ty {
+        GgmlType::F32 | GgmlType::Q4_K | GgmlType::Q6_K => Ok(()),
+        ty => Err(format!("{}: {ty:?} has no CUDA matmul kernel yet", t.name)),
+    }
+}
+
+impl Engine for GpuModel {
+    fn n_vocab(&self) -> usize {
+        self.w.hp.n_vocab
+    }
+
+    fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+
+    fn truncate(&mut self, n_past: usize) {
+        self.n_past = self.n_past.min(n_past);
+    }
+
+    /// Panics if the KV cache would overflow n_ctx.
+    fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.check_ctx(tokens.len());
+        tokens.chunks(self.span).flat_map(|c| self.forward_span(c, true)).collect()
+    }
+
+    fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.check_ctx(tokens.len());
+        let n = tokens.len().div_ceil(self.span);
+        let mut last = vec![];
+        for (i, c) in tokens.chunks(self.span).enumerate() {
+            last = self.forward_span(c, false);
+            if i + 1 < n {
+                last.clear();
+            }
+        }
+        last
+    }
+}
+//! HTTP API, wire-compatible with llama-server for the endpoints Claude Code and Codex use:
+//! POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses), /v1/messages/count_tokens;
+//! GET /v1/models, /health. Event sequences and JSON shapes follow llama-server
+//! (tools/server/server-task.cpp); tests/golden/api.json holds captured oracle traffic.
+//!
+//! Both APIs are converted to OpenAI chat messages, rendered with the GGUF chat template and run
+//! on one model thread, which owns the engine (CUDA work stays on the thread that created it).
+
+use crate::generate::{Finish, Generator, Sampling, Utf8Stream};
+use crate::qwen3moe::Engine;
+use crate::template::ChatTemplate;
+use crate::tokenizer::Tokenizer;
+use crate::toolcall::{Splitter, ToolCall};
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use tokio::sync::mpsc as tmpsc;
+
+/// A generation request for the model thread.
+struct Job {
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    sampling: Sampling,
+    tx: tmpsc::UnboundedSender<Gen>,
+}
+
+enum Gen {
+    Started { n_cached: usize },
+    Token(u32),
+    Done(Finish),
+}
+
+pub struct App {
+    tok: Tokenizer,
+    tpl: ChatTemplate,
+    jobs: mpsc::Sender<Job>,
+    alias: String,
+    n_ctx: usize,
+}
+
+impl App {
+    /// Start the model thread; `load` builds the engine on it.
+    pub fn new<E: Engine + 'static>(
+        tok: Tokenizer,
+        tpl: ChatTemplate,
+        alias: String,
+        load: impl FnOnce() -> Result<E, String> + Send + 'static,
+    ) -> Result<Arc<Self>, String> {
+        // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
+        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"].iter().filter_map(|t| tok.token_id(t)).collect();
+        eog.push(tok.eos);
+        let (jobs, rx) = mpsc::channel::<Job>();
+        let (ready_tx, ready) = mpsc::channel();
+        let eog_t = eog;
+        std::thread::Builder::new()
+            .name("eomoe-model".into())
+            .spawn(move || {
+                let mut g = match load() {
+                    Ok(e) => {
+                        ready_tx.send(Ok(e.n_ctx())).ok();
+                        Generator::new(e)
+                    }
+                    Err(e) => return drop(ready_tx.send(Err(e))),
+                };
+                for job in rx {
+                    model_job(&mut g, job, &eog_t);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let n_ctx = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx }))
+    }
+}
+
+// ponytail: one model thread runs jobs in arrival order (llama-server --parallel 1); the queue is
+// unbounded. Continuous batching across requests is Phase 6.
+fn model_job<E: Engine>(g: &mut Generator<E>, job: Job, eog: &[u32]) {
+    let tx = job.tx;
+    let n_cached = g.reusable(&job.prompt);
+    if tx.send(Gen::Started { n_cached }).is_err() {
+        return;
+    }
+    let (t0, mut t1, mut n) = (std::time::Instant::now(), None, 0usize);
+    let r = g.generate(&job.prompt, job.max_tokens, &job.sampling, |t| eog.contains(&t), |t| {
+        t1.get_or_insert_with(std::time::Instant::now);
+        n += 1;
+        tx.send(Gen::Token(t)).is_ok()
+    });
+    // A request that panics the engine kills this thread; its stream reports an error and later
+    // requests get "model thread stopped".
+    let t1 = t1.unwrap_or_else(std::time::Instant::now);
+    let (pre, dec) = (t1 - t0, t1.elapsed());
+    let n_new = job.prompt.len() - n_cached;
+    log::info!(
+        "prompt {} tok ({} cached), prefill {:.1}s ({:.0} tok/s), {} out ({:.1} tok/s), {:?}",
+        job.prompt.len(), n_cached, pre.as_secs_f32(), n_new as f32 / pre.as_secs_f32(), n,
+        n.saturating_sub(1) as f32 / dec.as_secs_f32().max(1e-6), r.as_ref().map(|x| x.0)
+    );
+    if let Ok((finish, _)) = r {
+        tx.send(Gen::Done(finish)).ok();
+    }
+}
+
+/// One chat request in the internal (OpenAI chat) form.
+struct Chat {
+    messages: Value,
+    tools: Value,
+    max_tokens: usize,
+    sampling: Sampling,
+    stop: Vec<String>,
+}
+
+/// What a request's stream carries to the API formatter.
+enum Out {
+    Start { n_prompt: usize, n_cached: usize },
+    Text(String),
+    End { calls: Vec<ToolCall>, finish: Finish, n_out: usize, stop_word: Option<String> },
+    /// Generation failed after the response started.
+    Error(Value),
+}
+
+#[derive(Debug)]
+struct ApiError(StatusCode, Value);
+
+impl ApiError {
+    fn new(code: StatusCode, ty: &str, msg: impl Into<String>) -> Self {
+        Self(code, json!({"code": code.as_u16(), "message": msg.into(), "type": ty}))
+    }
+    fn bad(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+fn rand_id() -> String {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let mut x = t ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E3779B97F4A7C15) | 1;
+    const A: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    (0..32)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            A[(x % 62) as usize] as char
+        })
+        .collect()
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Content-part arrays become one string (parts joined by "\n", as llama.cpp does for
+/// string-only templates); non-text parts are dropped.
+fn flatten_content(messages: &mut Value) {
+    for m in messages.as_array_mut().into_iter().flatten() {
+        if let Some(parts) = m.get("content").and_then(Value::as_array) {
+            let text: Vec<&str> = parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect();
+            m["content"] = text.join("\n").into();
+        }
+    }
+}
+
+impl App {
+    fn prompt(&self, chat: &Chat) -> Result<Vec<u32>, ApiError> {
+        let mut messages = chat.messages.clone();
+        flatten_content(&mut messages);
+        let mut req = json!({ "messages": messages, "add_generation_prompt": true });
+        if chat.tools.as_array().is_some_and(|t| !t.is_empty()) {
+            req["tools"] = chat.tools.clone();
+        }
+        let text = self.tpl.render(&req).map_err(|e| ApiError::bad(format!("chat template: {e}")))?;
+        Ok(self.tok.encode(&text, true))
+    }
+
+    /// Queue `chat` on the model thread; the receiver yields Start, Text..., End.
+    fn run(self: &Arc<Self>, chat: Chat) -> Result<tmpsc::UnboundedReceiver<Out>, ApiError> {
+        let prompt = self.prompt(&chat)?;
+        if prompt.len() >= self.n_ctx {
+            let mut e = ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "exceed_context_size_error",
+                format!("request ({} tokens) exceeds the available context size ({} tokens), try increasing it", prompt.len(), self.n_ctx),
+            );
+            e.1["n_prompt_tokens"] = prompt.len().into();
+            e.1["n_ctx"] = self.n_ctx.into();
+            return Err(e);
+        }
+        let (gtx, mut grx) = tmpsc::unbounded_channel();
+        let (otx, orx) = tmpsc::unbounded_channel();
+        let n_prompt = prompt.len();
+        let job = Job { prompt, max_tokens: chat.max_tokens, sampling: chat.sampling, tx: gtx };
+        self.jobs.send(job).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
+        let app = self.clone();
+        let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
+        tokio::spawn(async move {
+            let (mut utf8, mut split, mut n_out) = (Utf8Stream::default(), Splitter::new(has_tools), 0);
+            let mut stops = StopMatcher::new(chat.stop);
+            let mut finish = None;
+            while let Some(g) = grx.recv().await {
+                match g {
+                    Gen::Started { n_cached } => drop(otx.send(Out::Start { n_prompt, n_cached })),
+                    Gen::Token(t) => {
+                        if otx.is_closed() {
+                            return; // client gone: dropping grx stops the model
+                        }
+                        n_out += 1;
+                        let (text, hit) = stops.push(&utf8.push(&app.tok.decode_bytes(&[t])));
+                        let text = split.push(&text);
+                        if !text.is_empty() {
+                            otx.send(Out::Text(text)).ok();
+                        }
+                        if hit {
+                            finish = Some(Finish::Stop);
+                            break;
+                        }
+                    }
+                    Gen::Done(f) => finish = Some(f),
+                }
+            }
+            let Some(finish) = finish else {
+                let e = ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "generation failed (see server log)");
+                otx.send(Out::Error(e.1)).ok();
+                return;
+            };
+            let (rest, calls) = split.finish(&chat.tools);
+            let tail = stops.flush();
+            let text = rest + &if calls.is_empty() { tail } else { String::new() };
+            if !text.is_empty() {
+                otx.send(Out::Text(text)).ok();
+            }
+            otx.send(Out::End { calls, finish, n_out, stop_word: stops.hit }).ok();
+        });
+        Ok(orx)
+    }
+}
+
+/// Cuts generated text at the first stop string, holding back partial matches.
+struct StopMatcher {
+    stops: Vec<String>,
+    held: String,
+    hit: Option<String>,
+}
+
+impl StopMatcher {
+    fn new(stops: Vec<String>) -> Self {
+        Self { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), held: String::new(), hit: None }
+    }
+
+    /// (text safe to emit, whether a stop string was found).
+    fn push(&mut self, delta: &str) -> (String, bool) {
+        self.held.push_str(delta);
+        if let Some((p, s)) = self.stops.iter().filter_map(|s| self.held.find(s.as_str()).map(|p| (p, s))).min_by_key(|x| x.0) {
+            self.hit = Some(s.clone());
+            let out = self.held[..p].to_owned();
+            self.held.clear();
+            return (out, true);
+        }
+        let held = &self.held;
+        let keep = self.stops.iter().flat_map(|s| (1..s.len()).filter(move |&n| s.is_char_boundary(n) && held.ends_with(&s[..n]))).max().unwrap_or(0);
+        let cut = self.held.len() - keep;
+        let out = self.held[..cut].to_owned();
+        self.held.drain(..cut);
+        (out, false)
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+fn sampling(body: &Value) -> Sampling {
+    let d = Sampling::default();
+    let f = |k: &str, v: f32| body[k].as_f64().map_or(v, |x| x as f32);
+    Sampling {
+        temperature: f("temperature", d.temperature).max(0.0),
+        top_p: f("top_p", d.top_p).clamp(0.0, 1.0),
+        min_p: f("min_p", d.min_p).clamp(0.0, 1.0),
+        top_k: body["top_k"].as_u64().map_or(d.top_k, |k| k as usize),
+        seed: body["seed"].as_u64().unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 | 1),
+    }
+}
+
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter(|p| p["type"] == "text").filter_map(|p| p["text"].as_str()).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Anthropic Messages -> chat (llama.cpp server-chat.cpp convert_anthropic_to_oai).
+fn anthropic_to_chat(b: &Value) -> Result<Chat, ApiError> {
+    let mut msgs = vec![];
+    if !b["system"].is_null() {
+        msgs.push(json!({"role": "system", "content": text_of(&b["system"])}));
+    }
+    for m in b["messages"].as_array().ok_or_else(|| ApiError::bad("'messages' is required"))? {
+        let role = m["role"].as_str().unwrap_or("user");
+        let Some(blocks) = m["content"].as_array() else {
+            if !m["content"].is_null() || role != "assistant" {
+                msgs.push(m.clone());
+            }
+            continue;
+        };
+        let (mut parts, mut calls, mut tools) = (vec![], vec![], vec![]);
+        for bl in blocks {
+            match bl["type"].as_str() {
+                Some("text") => parts.push(json!({"type": "text", "text": bl["text"]})),
+                Some("tool_use") => calls.push(json!({"id": bl["id"], "type": "function", "function": {"name": bl["name"], "arguments": bl["input"].to_string()}})),
+                Some("tool_result") => tools.push(json!({"role": "tool", "tool_call_id": bl["tool_use_id"], "content": text_of(&bl["content"])})),
+                _ => {}
+            }
+        }
+        if !parts.is_empty() || !calls.is_empty() {
+            let mut msg = json!({"role": role, "content": if parts.is_empty() { json!("") } else { json!(parts) }});
+            if !calls.is_empty() {
+                msg["tool_calls"] = calls.into();
+            }
+            msgs.push(msg);
+        }
+        msgs.extend(tools);
+    }
+    let tools: Vec<Value> = b["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["name"].is_string())
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"].as_str().unwrap_or(""), "parameters": if t["input_schema"].is_null() { json!({}) } else { t["input_schema"].clone() }}}))
+        .collect();
+    Ok(Chat {
+        messages: msgs.into(),
+        tools: tools.into(),
+        max_tokens: b["max_tokens"].as_u64().unwrap_or(4096) as usize,
+        sampling: sampling(b),
+        stop: b["stop_sequences"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+    })
+}
+
+/// OpenAI Responses -> chat (llama.cpp server-chat.cpp convert_responses_to_chatcmpl).
+fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
+    if b["input"].is_null() {
+        return Err(ApiError::bad("'input' is required"));
+    }
+    if b["previous_response_id"].as_str().is_some_and(|s| !s.is_empty()) {
+        return Err(ApiError::bad("eomoe does not support 'previous_response_id'."));
+    }
+    let mut msgs: Vec<Value> = vec![];
+    if let Some(i) = b["instructions"].as_str() {
+        msgs.push(json!({"role": "system", "content": i}));
+    }
+    match &b["input"] {
+        Value::String(s) => msgs.push(json!({"role": "user", "content": s})),
+        Value::Array(items) => {
+            for it in items {
+                let merge = msgs.last().is_some_and(|m| m["role"] == "assistant");
+                let content = match &it["content"] {
+                    Value::String(s) => json!([{"type": "input_text", "text": s}]),
+                    c => c.clone(),
+                };
+                let parts = |c: &Value| -> Vec<Value> {
+                    c.as_array().into_iter().flatten().filter_map(|p| p["text"].as_str()).map(|t| json!({"type": "text", "text": t})).collect()
+                };
+                let role = it["role"].as_str().unwrap_or("");
+                let ty = it["type"].as_str().unwrap_or("");
+                if matches!(role, "user" | "system" | "developer") && content.is_array() {
+                    msgs.push(json!({"role": role, "content": parts(&content)}));
+                } else if role == "assistant" && ty == "message" {
+                    if merge {
+                        let last = msgs.last_mut().unwrap();
+                        let mut c = last["content"].as_array().cloned().unwrap_or_default();
+                        c.extend(parts(&content));
+                        last["content"] = c.into();
+                    } else {
+                        msgs.push(json!({"role": "assistant", "content": parts(&content)}));
+                    }
+                } else if ty == "function_call" {
+                    let tc = json!({"id": it["call_id"], "type": "function", "function": {"name": it["name"], "arguments": it["arguments"]}});
+                    if merge {
+                        let last = msgs.last_mut().unwrap();
+                        let mut c = last["tool_calls"].as_array().cloned().unwrap_or_default();
+                        c.push(tc);
+                        last["tool_calls"] = c.into();
+                    } else {
+                        msgs.push(json!({"role": "assistant", "tool_calls": [tc]}));
+                    }
+                } else if ty == "function_call_output" {
+                    msgs.push(json!({"role": "tool", "tool_call_id": it["call_id"], "content": text_of_output(&it["output"])}));
+                } else if ty == "reasoning" {
+                    // No reasoning in Qwen3-Coder's template.
+                } else {
+                    return Err(ApiError::bad("Cannot determine type of 'item'"));
+                }
+            }
+        }
+        _ => return Err(ApiError::bad("'input' must be a string or an array")),
+    }
+    let tools: Vec<Value> = b["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|t| t["type"] == "function")
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"], "strict": t.get("strict").cloned().unwrap_or(json!(true))}}))
+        .collect();
+    Ok(Chat {
+        messages: msgs.into(),
+        tools: tools.into(),
+        // No limit by default, as llama-server: generation stops at EOG or a full context.
+        max_tokens: b["max_output_tokens"].as_u64().map_or(usize::MAX, |n| n as usize),
+        sampling: sampling(b),
+        stop: vec![],
+    })
+}
+
+fn text_of_output(v: &Value) -> Value {
+    match v {
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<String>().into(),
+        v => v.clone(),
+    }
+}
+
+/// One SSE event: `event: <type>` + data, as llama-server writes them.
+fn sse(data: Value) -> String {
+    format!("event: {}\ndata: {data}\n\n", data["type"].as_str().unwrap_or(""))
+}
+
+/// Formats a request's `Out` stream for one API, both streamed and as the final body.
+trait Format: Send + 'static {
+    fn on(&mut self, out: &Out) -> Vec<String>;
+    fn body(&self) -> Value;
+}
+
+#[derive(Default)]
+struct Acc {
+    text: String,
+    calls: Vec<(String, ToolCall)>,
+    n_prompt: usize,
+    n_cached: usize,
+    n_out: usize,
+    finish: Option<Finish>,
+    stop_word: Option<String>,
+}
+
+impl Acc {
+    fn on(&mut self, out: &Out) {
+        match out {
+            Out::Start { n_prompt, n_cached } => (self.n_prompt, self.n_cached) = (*n_prompt, *n_cached),
+            Out::Text(t) => self.text += t,
+            Out::End { calls, finish, n_out, stop_word } => {
+                self.calls = calls.iter().map(|c| (rand_id(), c.clone())).collect();
+                (self.finish, self.n_out, self.stop_word) = (Some(*finish), *n_out, stop_word.clone());
+            }
+            Out::Error(_) => {}
+        }
+    }
+}
+
+struct Anthropic {
+    id: String,
+    model: String,
+    a: Acc,
+    text_open: bool,
+}
+
+impl Anthropic {
+    fn stop_reason(&self) -> &'static str {
+        match self.a.finish {
+            Some(Finish::Length) => "max_tokens",
+            _ if !self.a.calls.is_empty() => "tool_use",
+            _ => "end_turn",
+        }
+    }
+    fn usage(&self) -> Value {
+        json!({"cache_read_input_tokens": self.a.n_cached, "input_tokens": self.a.n_prompt - self.a.n_cached, "output_tokens": self.a.n_out})
+    }
+}
+
+impl Format for Anthropic {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        match out {
+            Out::Start { .. } => {
+                let mut u = self.usage();
+                u["output_tokens"] = 0.into();
+                vec![sse(json!({"type": "message_start", "message": {"id": self.id, "type": "message", "role": "assistant", "content": [], "model": self.model, "stop_reason": null, "stop_sequence": null, "usage": u}}))]
+            }
+            Out::Text(t) => {
+                let mut v = vec![];
+                if !self.text_open {
+                    self.text_open = true;
+                    v.push(sse(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
+                }
+                v.push(sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}})));
+                v
+            }
+            Out::End { .. } => {
+                let base = self.text_open as usize;
+                let mut v = vec![];
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    v.push(sse(json!({"type": "content_block_start", "index": base + k, "content_block": {"type": "tool_use", "id": id, "name": c.name}})));
+                    v.push(sse(json!({"type": "content_block_delta", "index": base + k, "delta": {"type": "input_json_delta", "partial_json": c.arguments}})));
+                }
+                for i in 0..base + self.a.calls.len() {
+                    v.push(sse(json!({"type": "content_block_stop", "index": i})));
+                }
+                v.push(sse(json!({"type": "message_delta", "delta": {"stop_reason": self.stop_reason(), "stop_sequence": self.a.stop_word}, "usage": {"output_tokens": self.a.n_out}})));
+                v.push(sse(json!({"type": "message_stop"})));
+                v
+            }
+            Out::Error(e) => vec![format!("event: error\ndata: {e}\n\n")],
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut content = vec![];
+        if !self.a.text.is_empty() {
+            content.push(json!({"type": "text", "text": self.a.text}));
+        }
+        for (id, c) in &self.a.calls {
+            let input: Value = serde_json::from_str(&c.arguments).unwrap_or(json!({}));
+            content.push(json!({"type": "tool_use", "id": id, "name": c.name, "input": input}));
+        }
+        json!({"id": self.id, "type": "message", "role": "assistant", "content": content, "model": self.model, "stop_reason": self.stop_reason(), "stop_sequence": self.a.stop_word, "usage": self.usage()})
+    }
+}
+
+struct Responses {
+    id: String,
+    msg_id: String,
+    model: String,
+    created: u64,
+    a: Acc,
+    text_open: bool,
+}
+
+impl Responses {
+    fn msg_item(&self) -> Value {
+        json!({"type": "message", "status": "completed", "id": self.msg_id, "content": [self.part()], "role": "assistant"})
+    }
+    fn part(&self) -> Value {
+        json!({"type": "output_text", "annotations": [], "logprobs": [], "text": self.a.text})
+    }
+    fn fc_item(id: &str, c: &ToolCall) -> Value {
+        json!({"id": format!("fc_{id}"), "type": "function_call", "status": "completed", "arguments": c.arguments, "call_id": format!("call_{id}"), "name": c.name})
+    }
+    fn output(&self) -> Vec<Value> {
+        let mut o = vec![];
+        if self.text_open {
+            o.push(self.msg_item());
+        }
+        o.extend(self.a.calls.iter().map(|(id, c)| Self::fc_item(id, c)));
+        o
+    }
+    fn usage(&self) -> Value {
+        json!({"input_tokens": self.a.n_prompt, "output_tokens": self.a.n_out, "total_tokens": self.a.n_prompt + self.a.n_out, "input_tokens_details": {"cached_tokens": self.a.n_cached}})
+    }
+}
+
+impl Format for Responses {
+    fn on(&mut self, out: &Out) -> Vec<String> {
+        self.a.on(out);
+        let ix = |s: &Self| json!({"item_id": s.msg_id, "output_index": 0, "content_index": 0});
+        let with = |mut base: Value, ty: &str, extra: Value| {
+            base["type"] = ty.into();
+            for (k, v) in extra.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            sse(base)
+        };
+        match out {
+            Out::Start { .. } => {
+                let r = json!({"id": self.id, "object": "response", "status": "in_progress"});
+                vec![sse(json!({"type": "response.created", "response": r})), sse(json!({"type": "response.in_progress", "response": r}))]
+            }
+            Out::Text(t) => {
+                let mut v = vec![];
+                if !self.text_open {
+                    self.text_open = true;
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": 0, "item": {"content": [], "id": self.msg_id, "role": "assistant", "status": "in_progress", "type": "message"}})));
+                    v.push(with(ix(self), "response.content_part.added", json!({"part": {"type": "output_text", "text": ""}})));
+                }
+                v.push(with(ix(self), "response.output_text.delta", json!({"delta": t})));
+                v
+            }
+            Out::End { .. } => {
+                let base = self.text_open as usize;
+                let mut v = vec![];
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    let fc = format!("fc_{id}");
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": base + k, "item": {"id": fc, "arguments": "", "call_id": format!("call_{id}"), "name": c.name, "type": "function_call", "status": "in_progress"}})));
+                    v.push(sse(json!({"type": "response.function_call_arguments.delta", "delta": c.arguments, "item_id": fc, "output_index": base + k})));
+                }
+                if self.text_open {
+                    v.push(with(ix(self), "response.output_text.done", json!({"text": self.a.text})));
+                    v.push(with(ix(self), "response.content_part.done", json!({"part": self.part()})));
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": 0, "item": self.msg_item()})));
+                }
+                for (k, (id, c)) in self.a.calls.iter().enumerate() {
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": base + k, "item": Self::fc_item(id, c)})));
+                }
+                v.push(sse(json!({"type": "response.completed", "response": {"id": self.id, "object": "response", "created_at": self.created, "status": "completed", "model": self.model, "output": self.output(), "usage": self.usage()}})));
+                v
+            }
+            Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
+        }
+    }
+
+    fn body(&self) -> Value {
+        json!({"completed_at": now(), "created_at": self.created, "id": self.id, "model": self.model, "object": "response", "output": self.output(), "status": "completed", "usage": self.usage()})
+    }
+}
+
+/// Stream the formatted events, or collect them into the final JSON body.
+async fn respond(rx: Result<tmpsc::UnboundedReceiver<Out>, ApiError>, mut f: impl Format, stream: bool) -> Response {
+    let mut rx = match rx {
+        Ok(rx) => rx,
+        Err(e) => return e.into_response(),
+    };
+    if !stream {
+        while let Some(o) = rx.recv().await {
+            if let Out::Error(e) = o {
+                return ApiError(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            }
+            f.on(&o);
+        }
+        return Json(f.body()).into_response();
+    }
+    let (tx, srx) = tmpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(o) = rx.recv().await {
+            for e in f.on(&o) {
+                if tx.send(e).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    // llama-server sends an SSE comment after 30 s without data, so a long prefill does not trip
+    // client idle timeouts.
+    let body = futures_util::stream::unfold(srx, |mut r| async move {
+        let s = match tokio::time::timeout(std::time::Duration::from_secs(30), r.recv()).await {
+            Ok(s) => s?,
+            Err(_) => ":\n\n".to_owned(),
+        };
+        Some((Ok::<_, std::convert::Infallible>(s), r))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .unwrap()
+}
+
+/// The request JSON; a malformed body gets llama-server's error shape, not axum's plain text.
+fn parse(body: &[u8]) -> Result<Value, ApiError> {
+    serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON body: {e}")))
+}
+
+async fn messages(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let f = Anthropic { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), a: Acc::default(), text_open: false };
+    let rx = anthropic_to_chat(&b).and_then(|c| app.run(c));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
+async fn responses(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let b = match parse(&body) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    let f = Responses { id: format!("resp_{}", rand_id()), msg_id: format!("msg_{}", rand_id()), model: app.alias.clone(), created: now(), a: Acc::default(), text_open: false };
+    let rx = responses_to_chat(&b).and_then(|c| app.run(c));
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
+}
+
+async fn count_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    match parse(&body).and_then(|b| anthropic_to_chat(&b)).and_then(|c| app.prompt(&c)) {
+        Ok(p) => Json(json!({"input_tokens": p.len()})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn input_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    match parse(&body).and_then(|b| responses_to_chat(&b)).and_then(|c| app.prompt(&c)) {
+        Ok(p) => Json(json!({"input_tokens": p.len(), "object": "response.input_tokens"})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn models(State(app): State<Arc<App>>) -> Json<Value> {
+    let n = &app.alias;
+    Json(json!({
+        "models": [{"name": n, "model": n, "modified_at": "", "size": "", "digest": "", "type": "model", "description": "", "tags": [""], "capabilities": ["completion"], "parameters": "",
+                    "details": {"parent_model": "", "format": "gguf", "family": "", "families": [""], "parameter_size": "", "quantization_level": ""}}],
+        "object": "list",
+        "data": [{"id": n, "aliases": [n], "tags": [], "object": "model", "created": now(), "owned_by": "eomoe", "meta": {"n_vocab": app.tok.n_vocab(), "n_ctx": app.n_ctx}}],
+    }))
+}
+
+pub fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/v1/health", get(|| async { Json(json!({"status": "ok"})) }))
+        .route("/v1/models", get(models))
+        .route("/models", get(models))
+        .route("/v1/messages", post(messages))
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/responses", post(responses))
+        .route("/responses", post(responses))
+        .route("/v1/responses/input_tokens", post(input_tokens))
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
+        .with_state(app)
+}
+
+pub async fn serve(app: Arc<App>, host: &str, port: u16) -> Result<(), String> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await.map_err(|e| format!("{host}:{port}: {e}"))?;
+    log::info!("listening on http://{}", listener.local_addr().map_err(|e| e.to_string())?);
+    axum::serve(listener, router(app)).await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_matcher_cuts_at_stop_and_holds_partials() {
+        let mut m = StopMatcher::new(vec!["END".into(), "".into()]);
+        assert_eq!(m.push("abc E"), ("abc ".into(), false));
+        assert_eq!(m.push("Nx"), ("ENx".into(), false)); // partial match released
+        assert_eq!(m.push("yy EN"), ("yy ".into(), false));
+        assert_eq!(m.push("D tail"), ("".into(), true));
+        assert_eq!(m.hit.as_deref(), Some("END"));
+        let mut m = StopMatcher::new(vec![]);
+        assert_eq!(m.push("é"), ("é".into(), false));
+    }
+
+    #[test]
+    fn anthropic_tool_results_follow_the_user_text() {
+        let b = json!({"system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "messages": [
+            {"role": "assistant", "content": [{"type": "text", "text": "x"}, {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"c": 1}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "o1"}, {"type": "text", "text": "o2"}]}, {"type": "text", "text": "q"}]}]});
+        let c = anthropic_to_chat(&b).unwrap();
+        let m = c.messages.as_array().unwrap();
+        assert_eq!(m[0], json!({"role": "system", "content": "ab"}));
+        assert_eq!(m[1]["tool_calls"][0]["function"]["arguments"], r#"{"c":1}"#);
+        assert_eq!((m[2]["role"].as_str(), m[3]["role"].as_str(), m[3]["content"].as_str()), (Some("user"), Some("tool"), Some("o1o2")));
+        assert_eq!(c.max_tokens, 4096);
+    }
+
+    #[test]
+    fn responses_function_calls_merge_into_the_assistant_turn() {
+        let b = json!({"instructions": "sys", "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "done"}]});
+        let m = responses_to_chat(&b).unwrap().messages;
+        assert_eq!(m.as_array().unwrap().len(), 4);
+        assert_eq!(m[2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(m[3], json!({"role": "tool", "tool_call_id": "c1", "content": "done"}));
+        assert!(responses_to_chat(&json!({"input": [{"type": "bogus"}]})).is_err());
+    }
+}
+//! CPU reference forward pass for qwen3moe (mirrors llama.cpp src/models/qwen3moe.cpp).
+//! f32 activations and KV cache. This is the correctness baseline the CUDA engine is
+//! checked against, and later the CPU fallback for experts missing from VRAM.
+
+use crate::gguf::{Gguf, TensorInfo};
+use crate::quant::{dequant_row, dot, matmul};
+use crate::qwen3moe::{route, Engine, Weights};
+use rayon::prelude::*;
+
+pub struct CpuModel {
+    pub w: Weights,
+    /// Per layer: K and V, each n_past x (n_head_kv * head_dim).
+    kv: Vec<(Vec<f32>, Vec<f32>)>,
+    n_past: usize,
+}
+
+pub fn rmsnorm(x: &mut [f32], w: &[f32], eps: f32) {
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let s = 1.0 / (ms + eps).sqrt();
+    for (v, w) in x.iter_mut().zip(w) {
+        *v = *v * s * w;
+    }
+}
+
+impl CpuModel {
+    pub fn new(g: Gguf) -> Result<Self, String> {
+        let w = Weights::load(g)?;
+        Ok(Self { kv: (0..w.hp.n_layer).map(|_| (vec![], vec![])).collect(), w, n_past: 0 })
+    }
+
+    fn mm(&self, t: &TensorInfo, x: &[f32]) -> Vec<f32> {
+        let k = t.dims[0] as usize;
+        let n = t.size / t.row_bytes();
+        let mut out = vec![0f32; x.len() / k * n];
+        matmul(t.ty, self.w.g.data(t), k, x, &mut out);
+        out
+    }
+}
+
+impl Engine for CpuModel {
+    fn n_vocab(&self) -> usize {
+        self.w.hp.n_vocab
+    }
+
+    fn n_ctx(&self) -> usize {
+        usize::MAX
+    }
+
+    fn truncate(&mut self, n_past: usize) {
+        let kvd = self.w.hp.n_head_kv * self.w.hp.head_dim;
+        for (k, v) in &mut self.kv {
+            k.truncate(n_past * kvd);
+            v.truncate(n_past * kvd);
+        }
+        self.n_past = self.n_past.min(n_past);
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let (g, hp) = (&self.w.g, &self.w.hp);
+        let (e, hd, nh, nkv) = (hp.n_embd, hp.head_dim, hp.n_head, hp.n_head_kv);
+        let t_n = tokens.len();
+
+        let mut x = vec![0f32; t_n * e];
+        for (row, &tok) in x.chunks_exact_mut(e).zip(tokens) {
+            dequant_row(self.w.tok_embd.ty, g.row(&self.w.tok_embd, tok as usize), row);
+        }
+
+        // NEOX rope tables: theta_i = base^(-2i/hd), rotating pairs (i, i + hd/2).
+        let half = hd / 2;
+        let inv_freq: Vec<f32> = (0..half).map(|i| hp.rope_base.powf(-2.0 * i as f32 / hd as f32)).collect();
+        let rope = |v: &mut [f32], pos: usize| {
+            for i in 0..half {
+                let (s, c) = (pos as f32 * inv_freq[i]).sin_cos();
+                let (a, b) = (v[i], v[i + half]);
+                v[i] = a * c - b * s;
+                v[i + half] = a * s + b * c;
+            }
+        };
+
+        for li in 0..hp.n_layer {
+            let l = &self.w.layers[li];
+
+            // --- attention ---
+            let mut h = x.clone();
+            let w = g.f32s(&l.attn_norm);
+            h.chunks_exact_mut(e).for_each(|r| rmsnorm(r, w, hp.eps));
+            let mut q = self.mm(&l.wq, &h);
+            let mut k = self.mm(&l.wk, &h);
+            let v = self.mm(&l.wv, &h);
+            let (qn, kn) = (g.f32s(&l.q_norm), g.f32s(&l.k_norm));
+            for (ti, (qr, kr)) in q.chunks_exact_mut(nh * hd).zip(k.chunks_exact_mut(nkv * hd)).enumerate() {
+                let pos = self.n_past + ti;
+                for hv in qr.chunks_exact_mut(hd) {
+                    rmsnorm(hv, qn, hp.eps);
+                    rope(hv, pos);
+                }
+                for hv in kr.chunks_exact_mut(hd) {
+                    rmsnorm(hv, kn, hp.eps);
+                    rope(hv, pos);
+                }
+            }
+            // The KV cache holds f16, as llama.cpp's default (and the GPU engine) does.
+            let f16 = |x: &f32| half::f16::from_f32(*x).to_f32();
+            let (kc, vc) = &mut self.kv[li];
+            kc.extend(k.iter().map(f16));
+            vc.extend(v.iter().map(f16));
+            let (kc, vc) = (&*kc, &*vc);
+
+            let scale = 1.0 / (hd as f32).sqrt();
+            let group = nh / nkv;
+            let n_past = self.n_past;
+            let mut attn = vec![0f32; t_n * nh * hd];
+            attn.par_chunks_mut(hd).enumerate().for_each(|(idx, out)| {
+                let (ti, hq) = (idx / nh, idx % nh);
+                let hk = hq / group;
+                let qv = &q[(ti * nh + hq) * hd..][..hd];
+                let n_ctx = n_past + ti + 1; // causal
+                let mut sc: Vec<f32> = (0..n_ctx).map(|p| dot(qv, &kc[(p * nkv + hk) * hd..][..hd]) * scale).collect();
+                let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for s in &mut sc {
+                    *s = (*s - m).exp();
+                    sum += *s;
+                }
+                for (p, s) in sc.iter().enumerate() {
+                    let vv = &vc[(p * nkv + hk) * hd..][..hd];
+                    let wgt = s / sum;
+                    for (o, vx) in out.iter_mut().zip(vv) {
+                        *o += wgt * vx;
+                    }
+                }
+            });
+            let o = self.mm(&l.wo, &attn);
+            x.iter_mut().zip(&o).for_each(|(a, b)| *a += b);
+
+            // --- MoE FFN ---
+            let mut h = x.clone();
+            let w = g.f32s(&l.ffn_norm);
+            h.chunks_exact_mut(e).for_each(|r| rmsnorm(r, w, hp.eps));
+            let logits = self.mm(&l.router, &h); // T x n_expert
+            let mut assign: Vec<Vec<(usize, f32)>> = vec![vec![]; hp.n_expert]; // expert -> (token, weight)
+            for (ti, sel) in route(&logits, hp.n_expert, hp.n_expert_used).into_iter().enumerate() {
+                for (ex, wgt) in sel {
+                    assign[ex].push((ti, wgt));
+                }
+            }
+            let ff = hp.n_ff_exp;
+            let mut moe = vec![0f32; t_n * e];
+            for (ex, toks) in assign.iter().enumerate() {
+                if toks.is_empty() {
+                    continue;
+                }
+                let xin: Vec<f32> = toks.iter().flat_map(|&(ti, _)| h[ti * e..(ti + 1) * e].iter().copied()).collect();
+                let n = toks.len();
+                let [gb, ub, db] = self.w.expert(l, ex);
+                let mut g_ = vec![0f32; n * ff];
+                let mut u_ = vec![0f32; n * ff];
+                matmul(l.gate.ty, gb, e, &xin, &mut g_);
+                matmul(l.up.ty, ub, e, &xin, &mut u_);
+                for (gv, uv) in g_.iter_mut().zip(&u_) {
+                    *gv = *gv / (1.0 + (-*gv).exp()) * uv; // silu(gate) * up
+                }
+                let mut d_ = vec![0f32; n * e];
+                matmul(l.down.ty, db, ff, &g_, &mut d_);
+                for (j, &(ti, wgt)) in toks.iter().enumerate() {
+                    for (a, b) in moe[ti * e..(ti + 1) * e].iter_mut().zip(&d_[j * e..(j + 1) * e]) {
+                        *a += wgt * b;
+                    }
+                }
+            }
+            x.iter_mut().zip(&moe).for_each(|(a, b)| *a += b);
+        }
+        self.n_past += t_n;
+
+        let w = g.f32s(&self.w.out_norm);
+        x.chunks_exact_mut(e).for_each(|r| rmsnorm(r, w, hp.eps));
+        self.mm(&self.w.output, &x)
+    }
+}
+// eomoe CUDA kernels. Every kernel is a plain extern "C" __global__ taking only pointers
+// and plain values, loaded by name from the fatbin (see src/gpu.rs), so an all-Rust
+// (rust-cuda) module exporting the same names can replace this file.
+// Numerics mirror the CPU reference (src/cpu.rs, src/quant.rs): f32 activations,
+// weights dequantized on the fly from ggml blocks.
+
+#include <stdint.h>
+#include <cuda_fp16.h>
+
+__device__ __forceinline__ float ld_f16(const uint8_t* p) {
+    return __half2float(__ushort_as_half((unsigned short)(p[0] | (p[1] << 8))));
+}
+
+// Sum across the block (blockDim.x a multiple of 32, <= 1024); result valid in all threads.
+__device__ __forceinline__ float block_sum(float v) {
+    __shared__ float part[32];
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    const int w = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __syncthreads();  // part[] may still be read by a previous call
+    if ((threadIdx.x & 31) == 0) part[w] = v;
+    __syncthreads();
+    v = (threadIdx.x < nw) ? part[threadIdx.x] : 0.0f;
+    if (w == 0)
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    if (threadIdx.x == 0) part[0] = v;
+    __syncthreads();
+    return part[0];
+}
+
+// y[t][r] = sum_i W[r][i] * x[t][i] for f32 W. grid (n_rows, T), block multiple of 32.
+extern "C" __global__ void mm_f32(const uint8_t* w, unsigned long long row_bytes, int k,
+                                  const float* x, float* y, int n_rows) {
+    const int r = blockIdx.x, t = blockIdx.y;
+    const float* row = (const float*)(w + (size_t)r * row_bytes);
+    const float* xt = x + (size_t)t * k;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) acc += row[i] * xt[i];
+    acc = block_sum(acc);
+    if (threadIdx.x == 0) y[(size_t)t * n_rows + r] = acc;
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+}
+
+// Quantized matvec: one warp per row, MM_ROWS rows per block; grid (ceil(n_rows/MM_ROWS), T),
+// block 32 * MM_ROWS. Each lane decodes 8 elements of every 256-element super-block.
+#define MM_ROWS 4
+
+// Each dot computes TT tokens at once (x[j] = xt + j*k, j < n): the weights of a super-block
+// are decoded once and reused across the tile. Per token the arithmetic is identical for
+// every TT, so tiled and untiled launches give bit-identical results.
+
+// Q4_K: 144 bytes: d f16, dmin f16, scales[12] (6-bit packed), qs[128]. Lane l: chunk
+// c = l/8 covers elements 64c..64c+63; it takes qs bytes 32c+4s..+3 (s = l%8): low
+// nibbles -> elements 64c+4s..+3 (scale 2c), high nibbles -> 64c+32+4s..+3 (scale 2c+1).
+template <int TT>
+__device__ __forceinline__ void dot_q4_k(const uint8_t* row, const float* xt, int k, int lane, int n, float* out) {
+    const int c = lane >> 3, s = lane & 7;
+    float acc[TT];
+#pragma unroll
+    for (int j = 0; j < TT; j++) acc[j] = 0.0f;
+    for (int sb = 0; sb < k / 256; sb++) {
+        const uint8_t* b = row + sb * 144;
+        const uint8_t* sc = b + 4;
+        const int is = 2 * c;  // is and is + 1, both < 8
+        int s1, m1, s2, m2;
+        if (is < 4) {
+            s1 = sc[is] & 63; m1 = sc[is + 4] & 63;
+            s2 = sc[is + 1] & 63; m2 = sc[is + 5] & 63;
+        } else {
+            s1 = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); m1 = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4);
+            s2 = (sc[is + 5] & 0xF) | ((sc[is - 3] >> 6) << 4); m2 = (sc[is + 5] >> 4) | ((sc[is + 1] >> 6) << 4);
+        }
+        const float d = ld_f16(b), dmin = ld_f16(b + 2);
+        const float d1 = d * s1, mm1 = dmin * m1, d2 = d * s2, mm2 = dmin * m2;
+        const unsigned q = *(const unsigned*)(b + 16 + 32 * c + 4 * s);
+        const float w0 = d1 * (q & 0xF) - mm1, w1 = d1 * ((q >> 8) & 0xF) - mm1;
+        const float w2 = d1 * ((q >> 16) & 0xF) - mm1, w3 = d1 * ((q >> 24) & 0xF) - mm1;
+        const float w4 = d2 * ((q >> 4) & 0xF) - mm2, w5 = d2 * ((q >> 12) & 0xF) - mm2;
+        const float w6 = d2 * ((q >> 20) & 0xF) - mm2, w7 = d2 * (q >> 28) - mm2;
+#pragma unroll
+        for (int j = 0; j < TT; j++) {
+            if (j < n) {
+                const float* xj = xt + (size_t)j * k + sb * 256 + 64 * c + 4 * s;
+                const float4 xl = *(const float4*)xj, xh = *(const float4*)(xj + 32);
+                acc[j] += w0 * xl.x + w1 * xl.y + w2 * xl.z + w3 * xl.w + w4 * xh.x + w5 * xh.y + w6 * xh.z + w7 * xh.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < TT; j++) out[j] = warp_sum(acc[j]);
+}
+
+// Q6_K: 210 bytes: ql[128], qh[64], scales[16] i8, d f16 at 208. Lane l takes position l
+// of each of the 4 quadrants (32 elements) in both 128-element halves.
+template <int TT>
+__device__ __forceinline__ void dot_q6_k(const uint8_t* row, const float* xt, int k, int l, int n, float* out) {
+    float acc[TT];
+#pragma unroll
+    for (int j = 0; j < TT; j++) acc[j] = 0.0f;
+    for (int sb = 0; sb < k / 256; sb++) {
+        const uint8_t* b = row + sb * 210;
+        const float d = ld_f16(b + 208);
+        for (int h2 = 0; h2 < 2; h2++) {
+            const uint8_t* ql = b + 64 * h2;
+            const int h = b[128 + 32 * h2 + l];
+            const int8_t* sc = (const int8_t*)(b + 192 + 8 * h2) + (l >> 4);
+            const int a = ql[l], c = ql[l + 32];
+            const float w0 = d * sc[0] * (float)(((a & 0xF) | ((h & 3) << 4)) - 32);
+            const float w1 = d * sc[2] * (float)(((c & 0xF) | (((h >> 2) & 3) << 4)) - 32);
+            const float w2 = d * sc[4] * (float)(((a >> 4) | (((h >> 4) & 3) << 4)) - 32);
+            const float w3 = d * sc[6] * (float)(((c >> 4) | (((h >> 6) & 3) << 4)) - 32);
+#pragma unroll
+            for (int j = 0; j < TT; j++) {
+                if (j < n) {
+                    const float* xv = xt + (size_t)j * k + sb * 256 + 128 * h2 + l;
+                    acc[j] += w0 * xv[0] + w1 * xv[32] + w2 * xv[64] + w3 * xv[96];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < TT; j++) out[j] = warp_sum(acc[j]);
+}
+
+// mm_X: y[t][r] = W[r] . x[t], one weight matrix. grid (ceil(n_rows / MM_ROWS), ceil(T / TT)).
+// mm_X_ids: the weights of token t start at wp[t] + off (grouped experts: one launch per
+// projection for all the experts of a layer, each gathered row reading its own expert).
+// A tile whose tokens straddle two experts falls back to one token at a time.
+// _t8 variants tile 8 tokens (prefill); the plain ones take one token per grid row (decode).
+template <int TT, void (*DOT)(const uint8_t*, const float*, int, int, int, float*)>
+__device__ __forceinline__ void mm_tile(const uint8_t* w, unsigned long long row_bytes, int k,
+                                        const float* x, float* y, int n_rows, int T) {
+    const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t0 = blockIdx.y * TT;
+    if (r >= n_rows) return;
+    float acc[TT];
+    const int n = min(TT, T - t0);
+    DOT(w + (size_t)r * row_bytes, x + (size_t)t0 * k, k, threadIdx.x & 31, n, acc);
+    if ((threadIdx.x & 31) == 0)
+        for (int j = 0; j < n; j++) y[(size_t)(t0 + j) * n_rows + r] = acc[j];
+}
+template <int TT, void (*DOT1)(const uint8_t*, const float*, int, int, int, float*),
+          void (*DOT)(const uint8_t*, const float*, int, int, int, float*)>
+__device__ __forceinline__ void mm_tile_ids(const unsigned long long* wp, unsigned long long off,
+                                            unsigned long long row_bytes, int k, const float* x,
+                                            float* y, int n_rows, int T) {
+    const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t0 = blockIdx.y * TT;
+    if (r >= n_rows) return;
+    const int n = min(TT, T - t0);
+    bool same = true;
+    for (int j = 1; j < n; j++) same &= wp[t0 + j] == wp[t0];
+    float acc[TT];
+    if (same) {
+        DOT((const uint8_t*)(wp[t0] + off) + (size_t)r * row_bytes, x + (size_t)t0 * k, k, threadIdx.x & 31, n, acc);
+    } else {
+        for (int j = 0; j < n; j++)
+            DOT1((const uint8_t*)(wp[t0 + j] + off) + (size_t)r * row_bytes, x + (size_t)(t0 + j) * k, k,
+                 threadIdx.x & 31, 1, acc + j);
+    }
+    if ((threadIdx.x & 31) == 0)
+        for (int j = 0; j < n; j++) y[(size_t)(t0 + j) * n_rows + r] = acc[j];
+}
+#define MM_QUANT(name, TT, sfx)                                                                    \
+    extern "C" __global__ void mm_##name##sfx(const uint8_t* w, unsigned long long row_bytes, int k, \
+                                              const float* x, float* y, int n_rows, int T) {        \
+        mm_tile<TT, dot_##name<TT>>(w, row_bytes, k, x, y, n_rows, T);                             \
+    }                                                                                              \
+    extern "C" __global__ void mm_##name##_ids##sfx(const unsigned long long* wp, unsigned long long off, \
+                                                    unsigned long long row_bytes, int k, const float* x, \
+                                                    float* y, int n_rows, int T) {                 \
+        mm_tile_ids<TT, dot_##name<1>, dot_##name<TT>>(wp, off, row_bytes, k, x, y, n_rows, T);    \
+    }
+MM_QUANT(q4_k, 1, )
+MM_QUANT(q6_k, 1, )
+MM_QUANT(q4_k, 8, _t8)
+MM_QUANT(q6_k, 8, _t8)
+
+// ---- Prefill GEMM: y[t][r] = W[r] . x[t] for many tokens, f32 SIMT, tiles in shared memory.
+// Block: 128 rows x 32 tokens, 128 threads, each 8 rows x 4 tokens. K advances one 32-element
+// sub-block per step: thread i dequantizes row r0+i's sub-block into ws[k][i] (k-major), the
+// block loads x[t0..t0+31][k0..k0+31] into xs. f32 throughout (sum order: k ascending).
+#define GB_R 128
+#define GB_T 32
+
+// Element 32j + l of a Q4_K row (l = 0..31) for every l; out[l] .
+__device__ __forceinline__ void deq32_q4_k(const uint8_t* row, int j, float* out) {
+    const uint8_t* b = row + (j >> 3) * 144;
+    const int is = j & 7;
+    const uint8_t* sc = b + 4;
+    int sv, mv;
+    if (is < 4) { sv = sc[is] & 63; mv = sc[is + 4] & 63; }
+    else { sv = (sc[is + 4] & 0xF) | ((sc[is - 4] >> 6) << 4); mv = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+    const float d = ld_f16(b) * sv, m = ld_f16(b + 2) * mv;
+    const uint8_t* qs = b + 16 + 32 * (is >> 1);
+    const int sh = (is & 1) * 4;
+#pragma unroll
+    for (int l = 0; l < 32; l += 4) {
+        const unsigned q = *(const unsigned*)(qs + l);
+        out[l] = d * ((q >> sh) & 0xF) - m;
+        out[l + 1] = d * ((q >> (8 + sh)) & 0xF) - m;
+        out[l + 2] = d * ((q >> (16 + sh)) & 0xF) - m;
+        out[l + 3] = d * ((q >> (24 + sh)) & 0xF) - m;
+    }
+}
+
+// Q6_K: chunk j of a super-block is quadrant qd = j%4 of half n = (j/4)%2.
+__device__ __forceinline__ void deq32_q6_k(const uint8_t* row, int j, float* out) {
+    const uint8_t* b = row + (j >> 3) * 210;
+    const int n = (j >> 2) & 1, qd = j & 3;
+    const uint8_t* ql = b + 64 * n + 32 * (qd & 1);
+    const uint8_t* qh = b + 128 + 32 * n;
+    const int8_t* sc = (const int8_t*)(b + 192 + 8 * n) + 2 * qd;
+    const float d = ld_f16(b + 208);
+    const float d0 = d * sc[0], d1 = d * sc[1];
+    const int sl = (qd >> 1) * 4, sh = 2 * qd;
+#pragma unroll
+    for (int l = 0; l < 32; l++) {
+        const int v = ((ql[l] >> sl) & 0xF) | (((qh[l] >> sh) & 3) << 4);
+        out[l] = (l < 16 ? d0 : d1) * (float)(v - 32);
+    }
+}
+
+template <void (*DEQ)(const uint8_t*, int, float*)>
+__device__ __forceinline__ void gemm_tile(const uint8_t* w, unsigned long long row_bytes, int k, const float* x,
+                                          float* y, int n_rows, int r0, int t0, int ts, int te, float (*acc)[4],
+                                          float (*ws)[GB_R + 4], float (*xs)[GB_T + 1]) {
+    // Accumulates tokens [t0+ts, t0+te) of the tile (others get +0) using weights w.
+    const int tid = threadIdx.x, rg = tid & 15, tg = tid >> 4;
+    float buf[32];
+    for (int j = 0; j < k / 32; j++) {
+        __syncthreads();
+        if (r0 + tid < n_rows) {
+            DEQ(w + (size_t)(r0 + tid) * row_bytes, j, buf);
+#pragma unroll
+            for (int l = 0; l < 32; l++) ws[l][tid] = buf[l];
+        } else {
+#pragma unroll
+            for (int l = 0; l < 32; l++) ws[l][tid] = 0.0f;
+        }
+        for (int i = tid; i < 32 * GB_T; i += 128) {
+            const int t = i >> 5, l = i & 31;
+            xs[l][t] = (t >= ts && t < te) ? x[(size_t)(t0 + t) * k + 32 * j + l] : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int l = 0; l < 32; l++) {
+            const float4 wa = *(const float4*)&ws[l][8 * rg], wb = *(const float4*)&ws[l][8 * rg + 4];
+            const float wv[8] = {wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w};
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const float xv = xs[l][4 * tg + c];
+#pragma unroll
+                for (int r = 0; r < 8; r++) acc[r][c] += wv[r] * xv;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void gemm_store(float* y, int n_rows, int r0, int t0, int T, float (*acc)[4]) {
+    const int rg = threadIdx.x & 15, tg = threadIdx.x >> 4;
+    for (int c = 0; c < 4; c++) {
+        const int t = t0 + 4 * tg + c;
+        if (t >= T) continue;
+        for (int r = 0; r < 8; r++) {
+            const int row = r0 + 8 * rg + r;
+            if (row < n_rows) y[(size_t)t * n_rows + row] = acc[r][c];
+        }
+    }
+}
+
+// grid (ceil(n_rows / 128), ceil(T / 32)), block 128.
+#define GEMM_QUANT(name)                                                                           \
+    extern "C" __global__ void gemm_##name(const uint8_t* w, unsigned long long row_bytes, int k,  \
+                                           const float* x, float* y, int n_rows, int T) {          \
+        __shared__ __align__(16) float ws[32][GB_R + 4];                                           \
+        __shared__ float xs[32][GB_T + 1];                                                         \
+        const int r0 = blockIdx.x * GB_R, t0 = blockIdx.y * GB_T;                                  \
+        float acc[8][4] = {};                                                                      \
+        gemm_tile<deq32_##name>(w, row_bytes, k, x, y, n_rows, r0, t0, 0, min(GB_T, T - t0), acc, ws, xs); \
+        gemm_store(y, n_rows, r0, t0, T, acc);                                                     \
+    }                                                                                              \
+    /* Gathered rows grouped by expert: each run of equal wp in the tile is one pass. */           \
+    extern "C" __global__ void gemm_##name##_ids(const unsigned long long* wp, unsigned long long off, \
+                                                 unsigned long long row_bytes, int k, const float* x, \
+                                                 float* y, int n_rows, int T) {                    \
+        __shared__ __align__(16) float ws[32][GB_R + 4];                                           \
+        __shared__ float xs[32][GB_T + 1];                                                         \
+        const int r0 = blockIdx.x * GB_R, t0 = blockIdx.y * GB_T, n = min(GB_T, T - t0);           \
+        float acc[8][4] = {};                                                                      \
+        for (int s = 0; s < n;) {                                                                  \
+            int e = s + 1;                                                                         \
+            while (e < n && wp[t0 + e] == wp[t0 + s]) e++;                                         \
+            gemm_tile<deq32_##name>((const uint8_t*)(wp[t0 + s] + off), row_bytes, k, x, y, n_rows, r0, t0, s, e, acc, ws, xs); \
+            s = e;                                                                                 \
+        }                                                                                          \
+        gemm_store(y, n_rows, r0, t0, T, acc);                                                     \
+    }
+GEMM_QUANT(q4_k)
+GEMM_QUANT(q6_k)
+
+// Row-wise RMSNorm, y may alias x. grid rows.
+extern "C" __global__ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* yr = y + (size_t)blockIdx.x * n;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    const float s = 1.0f / sqrtf(block_sum(ss) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * s * w[i];
+}
+
+// Per-head RMSNorm (q_norm/k_norm) then NEOX rope in place. v is T x heads x hd,
+// grid T * heads, block hd. Pairs (i, i + hd/2), theta_i = base^(-2i/hd), pos = pos0 + t.
+extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int hd, int pos0,
+                                        float eps, float base) {
+    __shared__ float s[1024];
+    float* hv = v + (size_t)blockIdx.x * hd;
+    const int i = threadIdx.x;
+    const float a = hv[i];
+    const float sc = 1.0f / sqrtf(block_sum(a * a) / hd + eps);
+    s[i] = a * sc * w[i];
+    __syncthreads();
+    const int half = hd / 2;
+    const float pos = (float)(pos0 + blockIdx.x / heads);
+    const int j = i < half ? i : i - half;
+    const float th = pos * powf(base, -2.0f * j / hd);
+    const float sn = sinf(th), cs = cosf(th);
+    hv[i] = i < half ? s[i] * cs - s[i + half] * sn : s[i - half] * sn + s[i] * cs;
+}
+
+// Causal GQA attention with online softmax. q: T x nh x hd, caches: n_ctx x nkv x hd,
+// out: T x nh x hd. grid (nh, T), block 32 * ATT_WARPS; hd a multiple of 32, <= 256.
+// Token t sees positions [0, n_past + t]. Each warp takes positions w, w + nw, ... with its own
+// softmax state (lane owns dims lane + 32d), then the warps merge.
+// The caches are f16 (llama.cpp's default KV type), so 32K ctx costs what 16K did in f32.
+// ponytail: K/V re-read per query head (no GQA sharing); tile for long contexts.
+#define ATT_WARPS 8
+extern "C" __global__ void attention(const float* q, const __half* kc, const __half* vc, float* out,
+                                     int nh, int nkv, int hd, int n_past, float scale) {
+    __shared__ float sm[ATT_WARPS], sl[ATT_WARPS], sacc[ATT_WARPS][256];
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int hk = h / (nh / nkv), nd = hd / 32;
+    const float* qp = q + ((size_t)t * nh + h) * hd;
+    float qv[8], acc[8];
+    for (int d = 0; d < nd; d++) { qv[d] = qp[lane + 32 * d]; acc[d] = 0.0f; }
+    const int n_ctx = n_past + t + 1;
+    float m = -INFINITY, l = 0.0f;
+    for (int p = w; p < n_ctx; p += ATT_WARPS) {
+        const size_t off = ((size_t)p * nkv + hk) * hd;
+        float s = 0.0f;
+        for (int d = 0; d < nd; d++) s += qv[d] * __half2float(kc[off + lane + 32 * d]);
+        s = warp_sum(s) * scale;
+        const float mn = fmaxf(m, s);
+        const float c = expf(m - mn), e = expf(s - mn);
+        l = l * c + e;
+        for (int d = 0; d < nd; d++) acc[d] = acc[d] * c + e * __half2float(vc[off + lane + 32 * d]);
+        m = mn;
+    }
+    if (lane == 0) { sm[w] = m; sl[w] = l; }
+    for (int d = 0; d < nd; d++) sacc[w][lane + 32 * d] = acc[d];
+    __syncthreads();
+    if (w != 0) return;
+    float M = sm[0];
+    for (int i = 1; i < ATT_WARPS; i++) M = fmaxf(M, sm[i]);
+    float L = 0.0f;
+    for (int i = 0; i < ATT_WARPS; i++) L += sl[i] * expf(sm[i] - M);
+    for (int d = 0; d < nd; d++) {
+        float o = 0.0f;
+        for (int i = 0; i < ATT_WARPS; i++) o += sacc[i][lane + 32 * d] * expf(sm[i] - M);
+        out[((size_t)t * nh + h) * hd + lane + 32 * d] = o / L;
+    }
+}
+
+// Decode attention (T <= 4), flash style. A block owns one KV head and 8 query rows: the G =
+// nh/nkv heads sharing it, for 8/G consecutive tokens. Tiles of FA_KT positions of K and V are
+// staged once in shared memory for all rows (GQA sharing). Warp w owns row w (one token's G = 8
+// heads keep all 8 warps busy); scores: lane j = position j of the tile; output: lane owns dims
+// 4*lane..+3. R rows per warp is kept as a constant: the loops are written for R > 1.
+// Requires hd == 128 and 8 % G == 0 (checked on the host). grid (nkv, ceil(T*G/8), S), block 256.
+// Split-K (decode): with S > 1, block z covers its S-th of the positions and writes its softmax
+// state (m, l, unnormalized acc[128]) to part[(z * T * nh + row) * 130]; attn_merge combines.
+#define FA_KT 32
+extern "C" __global__ void attention_dec(const float* q, const __half* kc, const __half* vc, float* out,
+                                         int nh, int nkv, int n_past, int T, float scale, float* part) {
+    constexpr int R = 1, NR = 8 * R;
+    __shared__ float sq[NR][128];
+    __shared__ __half2 sk[FA_KT][65];  // padded: lane j reads row j conflict-free
+    __shared__ __half2 sv[FA_KT][64];
+    __shared__ float sp[NR][FA_KT];
+    const int G = nh / nkv, QT = NR / G, hk = blockIdx.x, t0 = blockIdx.y * QT;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < NR * 128; i += 256) {
+        const int r = i >> 7, d = i & 127, t = min(t0 + r / G, T - 1);
+        sq[r][d] = q[((size_t)t * nh + hk * G + r % G) * 128 + d];
+    }
+    int tr[R];
+    float m[R], l[R], acc[R][4];
+    for (int i = 0; i < R; i++) {
+        tr[i] = n_past + min(t0 + (R * w + i) / G, T - 1);  // last visible position
+        m[i] = -INFINITY; l[i] = 0.0f;
+        for (int d = 0; d < 4; d++) acc[i][d] = 0.0f;
+    }
+    const int n_pos = n_past + min(t0 + QT, T);
+    const int span = (n_pos + FA_KT * gridDim.z - 1) / (FA_KT * gridDim.z) * FA_KT;
+    const int pb = blockIdx.z * span, pe = min(n_pos, pb + span);
+    const bool live = t0 + R * w / G < T;  // warp has at least one real row
+    for (int p0 = pb; p0 < pe; p0 += FA_KT) {
+        __syncthreads();  // previous tile fully consumed (and sq written, first time)
+        for (int i = threadIdx.x; i < FA_KT * 16; i += 256) {  // 16 x 8 halves per row
+            const int j = i >> 4, c = i & 15, p = p0 + j;
+            uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
+            if (p < pe) {
+                const size_t off = ((size_t)p * nkv + hk) * 128 + 8 * c;
+                kv4 = *(const uint4*)(kc + off);
+                vv4 = *(const uint4*)(vc + off);
+            }
+            const __half2* k2 = (const __half2*)&kv4;
+            for (int e = 0; e < 4; e++) sk[j][4 * c + e] = k2[e];
+            *(uint4*)&sv[j][4 * c] = vv4;
+        }
+        __syncthreads();
+        if (!live) continue;
+        float s[R] = {};
+        for (int d2 = 0; d2 < 64; d2++) {
+            const float2 kf = __half22float2(sk[lane][d2]);
+            for (int i = 0; i < R; i++) {
+                const float2 qf = *(const float2*)&sq[R * w + i][2 * d2];
+                s[i] += qf.x * kf.x + qf.y * kf.y;
+            }
+        }
+        const int p = p0 + lane;
+        for (int i = 0; i < R; i++) {
+            const float si = p <= tr[i] ? s[i] * scale : -INFINITY;
+            float mt = si;
+            for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffff, mt, o));
+            const float mn = fmaxf(m[i], mt);  // -inf only if no position seen yet (split-K)
+            const float c = mn == -INFINITY ? 1.0f : expf(m[i] - mn), e = si == -INFINITY ? 0.0f : expf(si - mn);
+            l[i] = l[i] * c + warp_sum(e);
+            m[i] = mn;
+            for (int d = 0; d < 4; d++) acc[i][d] *= c;
+            sp[R * w + i][lane] = e;
+        }
+        __syncwarp();
+        for (int j = 0; j < FA_KT; j++) {
+            const float2 v01 = __half22float2(sv[j][2 * lane]), v23 = __half22float2(sv[j][2 * lane + 1]);
+            for (int i = 0; i < R; i++) {
+                const float e = sp[R * w + i][j];
+                acc[i][0] += e * v01.x; acc[i][1] += e * v01.y; acc[i][2] += e * v23.x; acc[i][3] += e * v23.y;
+            }
+        }
+    }
+    for (int i = 0; i < R; i++) {
+        const int r = R * w + i, t = t0 + r / G;
+        if (t >= T) continue;
+        const size_t row = (size_t)t * nh + hk * G + r % G;
+        if (gridDim.z > 1) {
+            float* pp = part + ((size_t)blockIdx.z * T * nh + row) * 130;
+            if (lane == 0) { pp[0] = m[i]; pp[1] = l[i]; }
+            for (int d = 0; d < 4; d++) pp[2 + 4 * lane + d] = acc[i][d];
+            continue;
+        }
+        float4 o = make_float4(acc[i][0] / l[i], acc[i][1] / l[i], acc[i][2] / l[i], acc[i][3] / l[i]);
+        *(float4*)(out + ((size_t)t * nh + hk * G + r % G) * 128 + 4 * lane) = o;
+    }
+}
+
+
+// Tensor-core attention (prefill), FlashAttention-2 layout with mma.sync m16n8k16 (f16 in, f32
+// accumulate). A block owns one KV head and 64 query rows (64/G tokens x the G heads sharing it);
+// warp w owns rows 16w..16w+15. K tiles of TC_KT positions are staged in shared memory (V
+// transposed, so both B fragments are half2 loads). The online softmax runs on the accumulator
+// registers:

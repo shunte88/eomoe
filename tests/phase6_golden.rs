@@ -36,14 +36,13 @@ fn ctx_32k_keeps_cache_and_greedy_tokens() {
 const ORACLE_PREFILL_4K: f32 = 392.9;
 
 /// Prefill must beat the oracle: a 19K-token Claude Code first turn is pure prefill.
-/// The prompt is real code (this repo's sources), so expert routing looks like a client session.
+/// The prompt is real code (frozen repo sources), so expert routing looks like a client session.
 #[test]
 #[ignore]
 fn prefill_4k_beats_oracle() {
     let g = Gguf::open(model_path()).unwrap();
     let tok = eomoe::tokenizer::Tokenizer::from_gguf(&g).unwrap();
-    let src: String = ["src/gpu.rs", "src/server.rs", "src/cpu.rs", "kernels/eomoe.cu", "src/generate.rs"]
-        .iter().map(|p| std::fs::read_to_string(p).unwrap()).collect();
+    let src = std::fs::read_to_string("tests/golden/long_prompt.txt").unwrap();
     let prompt = &tok.encode(&src, false)[..4096];
     let mut m = GpuModel::with_cache(g, 32768, usize::MAX >> 20).unwrap();
     m.forward_last(&prompt[..512]); // warm up: kernel load, pinned staging
@@ -53,4 +52,60 @@ fn prefill_4k_beats_oracle() {
     let tps = prompt.len() as f32 / t0.elapsed().as_secs_f32();
     println!("prefill 4096 tok: {tps:.1} tok/s (oracle {ORACLE_PREFILL_4K})");
     assert!(tps > ORACLE_PREFILL_4K, "prefill {tps:.1} tok/s <= oracle {ORACLE_PREFILL_4K}");
+}
+
+/// Oracle decode right after a 4096-token prompt (STATUS.md Phase 0). Claude Code decodes after
+/// ~19K tokens, where attention reads ~1.9 GB of KV per token; we must still beat the oracle's
+/// 4K-context number there, and aim for 20.
+const ORACLE_DECODE_AFTER_4K: f32 = 16.0;
+const DECODE_19K_TARGET: f32 = 20.0;
+
+#[test]
+#[ignore]
+fn decode_after_19k_prompt_beats_oracle() {
+    // Teacher-forced: decode the source's next 72 tokens, so the routed experts (and the cache
+    // hit rate) do not depend on what greedy decoding happens to produce after numeric changes.
+    let (mut m, all) = long_prompt();
+    let (prompt, cont) = all.split_at(19000);
+    m.forward_last(prompt);
+    for &tk in &cont[..8] { m.forward_last(&[tk]); } // warm the expert cache for decode
+    let n = 64;
+    let s0 = m.cache_stats();
+    let t0 = std::time::Instant::now();
+    for &tk in &cont[8..8 + n] { m.forward_last(&[tk]); }
+    let tps = n as f32 / t0.elapsed().as_secs_f32();
+    let s1 = m.cache_stats();
+    let (h, mi) = (s1.hits - s0.hits, s1.misses - s0.misses);
+    println!("decode after 19K prompt: {tps:.1} tok/s (oracle after 4K: {ORACLE_DECODE_AFTER_4K}, target {DECODE_19K_TARGET}); \
+        cache hits {:.1}%, {:.0} MiB uploaded", 100.0 * h as f64 / (h + mi) as f64, (s1.bytes - s0.bytes) as f64 / 1048576.0);
+    assert!(tps >= DECODE_19K_TARGET, "decode {tps:.1} tok/s < {DECODE_19K_TARGET}");
+}
+
+/// 19072 tokens of a frozen snapshot of this repo's sources (tests/golden/long_prompt.txt; frozen
+/// because routing, and so cache hits and speed, depends on the exact text) (a Claude Code first turn is ~19K) and a 32K-ctx model.
+fn long_prompt() -> (GpuModel, Vec<u32>) {
+    let g = Gguf::open(model_path()).unwrap();
+    let tok = eomoe::tokenizer::Tokenizer::from_gguf(&g).unwrap();
+    let src = std::fs::read_to_string("tests/golden/long_prompt.txt").unwrap();
+    let mut all = tok.encode(&src, false);
+    assert!(all.len() >= 19072, "prompt source too short: {}", all.len());
+    all.truncate(19072); // 19000-token prompt + 72 continuation tokens
+    (GpuModel::with_cache(g, 32768, usize::MAX >> 20).unwrap(), all)
+}
+
+/// Follow-up turns (100-200 new tokens on a 19K prefix) ran at 74-99 tok/s in the server log.
+/// 128 tokens route to nearly every expert of every layer: ~13.9 GB of cache misses, ~1.0 s at
+/// PCIe 4.0 x8 (~14 GB/s), so ~128 tok/s is the ceiling until the cache hit rate improves.
+const FOLLOWUP_TARGET: f32 = 100.0;
+
+#[test]
+#[ignore]
+fn followup_prefill_on_19k_prefix() {
+    let (mut m, prompt) = long_prompt();
+    m.forward_last(&prompt[..18872]);
+    let t0 = std::time::Instant::now();
+    m.forward_last(&prompt[18872..19000]);
+    let tps = 128.0 / t0.elapsed().as_secs_f32();
+    println!("follow-up prefill 128 tok on 18.9K: {tps:.1} tok/s (target {FOLLOWUP_TARGET})");
+    assert!(tps >= FOLLOWUP_TARGET, "follow-up prefill {tps:.1} tok/s < {FOLLOWUP_TARGET}");
 }

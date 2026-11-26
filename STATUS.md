@@ -214,4 +214,61 @@ The KV cache is stored in f16 (llama.cpp's default `--cache-type-k/v f16`). K/V 
 
 **Long context now** (19K tokens):
 - Prefill 302 tok/s. At 19K, attention is 40% of prefill (22.7 s; SIMT only, ~130 GFLOPS), the expert GEMM is 22 s and the dense GEMM is 8.2 s. Tensor cores are the next lever for both.
-- Decode is still 7.4 tok/s, because the decode attention kernel has no GQA sharing and no split-K. This is the next item.
+- Decode was 7.4 tok/s, because the decode attention kernel had no GQA sharing and no split-K. Fixed below.
+
+## Phase 6: long-context decode (2026-11-26)
+
+Test first: `decode_after_19k_prompt_beats_oracle` (tests/phase6_golden.rs). It prefills 19000 tokens of this repo's sources, warms up with 8 decode steps, then times 64 greedy steps. It must reach ≥ 20 tok/s. The oracle's best long-context figure is 16.0 tok/s, and that is after only a 4K prompt. **Red at 7.5 tok/s.**
+
+| Step | Decode after 19K |
+|---|---|
+| Baseline: `attention`, grid (32 heads), each block re-reads its KV head | 7.5 tok/s |
+| Split-K on `attention_tiled` (gridDim.z over positions, 256 per split) + `attn_merge`; partials in the idle MoE scratch `s.gu`, so no VRAM cost | 24.7 (decode attention 183 µs/layer ≈ 213 GB/s) |
+| `ATT_SPLIT` 128 | 25.0 |
+| Kernel templated on rows per warp: `attention_dec` (R = 1) gives each of the 8 warps one of the token's 8 GQA heads. Before this, 6 of 8 warps idled | **29.3** |
+
+At 29.3 tok/s, attention adds ~4.7 ms per token over short-context decode (34.0). The KV bandwidth floor at 19K is ~4.2 ms (1.87 GB at ~448 GB/s).
+
+Gates (all pass):
+
+| Gate | Result |
+|---|---|
+| Phase 3 | top-1 fails 0/128, mean 0.1829 (floor 0.2414); incremental decode exact; GPU vs CPU p50 0.00040, max 1.11 |
+| Phase 4 | hits 76.17% (identical to the oracle); decode 34.0 tok/s |
+| Phase 5 API diff | pass |
+| Phase 6 | 32K, 575 slots; prefill 4K 418.7 tok/s; **decode after 19K 29.3 tok/s** |
+| lib | 11 pass |
+| Real Claude Code, stock tools, 18955-token prompt (`sub.py` bug) | **1m24s wall** (was 1m57s). Fixed. Server decode 23.4 / 22.9 / 24.8 tok/s (was 7.5 / 7.3 / 7.4) |
+
+Next lever, found in the same log: follow-up turns prefill 100–200 new tokens on a 19K cache at only 74–99 tok/s.
+- **Red test:** `followup_prefill_on_19k_prefix` times 128 new tokens on an 18.9K prefix. Target 150; currently 75.9.
+- **Split-K does not fix it:** trying it on the R=4 path only reached 78. That attention is compute-bound, about 1.9 TFLOP per 128-token turn (≈1.1 TFLOPS achieved on SIMT f32).
+- **The fix:** tensor-core attention, which is Phase 6 priority 2.
+
+## Phase 6: tensor-core attention, overlapped expert uploads (2026-11-26)
+
+| Step | Follow-up 128 tok on 18.9K | Prefill 4K |
+|---|---|---|
+| Before | 75.9 tok/s | 418.7 tok/s |
+| `attention_tc`: FlashAttention-2 layout on `mma.sync` m16n8k16. Q and P are fed as f16 hi + lo pairs (~f32 accuracy); K and V are exact f16. Used for every batch of more than 4 tokens; decode stays on `attention_dec`. The R=4 SIMT kernel is deleted | 80.1 | 454.6 |
+| Expert uploads on a copy stream. Staging is split into two halves of 16 slots. Wave 0 is the resident experts; misses come in waves of 16, ping-ponging between halves, ordered by `ready` and `free` events | 108.4 | 508.9 |
+
+Profile of the follow-up before the copy stream: uploads 990 ms of 1592, attention 153 ms, expert matvecs 335 ms.
+- **What the uploads mean:** 128 tokens touch nearly every expert of every layer. That is ~13.9 GB of misses at ~14 GB/s (PCIe 4.0 x8), so ~128 tok/s is the ceiling at this hit rate.
+- **Gate target revised:** the follow-up target was 150, set on a wrong compute-bound estimate made before profiling. It is now **100**: above the 74–99 tok/s server baseline, below the upload floor.
+
+**Decode gate fixed to be content-independent.**
+- **The problem:** greedy decode after 19K moved between 22 and 29 tok/s as unrelated kernel changes perturbed the text it generated (routing, and so hits, depends on content). The prompt was also read from this repo's live sources, which I was editing.
+- **The fix:** the prompt is now a frozen fixture (`tests/golden/long_prompt.txt`), and decode is teacher-forced on the fixture's next 64 tokens.
+- **Result:** deterministic, **22.7 tok/s at 65.4% hits** (366 MB/token uploaded). Decode at 19K is now upload-bound. That is the next lever: next-layer expert prefetch.
+
+Gates (all pass):
+
+| Gate | Result |
+|---|---|
+| Phase 3 | top-1 fails 0/128, mean 0.1825 (floor 0.2414); incremental decode exact; GPU vs CPU **p50 0.00034** (was 0.00040), mean 0.036 (was 0.049), max 1.12 |
+| Phase 4 | hits 76.17% (identical to the oracle); decode 34.2 tok/s |
+| Phase 5 API diff | pass |
+| Phase 6 | 32K, 576 slots; prefill 4K **510 tok/s**; decode after 19K 22.7 (teacher-forced); follow-up **112 tok/s** |
+| lib | 11 pass |
+| Real Claude Code, stock tools, 18955 tokens (`sub.py`) | **1m03s wall** (was 1m24s). Fixed. First turn: prefill 46.1 s at **411 tok/s** (was 302). Follow-ups: 110 and 165 tok/s. Decode 23.3–25.5 |

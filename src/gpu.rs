@@ -10,7 +10,7 @@ use crate::expert_cache::ExpertCache;
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::quant::dequant_row;
 use crate::qwen3moe::{route, Engine, Weights};
-use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
+use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
 use rayon::prelude::*;
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
@@ -29,6 +29,8 @@ const GEMM_MIN: usize = 16;
 /// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
 const SPAN: usize = 4096;
 /// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
+/// Positions per split-K block of decode attention.
+const ATT_SPLIT: usize = 128;
 const LOGIT_ROWS: usize = 64;
 /// VRAM left free after sizing the expert cache to "as much as fits".
 const VRAM_RESERVE: usize = 192 << 20;
@@ -85,7 +87,9 @@ struct Kernels {
     rmsnorm: CudaFunction,
     qk_norm_rope: CudaFunction,
     attention: CudaFunction,
-    attention_tiled: CudaFunction,
+    attention_dec: CudaFunction,
+    attention_tc: CudaFunction,
+    attn_merge: CudaFunction,
     store_f16: CudaFunction,
     add_inplace: CudaFunction,
     gather_rows: CudaFunction,
@@ -146,8 +150,13 @@ pub struct GpuModel {
     kv: Ptr,
     groups: Vec<Group>,
     group_of: Vec<usize>,
-    /// STAGE slots of the largest expert, for uncached ubatches.
+    /// STAGE slots of the largest expert, for uncached ubatches: two halves, so one wave's
+    /// misses upload on `copy` while the previous wave computes on `stream`.
     stage: Ptr,
+    copy: Arc<CudaStream>,
+    /// Per stage half: uploads done (copy stream) / last reader done (main stream).
+    ready: [CudaEvent; 2],
+    free: [CudaEvent; 2],
     stage_bytes: usize,
     stats: CacheStats,
     host: Option<HostExperts>,
@@ -204,7 +213,9 @@ impl GpuModel {
             rmsnorm: f("rmsnorm")?,
             qk_norm_rope: f("qk_norm_rope")?,
             attention: f("attention")?,
-            attention_tiled: f("attention_tiled")?,
+            attention_dec: f("attention_dec")?,
+            attention_tc: f("attention_tc")?,
+            attn_merge: f("attn_merge")?,
             store_f16: f("store_f16")?,
             add_inplace: f("add_inplace")?,
             gather_rows: f("gather_rows")?,
@@ -317,7 +328,11 @@ impl GpuModel {
             groups.iter().map(|g| g.cache.n_slots()).collect::<Vec<_>>(),
             vram.get() >> 20
         );
+        let ev = || ctx.new_event(None).map_err(err);
         Ok(Self {
+            copy: ctx.new_stream().map_err(err)?,
+            ready: [ev()?, ev()?],
+            free: [ev()?, ev()?],
             stream,
             k,
             layers,
@@ -353,13 +368,13 @@ impl GpuModel {
     }
 
     /// Queue a copy of expert `ex` of layer `li` (gate | up | down) to `dst`; returns its bytes.
-    fn upload_expert(&self, li: usize, ex: usize, dst: Ptr) -> usize {
+    fn upload_expert(&self, li: usize, ex: usize, dst: Ptr, st: &CudaStream) -> usize {
         let parts = self.w.expert(&self.w.layers[li], ex);
         let n: usize = parts.iter().map(|b| b.len()).sum();
         match &self.host {
             Some(h) => {
                 let src = &h.buf.as_slice().expect("pinned")[h.base[li] + ex * n..][..n];
-                unsafe { result::memcpy_htod_async(dst, src, self.stream.cu_stream()) }.expect("htod async");
+                unsafe { result::memcpy_htod_async(dst, src, st.cu_stream()) }.expect("htod async");
             }
             None => {
                 let mut off = 0;
@@ -471,9 +486,24 @@ impl GpuModel {
                 let g = ((tc * kvd).div_ceil(256) as u32, 1, 1);
                 launch!(self, self.k.store_f16, g, 256, [kd, ks, nkv_t]);
                 launch!(self, self.k.store_f16, g, 256, [vd, vs, nkv_t]);
-                if tc > 1 && hd == 128 && 32 % (nh / nkv) == 0 {
-                    let g = (nkv as u32, (tc * (nh / nkv)).div_ceil(32) as u32, 1);
-                    launch!(self, self.k.attention_tiled, g, 256, [q, kc, vc, attn, nhi, nkvi, pos0, ti, scale]);
+                let gq = nh / nkv;
+                if hd == 128 && 8 % gq == 0 {
+                    // Decode (<= 4 tokens): attention_dec, one row per warp. Prefill: tensor-core
+                    // attention_tc. Both split the positions when blocks are few, partials in s.gu
+                    // (idle during attention).
+                    let small = tc <= 4;
+                    let cap = self.max_batch * hp.n_expert_used * 2 * hp.n_ff_exp / (tc * nh * 130);
+                    let (f, gy, bs) = if small { (&self.k.attention_dec, (tc * gq).div_ceil(8), 256) }
+                        else { (&self.k.attention_tc, (tc * gq).div_ceil(64), 128) };
+                    // Fill the GPU: split positions until ~240 blocks (decode: every ATT_SPLIT).
+                    let want = if small { usize::MAX } else { (240 / (nkv * gy)).max(1) };
+                    let sk = (pos + tc).div_ceil(if small { ATT_SPLIT } else { 512 }).min(want).min(cap).max(1);
+                    let (part, ski) = (s.gu, sk as i32);
+                    launch!(self, *f, (nkv as u32, gy as u32, sk as u32), bs, [q, kc, vc, attn, nhi, nkvi, pos0, ti, scale, part]);
+                    if sk > 1 {
+                        let rows = (tc * nh) as i32;
+                        launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), 128, [part, attn, rows, ski]);
+                    }
                 } else {
                     launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, attn, nhi, nkvi, hdi, pos0, scale]);
                 }
@@ -499,30 +529,35 @@ impl GpuModel {
             // ptr[ex]: where expert ex's (gate | up | down) will be when its wave runs.
             let mut ptr = vec![0u64; n_expert];
             // Cached ubatches go through the cache policy and run as one wave; larger spans
-            // bypass it (as in the oracle): resident experts are read in place, misses are
-            // streamed through the STAGE staging slots, one wave at a time.
+            // bypass it (as in the oracle): resident experts are read in place (wave 0), misses
+            // are streamed through the staging halves in waves of HALF, alternating halves.
             let cached = t <= CACHE_MAX_BATCH;
-            let waves: Vec<&[usize]> = if cached {
+            const HALF: usize = STAGE / 2;
+            let mut half: Vec<Option<usize>> = vec![None]; // staging half each wave uses
+            let waves: Vec<Vec<usize>> = if cached {
                 let ids: Vec<u32> = sels[0].iter().flatten().map(|&(e, _)| e as u32).collect();
                 let p = self.groups[gi].cache.plan(li, &ids, t);
                 for &(ex, slot) in &p.fills {
-                    self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64) as u64;
+                    self.stats.bytes += self.upload_expert(li, ex, bank + (slot * sb) as u64, &self.stream) as u64;
                 }
                 self.stats.hits += p.hits as u64;
                 self.stats.misses += p.fills.len() as u64;
                 for &ex in &used {
                     ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).expect("planned expert resident") * sb) as u64;
                 }
-                vec![&used[..]]
+                vec![used]
             } else {
-                let waves: Vec<&[usize]> = used.chunks(STAGE).collect();
-                for wave in &waves {
+                let (res, miss): (Vec<usize>, Vec<usize>) = used.iter().partition(|&&ex| self.groups[gi].cache.slot(li, ex).is_some());
+                for &ex in &res {
+                    ptr[ex] = bank + (self.groups[gi].cache.slot(li, ex).unwrap() * sb) as u64;
+                }
+                let mut waves = vec![res];
+                for (k, wave) in miss.chunks(HALF).enumerate() {
                     for (j, &ex) in wave.iter().enumerate() {
-                        ptr[ex] = match self.groups[gi].cache.slot(li, ex) {
-                            Some(slot) => bank + (slot * sb) as u64,
-                            None => self.stage + (j * self.stage_bytes) as u64,
-                        };
+                        ptr[ex] = self.stage + (((k % 2) * HALF + j) * self.stage_bytes) as u64;
                     }
+                    half.push(Some(k % 2));
+                    waves.push(wave.to_vec());
                 }
                 waves
             };
@@ -569,13 +604,21 @@ impl GpuModel {
             let wl = &self.w.layers[li];
             let down_off = (self.w.expert(wl, 0)[0].len() * 2) as u64;
             let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
-            for (wi, wave) in waves.iter().enumerate() {
-                if !cached {
-                    for (j, &ex) in wave.iter().enumerate() {
-                        if self.groups[gi].cache.slot(li, ex).is_none() {
-                            self.upload_expert(li, ex, self.stage + (j * self.stage_bytes) as u64);
-                        }
+            // Copy stream: wave k's misses into its half once the half's last reader is done.
+            let upload = |k: usize| {
+                if let Some(Some(hf)) = half.get(k) {
+                    self.copy.wait(&self.free[*hf]).expect("wait");
+                    for (j, &ex) in waves[k].iter().enumerate() {
+                        self.upload_expert(li, ex, self.stage + ((hf * HALF + j) * self.stage_bytes) as u64, &self.copy);
                     }
+                    self.ready[*hf].record(&self.copy).expect("record");
+                }
+            };
+            upload(1);
+            upload(2);
+            for (wi, _) in waves.iter().enumerate() {
+                if let Some(hf) = half[wi] {
+                    self.stream.wait(&self.ready[hf]).expect("wait");
                 }
                 for &(_, r, o, per_ex) in passes.iter().filter(|p| p.0 == wi) {
                     let (x, h) = (s.x, s.h);
@@ -589,6 +632,10 @@ impl GpuModel {
                     launch!(self, self.k.swiglu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
                     self.mm_ids(wl.down.ty, wp, down_off, wl.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
                     launch!(self, self.k.moe_combine, (t as u32, 1, 1), 256, [x, dbuf, off, crow, cw, ei]);
+                }
+                if let Some(hf) = half[wi] {
+                    self.free[hf].record(&self.stream).expect("record");
+                    upload(wi + 2);
                 }
             }
         }
@@ -612,7 +659,7 @@ impl GpuModel {
 /// padding to 8, then wp (8 bytes per row). Passes: at most one partial per wave plus
 /// t * kk / (b * kk) full ones.
 fn meta_bytes(t: usize, b: usize, kk: usize, n_expert: usize) -> usize {
-    let passes = n_expert.div_ceil(STAGE) + t.div_ceil(b);
+    let passes = 1 + n_expert.div_ceil(STAGE / 2) + t.div_ceil(b);
     t * kk * 20 + passes * (4 * (t + 1) + 8)
 }
 

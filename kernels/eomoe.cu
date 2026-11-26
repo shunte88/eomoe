@@ -372,38 +372,45 @@ extern "C" __global__ void attention(const float* q, const __half* kc, const __h
     }
 }
 
-// Prefill attention, flash style. A block owns one KV head and 32 query rows: the G = nh/nkv
-// heads sharing it, for 32/G consecutive tokens. Tiles of FA_KT positions of K and V are
-// staged once in shared memory for all 32 rows (GQA sharing). Warp w owns rows 4w..4w+3;
-// scores: lane j = position j of the tile; output: lane owns dims 4*lane..+3.
-// Requires hd == 128 and 32 % G == 0 (checked on the host). grid (nkv, ceil(T*G/32)), block 256.
+// Decode attention (T <= 4), flash style. A block owns one KV head and 8 query rows: the G =
+// nh/nkv heads sharing it, for 8/G consecutive tokens. Tiles of FA_KT positions of K and V are
+// staged once in shared memory for all rows (GQA sharing). Warp w owns row w (one token's G = 8
+// heads keep all 8 warps busy); scores: lane j = position j of the tile; output: lane owns dims
+// 4*lane..+3. R rows per warp is kept as a constant: the loops are written for R > 1.
+// Requires hd == 128 and 8 % G == 0 (checked on the host). grid (nkv, ceil(T*G/8), S), block 256.
+// Split-K (decode): with S > 1, block z covers its S-th of the positions and writes its softmax
+// state (m, l, unnormalized acc[128]) to part[(z * T * nh + row) * 130]; attn_merge combines.
 #define FA_KT 32
-extern "C" __global__ void attention_tiled(const float* q, const __half* kc, const __half* vc, float* out,
-                                           int nh, int nkv, int n_past, int T, float scale) {
-    __shared__ float sq[32][128];
+extern "C" __global__ void attention_dec(const float* q, const __half* kc, const __half* vc, float* out,
+                                         int nh, int nkv, int n_past, int T, float scale, float* part) {
+    constexpr int R = 1, NR = 8 * R;
+    __shared__ float sq[NR][128];
     __shared__ __half2 sk[FA_KT][65];  // padded: lane j reads row j conflict-free
     __shared__ __half2 sv[FA_KT][64];
-    __shared__ float sp[32][FA_KT];
-    const int G = nh / nkv, QT = 32 / G, hk = blockIdx.x, t0 = blockIdx.y * QT;
+    __shared__ float sp[NR][FA_KT];
+    const int G = nh / nkv, QT = NR / G, hk = blockIdx.x, t0 = blockIdx.y * QT;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    for (int i = threadIdx.x; i < 32 * 128; i += 256) {
+    for (int i = threadIdx.x; i < NR * 128; i += 256) {
         const int r = i >> 7, d = i & 127, t = min(t0 + r / G, T - 1);
         sq[r][d] = q[((size_t)t * nh + hk * G + r % G) * 128 + d];
     }
-    int tr[4];
-    float m[4], l[4], acc[4][4];
-    for (int i = 0; i < 4; i++) {
-        tr[i] = n_past + min(t0 + (4 * w + i) / G, T - 1);  // last visible position
+    int tr[R];
+    float m[R], l[R], acc[R][4];
+    for (int i = 0; i < R; i++) {
+        tr[i] = n_past + min(t0 + (R * w + i) / G, T - 1);  // last visible position
         m[i] = -INFINITY; l[i] = 0.0f;
         for (int d = 0; d < 4; d++) acc[i][d] = 0.0f;
     }
     const int n_pos = n_past + min(t0 + QT, T);
-    for (int p0 = 0; p0 < n_pos; p0 += FA_KT) {
+    const int span = (n_pos + FA_KT * gridDim.z - 1) / (FA_KT * gridDim.z) * FA_KT;
+    const int pb = blockIdx.z * span, pe = min(n_pos, pb + span);
+    const bool live = t0 + R * w / G < T;  // warp has at least one real row
+    for (int p0 = pb; p0 < pe; p0 += FA_KT) {
         __syncthreads();  // previous tile fully consumed (and sq written, first time)
         for (int i = threadIdx.x; i < FA_KT * 16; i += 256) {  // 16 x 8 halves per row
             const int j = i >> 4, c = i & 15, p = p0 + j;
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
-            if (p < n_pos) {
+            if (p < pe) {
                 const size_t off = ((size_t)p * nkv + hk) * 128 + 8 * c;
                 kv4 = *(const uint4*)(kc + off);
                 vv4 = *(const uint4*)(vc + off);
@@ -413,41 +420,197 @@ extern "C" __global__ void attention_tiled(const float* q, const __half* kc, con
             *(uint4*)&sv[j][4 * c] = vv4;
         }
         __syncthreads();
-        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (!live) continue;
+        float s[R] = {};
         for (int d2 = 0; d2 < 64; d2++) {
             const float2 kf = __half22float2(sk[lane][d2]);
-            for (int i = 0; i < 4; i++) {
-                const float2 qf = *(const float2*)&sq[4 * w + i][2 * d2];
+            for (int i = 0; i < R; i++) {
+                const float2 qf = *(const float2*)&sq[R * w + i][2 * d2];
                 s[i] += qf.x * kf.x + qf.y * kf.y;
             }
         }
         const int p = p0 + lane;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < R; i++) {
             const float si = p <= tr[i] ? s[i] * scale : -INFINITY;
             float mt = si;
             for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffff, mt, o));
-            const float mn = fmaxf(m[i], mt);  // finite: position 0 is always visible
-            const float c = expf(m[i] - mn), e = expf(si - mn);
+            const float mn = fmaxf(m[i], mt);  // -inf only if no position seen yet (split-K)
+            const float c = mn == -INFINITY ? 1.0f : expf(m[i] - mn), e = si == -INFINITY ? 0.0f : expf(si - mn);
             l[i] = l[i] * c + warp_sum(e);
             m[i] = mn;
             for (int d = 0; d < 4; d++) acc[i][d] *= c;
-            sp[4 * w + i][lane] = e;
+            sp[R * w + i][lane] = e;
         }
         __syncwarp();
         for (int j = 0; j < FA_KT; j++) {
             const float2 v01 = __half22float2(sv[j][2 * lane]), v23 = __half22float2(sv[j][2 * lane + 1]);
-            for (int i = 0; i < 4; i++) {
-                const float e = sp[4 * w + i][j];
+            for (int i = 0; i < R; i++) {
+                const float e = sp[R * w + i][j];
                 acc[i][0] += e * v01.x; acc[i][1] += e * v01.y; acc[i][2] += e * v23.x; acc[i][3] += e * v23.y;
             }
         }
     }
-    for (int i = 0; i < 4; i++) {
-        const int r = 4 * w + i, t = t0 + r / G;
+    for (int i = 0; i < R; i++) {
+        const int r = R * w + i, t = t0 + r / G;
         if (t >= T) continue;
+        const size_t row = (size_t)t * nh + hk * G + r % G;
+        if (gridDim.z > 1) {
+            float* pp = part + ((size_t)blockIdx.z * T * nh + row) * 130;
+            if (lane == 0) { pp[0] = m[i]; pp[1] = l[i]; }
+            for (int d = 0; d < 4; d++) pp[2 + 4 * lane + d] = acc[i][d];
+            continue;
+        }
         float4 o = make_float4(acc[i][0] / l[i], acc[i][1] / l[i], acc[i][2] / l[i], acc[i][3] / l[i]);
         *(float4*)(out + ((size_t)t * nh + hk * G + r % G) * 128 + 4 * lane) = o;
     }
+}
+
+
+// Tensor-core attention (prefill), FlashAttention-2 layout with mma.sync m16n8k16 (f16 in, f32
+// accumulate). A block owns one KV head and 64 query rows (64/G tokens x the G heads sharing it);
+// warp w owns rows 16w..16w+15. K tiles of TC_KT positions are staged in shared memory (V
+// transposed, so both B fragments are half2 loads). The online softmax runs on the accumulator
+// registers: thread (g = lane/4, tq = lane%4) holds rows g and g+8, columns 8n + 2tq + {0,1}.
+// Q and P are fed as f16 hi + lo pairs (two mmas each): ~f32 accuracy; K and V are exact f16.
+// Requires hd == 128 and 64 % G == 0. grid (nkv, ceil(T*G/64), S), block 128. Split-K as above.
+#define TC_KT 64
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void split_h2(float x, float y, uint32_t& hi, uint32_t& lo) {
+    const __half2 h = __floats2half2_rn(x, y);
+    const float2 hf = __half22float2(h);
+    const __half2 l = __floats2half2_rn(x - hf.x, y - hf.y);
+    hi = *(const uint32_t*)&h;
+    lo = *(const uint32_t*)&l;
+}
+extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, float* out,
+                                                              int nh, int nkv, int n_past, int T, float scale, float* part) {
+    __shared__ __align__(16) __half sk[TC_KT][136];
+    __shared__ __align__(16) __half svt[128][TC_KT + 8];
+    const int G = nh / nkv, QT = 64 / G, hk = blockIdx.x, t0 = blockIdx.y * QT;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
+    const int rr[2] = {16 * w + g, 16 * w + g + 8};
+    int tr[2];
+    const float* qp[2];
+    for (int i = 0; i < 2; i++) {
+        const int t = min(t0 + rr[i] / G, T - 1);
+        tr[i] = n_past + t;  // last visible position
+        qp[i] = q + ((size_t)t * nh + hk * G + rr[i] % G) * 128;
+    }
+    uint32_t qh[8][4], ql[8][4];
+    for (int kk = 0; kk < 8; kk++) {
+        const int c = 16 * kk + 2 * tq;
+        split_h2(qp[0][c], qp[0][c + 1], qh[kk][0], ql[kk][0]);
+        split_h2(qp[1][c], qp[1][c + 1], qh[kk][1], ql[kk][1]);
+        split_h2(qp[0][c + 8], qp[0][c + 9], qh[kk][2], ql[kk][2]);
+        split_h2(qp[1][c + 8], qp[1][c + 9], qh[kk][3], ql[kk][3]);
+    }
+    float o[16][4];
+    for (int n = 0; n < 16; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+    const int n_pos = n_past + min(t0 + QT, T);
+    const int span = (n_pos + TC_KT * gridDim.z - 1) / (TC_KT * gridDim.z) * TC_KT;
+    const int pb = blockIdx.z * span, pe = min(n_pos, pb + span);
+    for (int p0 = pb; p0 < pe; p0 += TC_KT) {
+        __syncthreads();  // previous tile consumed
+        for (int i = threadIdx.x; i < TC_KT * 16; i += 128) {
+            const int j = i >> 4, c = i & 15, p = p0 + j;
+            uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
+            if (p < pe) {
+                const size_t off = ((size_t)p * nkv + hk) * 128 + 8 * c;
+                kv4 = *(const uint4*)(kc + off);
+                vv4 = *(const uint4*)(vc + off);
+            }
+            *(uint4*)&sk[j][8 * c] = kv4;
+            const __half* vh = (const __half*)&vv4;
+            for (int e = 0; e < 8; e++) svt[8 * c + e][j] = vh[e];
+        }
+        __syncthreads();
+        float sc[8][4];
+        for (int n = 0; n < 8; n++) {
+            sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.0f;
+            for (int kk = 0; kk < 8; kk++) {
+                const __half* kr = &sk[8 * n + g][16 * kk + 2 * tq];
+                const uint32_t b0 = *(const uint32_t*)kr, b1 = *(const uint32_t*)(kr + 8);
+                mma16816(sc[n], qh[kk], b0, b1);
+                mma16816(sc[n], ql[kk], b0, b1);
+            }
+        }
+        float mx[2] = {-INFINITY, -INFINITY};
+        for (int n = 0; n < 8; n++)
+            for (int e = 0; e < 4; e++) {
+                const int r = e >> 1, p = p0 + 8 * n + 2 * tq + (e & 1);
+                const float v = p <= tr[r] ? sc[n][e] * scale : -INFINITY;
+                sc[n][e] = v;
+                mx[r] = fmaxf(mx[r], v);
+            }
+        float c[2], sum[2] = {0.0f, 0.0f};
+        for (int r = 0; r < 2; r++) {
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 1));
+            mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffff, mx[r], 2));
+            const float mn = fmaxf(m[r], mx[r]);  // -inf only if no position seen yet
+            c[r] = mn == -INFINITY ? 1.0f : expf(m[r] - mn);
+            m[r] = mn;
+        }
+        for (int n = 0; n < 8; n++)
+            for (int e = 0; e < 4; e++) {
+                const int r = e >> 1;
+                const float v = sc[n][e] == -INFINITY ? 0.0f : expf(sc[n][e] - m[r]);
+                sc[n][e] = v;
+                sum[r] += v;
+            }
+        for (int r = 0; r < 2; r++) {
+            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 1);
+            sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 2);
+            l[r] = l[r] * c[r] + sum[r];
+        }
+        for (int n = 0; n < 16; n++) { o[n][0] *= c[0]; o[n][1] *= c[0]; o[n][2] *= c[1]; o[n][3] *= c[1]; }
+        for (int kk = 0; kk < TC_KT / 16; kk++) {
+            uint32_t ph[4], pl[4];
+            split_h2(sc[2 * kk][0], sc[2 * kk][1], ph[0], pl[0]);
+            split_h2(sc[2 * kk][2], sc[2 * kk][3], ph[1], pl[1]);
+            split_h2(sc[2 * kk + 1][0], sc[2 * kk + 1][1], ph[2], pl[2]);
+            split_h2(sc[2 * kk + 1][2], sc[2 * kk + 1][3], ph[3], pl[3]);
+            for (int n = 0; n < 16; n++) {
+                const __half* vr = &svt[8 * n + g][16 * kk + 2 * tq];
+                const uint32_t b0 = *(const uint32_t*)vr, b1 = *(const uint32_t*)(vr + 8);
+                mma16816(o[n], ph, b0, b1);
+                mma16816(o[n], pl, b0, b1);
+            }
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        const int r = rr[i], t = t0 + r / G;
+        if (t >= T) continue;
+        const size_t row = (size_t)t * nh + hk * G + r % G;
+        if (gridDim.z > 1) {
+            float* pp = part + ((size_t)blockIdx.z * T * nh + row) * 130;
+            if (tq == 0) { pp[0] = m[i]; pp[1] = l[i]; }
+            for (int n = 0; n < 16; n++) { pp[2 + 8 * n + 2 * tq] = o[n][2 * i]; pp[3 + 8 * n + 2 * tq] = o[n][2 * i + 1]; }
+            continue;
+        }
+        for (int n = 0; n < 16; n++)
+            *(float2*)(out + row * 128 + 8 * n + 2 * tq) = make_float2(o[n][2 * i] / l[i], o[n][2 * i + 1] / l[i]);
+    }
+}
+
+// Combine split-K partials of attention_dec / attention_tc. grid T * nh, block 128 (= hd).
+extern "C" __global__ void attn_merge(const float* part, float* out, int rows, int S) {
+    const int r = blockIdx.x, d = threadIdx.x;
+    float M = -INFINITY;
+    for (int z = 0; z < S; z++) M = fmaxf(M, part[((size_t)z * rows + r) * 130]);
+    float L = 0.0f, o = 0.0f;
+    for (int z = 0; z < S; z++) {
+        const float* pp = part + ((size_t)z * rows + r) * 130;
+        if (pp[1] == 0.0f) continue;  // split saw no visible position
+        const float c = expf(pp[0] - M);
+        L += pp[1] * c;
+        o += pp[2 + d] * c;
+    }
+    out[(size_t)r * 128 + d] = o / L;
 }
 
 // KV cache store: dst[i] = (f16) src[i].
