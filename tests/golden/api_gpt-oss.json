@@ -1,0 +1,4651 @@
+{
+ "cases": {
+  "chat_text": {
+   "path": "/v1/chat/completions",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France? Answer in one word."
+     }
+    ],
+    "max_tokens": 200,
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "choices": [
+      {
+       "finish_reason": "stop",
+       "index": 0,
+       "message": {
+        "role": "assistant",
+        "content": "Paris",
+        "reasoning_content": "The user asks: \"What is the capital of France? Answer in one word.\" The answer is \"Paris\". Just output that."
+       }
+      }
+     ],
+     "created": 1795791675,
+     "model": "local-code",
+     "system_fingerprint": "b1-e6443bd",
+     "object": "chat.completion",
+     "usage": {
+      "completion_tokens": 38,
+      "prompt_tokens": 79,
+      "total_tokens": 117,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "id": "chatcmpl-obbCkHw2wtaS4gRKAqelzr9wtrULcY3r",
+     "timings": {
+      "cache_n": 0,
+      "prompt_n": 79,
+      "prompt_ms": 1336.507,
+      "prompt_per_token_ms": 16.91781012658228,
+      "prompt_per_second": 59.10930507659144,
+      "predicted_n": 38,
+      "predicted_ms": 1839.485,
+      "predicted_per_token_ms": 49.71581081081081,
+      "predicted_per_second": 20.114325476967736
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "role": "assistant",
+          "content": null
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "The"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " user"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " asks"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": ":"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " \""
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "What"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " is"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " the"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " capital"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " of"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " France"
+         }
+        }
+       ],
+       "created": 1795791675,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "?"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " Answer"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " in"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " one"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " word"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": ".\""
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " The"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " answer"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " is"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " \""
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "Paris"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "\"."
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " Just"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " output"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " that"
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "."
+         }
+        }
+       ],
+       "created": 1795791676,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "Paris"
+         }
+        }
+       ],
+       "created": 1795791677,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": "stop",
+         "index": 0,
+         "delta": {}
+        }
+       ],
+       "created": 1795791677,
+       "id": "chatcmpl-iUNzZ4qRhUFNhVZm48NJaArcxdxouVYT",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk",
+       "timings": {
+        "cache_n": 74,
+        "prompt_n": 5,
+        "prompt_ms": 153.139,
+        "prompt_per_token_ms": 30.6278,
+        "prompt_per_second": 32.65007607467725,
+        "predicted_n": 38,
+        "predicted_ms": 1831.165,
+        "predicted_per_token_ms": 49.490945945945946,
+        "predicted_per_second": 20.205716033235674
+       }
+      }
+     },
+     {
+      "event": null,
+      "data": "[DONE]"
+     }
+    ]
+   }
+  },
+  "chat_tool": {
+   "path": "/v1/chat/completions",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "max_tokens": 200,
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris right now?"
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "choices": [
+      {
+       "finish_reason": "tool_calls",
+       "index": 0,
+       "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "We need to call get_weather function with city \"Paris\".",
+        "tool_calls": [
+         {
+          "type": "function",
+          "function": {
+           "name": "get_weather",
+           "arguments": "{\"city\":\"Paris\"}"
+          },
+          "id": "0hDX9QAwOYNS3AnXQWBNmc5IavCTCpKA"
+         }
+        ]
+       }
+      }
+     ],
+     "created": 1795791680,
+     "model": "local-code",
+     "system_fingerprint": "b1-e6443bd",
+     "object": "chat.completion",
+     "usage": {
+      "completion_tokens": 36,
+      "prompt_tokens": 132,
+      "total_tokens": 168,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      }
+     },
+     "id": "chatcmpl-u4An9SwAjVMzBjKxS3BUZ8AzjT954abt",
+     "timings": {
+      "cache_n": 0,
+      "prompt_n": 132,
+      "prompt_ms": 1196.935,
+      "prompt_per_token_ms": 9.067689393939393,
+      "prompt_per_second": 110.2816777853434,
+      "predicted_n": 36,
+      "predicted_ms": 1730.348,
+      "predicted_per_token_ms": 49.438514285714284,
+      "predicted_per_second": 20.227145059837675
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "role": "assistant",
+          "content": null
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "We"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " need"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " to"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " call"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " get"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "_weather"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " function"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " with"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " city"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": " \""
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "Paris"
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "reasoning_content": "\"."
+         }
+        }
+       ],
+       "created": 1795791680,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "id": "lRlfHKPnlrR23oAwJZfMXqkxUv7iIyvV",
+            "type": "function",
+            "function": {
+             "name": "get_weather",
+             "arguments": "{"
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "function": {
+             "arguments": "\""
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "function": {
+             "arguments": "city"
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "function": {
+             "arguments": "\":\""
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "function": {
+             "arguments": "Paris"
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "tool_calls": [
+           {
+            "index": 0,
+            "function": {
+             "arguments": "\"}"
+            }
+           }
+          ]
+         }
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": "tool_calls",
+         "index": 0,
+         "delta": {}
+        }
+       ],
+       "created": 1795791681,
+       "id": "chatcmpl-NdNGLvGbA9rVgZc4smtYPhIAHrun43GW",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk",
+       "timings": {
+        "cache_n": 131,
+        "prompt_n": 1,
+        "prompt_ms": 52.085,
+        "prompt_per_token_ms": 52.085,
+        "prompt_per_second": 19.19938561966017,
+        "predicted_n": 36,
+        "predicted_ms": 1737.808,
+        "predicted_per_token_ms": 49.65165714285714,
+        "predicted_per_second": 20.1403146952943
+       }
+      }
+     },
+     {
+      "event": null,
+      "data": "[DONE]"
+     }
+    ]
+   }
+  },
+  "chat_tool_result": {
+   "path": "/v1/chat/completions",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the current weather for a city.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "max_tokens": 200,
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris right now?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "reasoning_content": "The user wants the current weather in Paris. Use get_weather.",
+      "tool_calls": [
+       {
+        "id": "call_01",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Paris\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_01",
+      "content": "18 C, light rain"
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "choices": [
+      {
+       "finish_reason": "stop",
+       "index": 0,
+       "message": {
+        "role": "assistant",
+        "content": "The current weather in Paris is **18 °C with light rain**."
+       }
+      }
+     ],
+     "created": 1795791683,
+     "model": "local-code",
+     "system_fingerprint": "b1-e6443bd",
+     "object": "chat.completion",
+     "usage": {
+      "completion_tokens": 19,
+      "prompt_tokens": 189,
+      "total_tokens": 208,
+      "prompt_tokens_details": {
+       "cached_tokens": 135
+      }
+     },
+     "id": "chatcmpl-3GkKhVLWxLMYcGInGCgIYAvXd87WimCp",
+     "timings": {
+      "cache_n": 135,
+      "prompt_n": 54,
+      "prompt_ms": 929.468,
+      "prompt_per_token_ms": 17.21237037037037,
+      "prompt_per_second": 58.097750541169795,
+      "predicted_n": 19,
+      "predicted_ms": 888.862,
+      "predicted_per_token_ms": 49.38122222222222,
+      "predicted_per_second": 20.250612581030577
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "role": "assistant",
+          "content": null
+         }
+        }
+       ],
+       "created": 1795791683,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "Here"
+         }
+        }
+       ],
+       "created": 1795791683,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "’s"
+         }
+        }
+       ],
+       "created": 1795791683,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " the"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " current"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " weather"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " in"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " Paris"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ":\n\n"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "-"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " **"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "Temperature"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ":**"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " "
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "18"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " "
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "°C"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "  \n"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "-"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " **"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "Condition"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ":**"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " Light"
+         }
+        }
+       ],
+       "created": 1795791684,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " rain"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "  \n\n"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "Let"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " me"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " know"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " if"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " you"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "’d"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " like"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " more"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " details"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " ("
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "humidity"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ","
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " wind"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ","
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " forecast"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ","
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": " etc"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": ".)"
+         }
+        }
+       ],
+       "created": 1795791685,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": null,
+         "index": 0,
+         "delta": {
+          "content": "!"
+         }
+        }
+       ],
+       "created": 1795791686,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk"
+      }
+     },
+     {
+      "event": null,
+      "data": {
+       "choices": [
+        {
+         "finish_reason": "stop",
+         "index": 0,
+         "delta": {}
+        }
+       ],
+       "created": 1795791686,
+       "id": "chatcmpl-oTt9v0S6rTM2X5hiPrE6NUKaaIYHktb8",
+       "model": "local-code",
+       "system_fingerprint": "b1-e6443bd",
+       "object": "chat.completion.chunk",
+       "timings": {
+        "cache_n": 188,
+        "prompt_n": 1,
+        "prompt_ms": 51.208,
+        "prompt_per_token_ms": 51.208,
+        "prompt_per_second": 19.528198718950165,
+        "predicted_n": 47,
+        "predicted_ms": 2269.57,
+        "predicted_per_token_ms": 49.33847826086957,
+        "predicted_per_second": 20.268156523041807
+       }
+      }
+     },
+     {
+      "event": null,
+      "data": "[DONE]"
+     }
+    ]
+   }
+  },
+  "messages_text": {
+   "path": "/v1/messages",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France? Answer in one word."
+     }
+    ],
+    "max_tokens": 200,
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-IRMIjNQ77SOcJNW4jf9C8xr5noG83RK7",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "thinking",
+       "thinking": "The user asks: \"What is the capital of France? Answer in one word.\" The answer is \"Paris\". Just output that.",
+       "signature": ""
+      },
+      {
+       "type": "text",
+       "text": "Paris"
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "end_turn",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 0,
+      "input_tokens": 79,
+      "output_tokens": 38
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-IsNpyP1RHqkOXGhJCMlQqWimdNvfgBkl",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 74,
+         "input_tokens": 5,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "thinking",
+        "thinking": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "The"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " user"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " asks"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": ":"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " \""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "What"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " is"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " the"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " capital"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " of"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " France"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "?"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " Answer"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " in"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " one"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " word"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": ".\""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " The"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " answer"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " is"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " \""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "Paris"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "\"."
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " Just"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " output"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " that"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "."
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 1,
+       "content_block": {
+        "type": "text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "text_delta",
+        "text": "Paris"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "signature_delta",
+        "signature": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 1
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 38
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "messages_tool": {
+   "path": "/v1/messages",
+   "request": {
+    "tools": [
+     {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    ],
+    "max_tokens": 200,
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris right now?"
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-vY3F5JeX7WhJdwqHZS7yjq3afJaTkEgm",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "thinking",
+       "thinking": "We need to call get_weather function with city \"Paris\".",
+       "signature": ""
+      },
+      {
+       "type": "tool_use",
+       "id": "JkROuXMwJc9jdfL8ZIMrIhEou9C2rhcJ",
+       "name": "get_weather",
+       "input": {
+        "city": "Paris"
+       }
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "tool_use",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 130,
+      "input_tokens": 2,
+      "output_tokens": 36
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-kXYmlHfgxjVkHUZujCcgiZSutVaCjUPJ",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 131,
+         "input_tokens": 1,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "thinking",
+        "thinking": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "We"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " need"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " to"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " call"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " get"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "_weather"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " function"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " with"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " city"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": " \""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "Paris"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "thinking_delta",
+        "thinking": "\"."
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 1,
+       "content_block": {
+        "type": "tool_use",
+        "id": "q0Oe1foytu2LFriNOFfP5claKIWsXg8R",
+        "name": "get_weather"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "\""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "city"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "\":\""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "Paris"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 1,
+       "delta": {
+        "type": "input_json_delta",
+        "partial_json": "\"}"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "signature_delta",
+        "signature": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 1
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "tool_use",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 36
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "messages_tool_result": {
+   "path": "/v1/messages",
+   "request": {
+    "tools": [
+     {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    ],
+    "max_tokens": 200,
+    "messages": [
+     {
+      "role": "user",
+      "content": "What's the weather in Paris right now?"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "thinking",
+        "thinking": "The user wants the current weather in Paris. Use get_weather.",
+        "signature": ""
+       },
+       {
+        "type": "tool_use",
+        "id": "toolu_01",
+        "name": "get_weather",
+        "input": {
+         "city": "Paris"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "toolu_01",
+        "content": "18 C, light rain"
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "id": "chatcmpl-EKvFgNzMTrFM9SsbOtFtnjamDyaD1Pnq",
+     "type": "message",
+     "role": "assistant",
+     "content": [
+      {
+       "type": "text",
+       "text": "Here’s the current weather in Paris:\n\n- **Temperature:** 18 °C  \n- **Condition:** Light rain  \n\nLet me know if you’d like more details (humidity, wind, forecast, etc.)!"
+      }
+     ],
+     "model": "local-code",
+     "stop_reason": "end_turn",
+     "stop_sequence": null,
+     "usage": {
+      "cache_read_input_tokens": 135,
+      "input_tokens": 54,
+      "output_tokens": 47
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "message_start",
+      "data": {
+       "type": "message_start",
+       "message": {
+        "id": "chatcmpl-YldX1EicsSbR9VX0b7vjpYf1svw4dwrQ",
+        "type": "message",
+        "role": "assistant",
+        "content": [],
+        "model": "local-code",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+         "cache_read_input_tokens": 188,
+         "input_tokens": 1,
+         "output_tokens": 0
+        }
+       }
+      }
+     },
+     {
+      "event": "content_block_start",
+      "data": {
+       "type": "content_block_start",
+       "index": 0,
+       "content_block": {
+        "type": "text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "The"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " current"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " weather"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " in"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " Paris"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " is"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " **"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "18"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " "
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "°C"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " with"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " light"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": " rain"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "**"
+       }
+      }
+     },
+     {
+      "event": "content_block_delta",
+      "data": {
+       "type": "content_block_delta",
+       "index": 0,
+       "delta": {
+        "type": "text_delta",
+        "text": "."
+       }
+      }
+     },
+     {
+      "event": "content_block_stop",
+      "data": {
+       "type": "content_block_stop",
+       "index": 0
+      }
+     },
+     {
+      "event": "message_delta",
+      "data": {
+       "type": "message_delta",
+       "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null
+       },
+       "usage": {
+        "output_tokens": 19
+       }
+      }
+     },
+     {
+      "event": "message_stop",
+      "data": {
+       "type": "message_stop"
+      }
+     }
+    ]
+   }
+  },
+  "responses_text": {
+   "path": "/v1/responses",
+   "request": {
+    "input": "What is the capital of France? Answer in one word.",
+    "max_output_tokens": 200,
+    "store": false,
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795791700,
+     "created_at": 1795791700,
+     "id": "resp_gWQBUb5txejyI61ic7LN7YyE2du4XswL",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "id": "rs_PvB9wy9DHnQy7aRYOjediF0WThh8AfhW",
+       "summary": [],
+       "type": "reasoning",
+       "content": [
+        {
+         "text": "The user asks: \"What is the capital of France? Answer in one word.\" The answer is \"Paris\". Just output that.",
+         "type": "reasoning_text"
+        }
+       ],
+       "encrypted_content": "",
+       "status": "completed"
+      },
+      {
+       "content": [
+        {
+         "type": "output_text",
+         "annotations": [],
+         "logprobs": [],
+         "text": "Paris"
+        }
+       ],
+       "id": "msg_vVSCNdpAUdJRlGR8s7DUavo077A9slaC",
+       "role": "assistant",
+       "status": "completed",
+       "type": "message"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 79,
+      "output_tokens": 38,
+      "total_tokens": 117,
+      "input_tokens_details": {
+       "cached_tokens": 74
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_e8ckouNOYvr0c212Rjdaq5IwpIsRrUtM",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_e8ckouNOYvr0c212Rjdaq5IwpIsRrUtM",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE",
+        "summary": [],
+        "type": "reasoning",
+        "content": [],
+        "encrypted_content": "",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "The",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " user",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " asks",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": ":",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " \"",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "What",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " is",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " the",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " capital",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " of",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " France",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "?",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " Answer",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " in",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " one",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " word",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": ".\"",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " The",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " answer",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " is",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " \"",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "Paris",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "\".",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " Just",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " output",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " that",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": ".",
+       "item_id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE"
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 1,
+       "item": {
+        "content": [],
+        "id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+       }
+      }
+     },
+     {
+      "event": "response.content_part.added",
+      "data": {
+       "type": "response.content_part.added",
+       "item_id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+       "output_index": 1,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+       "output_index": 1,
+       "content_index": 0,
+       "delta": "Paris"
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE",
+        "summary": [],
+        "type": "reasoning",
+        "content": [
+         {
+          "text": "The user asks: \"What is the capital of France? Answer in one word.\" The answer is \"Paris\". Just output that.",
+          "type": "reasoning_text"
+         }
+        ],
+        "encrypted_content": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_text.done",
+      "data": {
+       "type": "response.output_text.done",
+       "item_id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+       "output_index": 1,
+       "content_index": 0,
+       "text": "Paris"
+      }
+     },
+     {
+      "event": "response.content_part.done",
+      "data": {
+       "type": "response.content_part.done",
+       "item_id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+       "output_index": 1,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "annotations": [],
+        "logprobs": [],
+        "text": "Paris"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 1,
+       "item": {
+        "type": "message",
+        "status": "completed",
+        "id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+        "content": [
+         {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "Paris"
+         }
+        ],
+        "role": "assistant"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_e8ckouNOYvr0c212Rjdaq5IwpIsRrUtM",
+        "object": "response",
+        "created_at": 1795791702,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "id": "rs_byShkGAyuiBMxUTht45gsMU4bANYOwgE",
+          "summary": [],
+          "type": "reasoning",
+          "content": [
+           {
+            "text": "The user asks: \"What is the capital of France? Answer in one word.\" The answer is \"Paris\". Just output that.",
+            "type": "reasoning_text"
+           }
+          ],
+          "encrypted_content": ""
+         },
+         {
+          "type": "message",
+          "status": "completed",
+          "id": "msg_uBDEJBTRuRVzz2K5sMQPzoVVswo36oQe",
+          "content": [
+           {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": "Paris"
+           }
+          ],
+          "role": "assistant"
+         }
+        ],
+        "usage": {
+         "input_tokens": 79,
+         "output_tokens": 38,
+         "total_tokens": 117,
+         "input_tokens_details": {
+          "cached_tokens": 74
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 74,
+        "prompt_n": 5,
+        "prompt_ms": 151.951,
+        "prompt_per_token_ms": 30.3902,
+        "prompt_per_second": 32.905344486051426,
+        "predicted_n": 38,
+        "predicted_ms": 1819.508,
+        "predicted_per_token_ms": 49.175891891891894,
+        "predicted_per_second": 20.33516752880449
+       }
+      }
+     }
+    ]
+   }
+  },
+  "responses_tool": {
+   "path": "/v1/responses",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": false
+     }
+    ],
+    "max_output_tokens": 200,
+    "store": false,
+    "input": [
+     {
+      "type": "message",
+      "role": "user",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "What's the weather in Paris right now?"
+       }
+      ]
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795791704,
+     "created_at": 1795791704,
+     "id": "resp_buteXZltXjf6ndHgZzcJrOlB99BrQZ9Q",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "id": "rs_z553MO3E20D9KsPJJaCkRuQcHJ1nWnTq",
+       "summary": [],
+       "type": "reasoning",
+       "content": [
+        {
+         "text": "We need to call get_weather function with city \"Paris\".",
+         "type": "reasoning_text"
+        }
+       ],
+       "encrypted_content": "",
+       "status": "completed"
+      },
+      {
+       "id": "fc_dydQY43lCk6XvdBy0iJYDLgCIesWf3Cx",
+       "type": "function_call",
+       "status": "completed",
+       "arguments": "{\"city\":\"Paris\"}",
+       "call_id": "call_dydQY43lCk6XvdBy0iJYDLgCIesWf3Cx",
+       "name": "get_weather"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 132,
+      "output_tokens": 36,
+      "total_tokens": 168,
+      "input_tokens_details": {
+       "cached_tokens": 130
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_mnzmbOJLSDOgVfgtSp6I0Jas03FL393g",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_mnzmbOJLSDOgVfgtSp6I0Jas03FL393g",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv",
+        "summary": [],
+        "type": "reasoning",
+        "content": [],
+        "encrypted_content": "",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "We",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " need",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " to",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " call",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " get",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "_weather",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " function",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " with",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " city",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " \"",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "Paris",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.reasoning_text.delta",
+      "data": {
+       "type": "response.reasoning_text.delta",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "\".",
+       "item_id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv"
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 1,
+       "item": {
+        "id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+        "arguments": "",
+        "call_id": "call_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+        "name": "get_weather",
+        "type": "function_call",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "{",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\"",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "city",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\":\"",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "Paris",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+       "type": "response.function_call_arguments.delta",
+       "delta": "\"}",
+       "item_id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+       "output_index": 1
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv",
+        "summary": [],
+        "type": "reasoning",
+        "content": [
+         {
+          "text": "We need to call get_weather function with city \"Paris\".",
+          "type": "reasoning_text"
+         }
+        ],
+        "encrypted_content": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 1,
+       "item": {
+        "id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+        "type": "function_call",
+        "status": "completed",
+        "arguments": "{\"city\":\"Paris\"}",
+        "call_id": "call_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+        "name": "get_weather"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_mnzmbOJLSDOgVfgtSp6I0Jas03FL393g",
+        "object": "response",
+        "created_at": 1795791706,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "id": "rs_vS48SElJSscMA2NMvbQObg68dpYIDXnv",
+          "summary": [],
+          "type": "reasoning",
+          "content": [
+           {
+            "text": "We need to call get_weather function with city \"Paris\".",
+            "type": "reasoning_text"
+           }
+          ],
+          "encrypted_content": ""
+         },
+         {
+          "id": "fc_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"city\":\"Paris\"}",
+          "call_id": "call_DGufTHCovdB27Re6LVA3SDCt9SURTjUn",
+          "name": "get_weather"
+         }
+        ],
+        "usage": {
+         "input_tokens": 132,
+         "output_tokens": 36,
+         "total_tokens": 168,
+         "input_tokens_details": {
+          "cached_tokens": 131
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 131,
+        "prompt_n": 1,
+        "prompt_ms": 50.098,
+        "prompt_per_token_ms": 50.098,
+        "prompt_per_second": 19.960876681703862,
+        "predicted_n": 36,
+        "predicted_ms": 1720.475,
+        "predicted_per_token_ms": 49.15642857142857,
+        "predicted_per_second": 20.343219169124804
+       }
+      }
+     }
+    ]
+   }
+  },
+  "responses_tool_result": {
+   "path": "/v1/responses",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": false
+     }
+    ],
+    "max_output_tokens": 200,
+    "store": false,
+    "input": [
+     {
+      "type": "message",
+      "role": "user",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "What's the weather in Paris right now?"
+       }
+      ]
+     },
+     {
+      "type": "reasoning",
+      "summary": [],
+      "content": [
+       {
+        "type": "reasoning_text",
+        "text": "The user wants the current weather in Paris. Use get_weather."
+       }
+      ]
+     },
+     {
+      "type": "function_call",
+      "call_id": "call_01",
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     },
+     {
+      "type": "function_call_output",
+      "call_id": "call_01",
+      "output": "18 C, light rain"
+     }
+    ],
+    "model": "local-code",
+    "temperature": 0
+   },
+   "full": {
+    "status": 200,
+    "body": {
+     "completed_at": 1795791709,
+     "created_at": 1795791709,
+     "id": "resp_XwnSnAhCiayCsgwoFnv342exiJS0j7Fc",
+     "model": "local-code",
+     "object": "response",
+     "output": [
+      {
+       "content": [
+        {
+         "type": "output_text",
+         "annotations": [],
+         "logprobs": [],
+         "text": "Here’s the current weather in Paris:\n\n- **Temperature:** 18 °C  \n- **Condition:** Light rain  \n\nLet me know if you’d like more details (humidity, wind, forecast, etc.)!"
+        }
+       ],
+       "id": "msg_8Y8L4Hsg0A6e8NKgaNbvPt1prKgt8JVo",
+       "role": "assistant",
+       "status": "completed",
+       "type": "message"
+      }
+     ],
+     "status": "completed",
+     "usage": {
+      "input_tokens": 189,
+      "output_tokens": 47,
+      "total_tokens": 236,
+      "input_tokens_details": {
+       "cached_tokens": 135
+      }
+     }
+    }
+   },
+   "stream": {
+    "status": 200,
+    "events": [
+     {
+      "event": "response.created",
+      "data": {
+       "type": "response.created",
+       "response": {
+        "id": "resp_j8HYSW0RBpL3vkq37whJCNkfmUGHt1i1",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.in_progress",
+      "data": {
+       "type": "response.in_progress",
+       "response": {
+        "id": "resp_j8HYSW0RBpL3vkq37whJCNkfmUGHt1i1",
+        "object": "response",
+        "status": "in_progress"
+       }
+      }
+     },
+     {
+      "event": "response.output_item.added",
+      "data": {
+       "type": "response.output_item.added",
+       "output_index": 0,
+       "item": {
+        "content": [],
+        "id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+       }
+      }
+     },
+     {
+      "event": "response.content_part.added",
+      "data": {
+       "type": "response.content_part.added",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "text": ""
+       }
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "The"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " current"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " weather"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " in"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " Paris"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " is"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " **"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "18"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " "
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "°C"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " with"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " light"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": " rain"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "**"
+      }
+     },
+     {
+      "event": "response.output_text.delta",
+      "data": {
+       "type": "response.output_text.delta",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "delta": "."
+      }
+     },
+     {
+      "event": "response.output_text.done",
+      "data": {
+       "type": "response.output_text.done",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "text": "The current weather in Paris is **18 °C with light rain**."
+      }
+     },
+     {
+      "event": "response.content_part.done",
+      "data": {
+       "type": "response.content_part.done",
+       "item_id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+       "output_index": 0,
+       "content_index": 0,
+       "part": {
+        "type": "output_text",
+        "annotations": [],
+        "logprobs": [],
+        "text": "The current weather in Paris is **18 °C with light rain**."
+       }
+      }
+     },
+     {
+      "event": "response.output_item.done",
+      "data": {
+       "type": "response.output_item.done",
+       "output_index": 0,
+       "item": {
+        "type": "message",
+        "status": "completed",
+        "id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+        "content": [
+         {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "The current weather in Paris is **18 °C with light rain**."
+         }
+        ],
+        "role": "assistant"
+       }
+      }
+     },
+     {
+      "event": "response.completed",
+      "data": {
+       "type": "response.completed",
+       "response": {
+        "id": "resp_j8HYSW0RBpL3vkq37whJCNkfmUGHt1i1",
+        "object": "response",
+        "created_at": 1795791710,
+        "status": "completed",
+        "model": "local-code",
+        "output": [
+         {
+          "type": "message",
+          "status": "completed",
+          "id": "msg_VxA2Rms6b5M4RbqnkibgaCy3q00WVrbM",
+          "content": [
+           {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": "The current weather in Paris is **18 °C with light rain**."
+           }
+          ],
+          "role": "assistant"
+         }
+        ],
+        "usage": {
+         "input_tokens": 189,
+         "output_tokens": 19,
+         "total_tokens": 208,
+         "input_tokens_details": {
+          "cached_tokens": 188
+         }
+        }
+       },
+       "timings": {
+        "cache_n": 188,
+        "prompt_n": 1,
+        "prompt_ms": 49.925,
+        "prompt_per_token_ms": 49.925,
+        "prompt_per_second": 20.030045067601403,
+        "predicted_n": 19,
+        "predicted_ms": 884.688,
+        "predicted_per_token_ms": 49.14933333333333,
+        "predicted_per_second": 20.34615593293907
+       }
+      }
+     }
+    ]
+   }
+  }
+ },
+ "count_tokens": {
+  "status": 200,
+  "body": {
+   "input_tokens": 132
+  }
+ },
+ "models": {
+  "status": 200,
+  "body": {
+   "models": [
+    {
+     "name": "local-code",
+     "model": "local-code",
+     "modified_at": "",
+     "size": "",
+     "digest": "",
+     "type": "model",
+     "description": "",
+     "tags": [
+      ""
+     ],
+     "capabilities": [
+      "completion"
+     ],
+     "parameters": "",
+     "details": {
+      "parent_model": "",
+      "format": "gguf",
+      "family": "",
+      "families": [
+       ""
+      ],
+      "parameter_size": "",
+      "quantization_level": ""
+     }
+    }
+   ],
+   "object": "list",
+   "data": [
+    {
+     "id": "local-code",
+     "aliases": [
+      "local-code"
+     ],
+     "tags": [],
+     "object": "model",
+     "architecture": {
+      "input_modalities": [
+       "text"
+      ],
+      "output_modalities": [
+       "text"
+      ]
+     },
+     "created": 1795791710,
+     "owned_by": "llamacpp",
+     "meta": {
+      "vocab_type": 2,
+      "n_vocab": 201088,
+      "n_ctx": 4096,
+      "n_ctx_train": 131072,
+      "n_embd": 2880,
+      "n_params": 20914757184,
+      "size": 12096558336,
+      "ftype": "MXFP4 MoE"
+     }
+    }
+   ]
+  }
+ },
+ "health": {
+  "status": 200,
+  "body": {
+   "status": "ok"
+  }
+ }
+}

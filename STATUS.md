@@ -900,3 +900,27 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - Decode is 13 tok/s with the 1000 MiB test cache; the default cache was not benchmarked.
   - The CPU experts dequantize MXFP4 per row, with no AVX2 dot.
   - Serving (arch-selected engine, Harmony tool calls / analysis channel) is 13e.
+
+### Phase 13e: gpt-oss serving (2026-11-27), oracle-verified
+
+- **Engine by arch:** `eomoe serve --model gpt-oss-20b-MXFP4.gguf` already builds `GpuModel` (13d). The server switches to Harmony output when the vocab has `<|channel|>`.
+- **EOG:** `<|return|>` (the GGUF EOS) and `<|call|>` added. `<|end|>` is not EOG, since it ends every Harmony message.
+- **Harmony parser (`src/harmony.rs`, after llama.cpp common/parsers/gpt-oss.cpp):**
+  - analysis → reasoning; final and commentary preambles → content; `to=functions.NAME` (in the channel or the role header) → one tool call, with the raw JSON body as arguments.
+  - A stray `<|channel|>commentary` prefix is skipped (the last channel wins). Calls without request tools are unsolicited and dropped, as in llama.cpp.
+  - Raw prompts (`/completion`, `/v1/completions`, Ollama raw/FIM) are not parsed.
+- **Reasoning out (`Out::Reasoning`), laid out as in llama-server server-task.cpp:**
+  - chat `reasoning_content` deltas and message field;
+  - Anthropic `thinking` block at index 0 with an empty `signature_delta` before the stops;
+  - Responses `reasoning` item (`rs_…`, `reasoning_text.delta`; no status when streamed, `completed` in the body), which shifts the message and call output indices;
+  - Ollama `thinking`.
+- **Reasoning in:**
+  - Anthropic `thinking` blocks and Responses `reasoning` items become `reasoning_content`;
+  - for gpt-oss, `reasoning_content` becomes the template's `thinking`, and content is dropped when there are tool calls (common_chat_params_init_gpt_oss).
+- **Gates:**
+  - `harmony::tests` (3 unit tests). Mutations (no `<|end|>` hold-back, first channel instead of last, calls kept without tools) are all red.
+  - `phase5_golden::api_matches_oracle_gptoss`: tests/golden/api_gpt-oss.json from tools/capture_api_gptoss.py, captured from the llama.cpp `e6443bd` oracle (GPU, `-ot exps=CPU`, fenced at 18G).
+    - 9 cases (chat/messages/responses × text, tool call, tool result with reasoning in the history), streamed and full.
+    - All match: prompt tokens 79/132/189, stop/finish, calls `get_weather {"city":"Paris"}`, reasoning presence and keys, and streamed event shapes. `count_tokens` 132 also matches.
+    - Mutations (all red): no `thinking` mapping (6 mismatches), Anthropic thinking input dropped (2), Responses reasoning input dropped (2; the merge branch is not covered by the golden), `<|call|>` not EOG, chat reasoning streamed as content (2).
+- **Not done (ponytail):** `reasoning_effort` (the template default is medium); the Harmony tool-call grammar (greedy output matched without it); whitespace-only reasoning is not discarded.

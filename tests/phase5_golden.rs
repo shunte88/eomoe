@@ -4,21 +4,16 @@
 //! Generated text is only required to be non-empty where the oracle's is: greedy text differs
 //! between backends (see STATUS.md, Phase 3 precision floor).
 //!
+//! Phase 13e: the same gate on gpt-oss-20b (tests/golden/api_gpt-oss.json, from
+//! tools/capture_api_gptoss.py) adds reasoning: whether each response has it, and where it streams.
+//!
 //! Needs the GPU and the model: cargo test --release --test phase5_golden -- --ignored
 
 mod common;
-use common::{events, Server};
+use common::{events, gptoss_path, Server};
 use serde_json::{json, Value};
 
 const PORT: u16 = 8097;
-
-fn start() -> Server {
-    common::start(PORT)
-}
-
-fn http(method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
-    common::http(PORT, method, path, body)
-}
 
 /// Chat completion chunks (no event lines): what each delta carries, runs collapsed.
 fn chat_shape(evs: &[(Option<String>, Value)]) -> Vec<String> {
@@ -36,10 +31,12 @@ fn chat_shape(evs: &[(Option<String>, Value)]) -> Vec<String> {
             "role".into()
         } else if c["delta"]["tool_calls"].is_array() {
             "tool_calls".into()
+        } else if c["delta"]["reasoning_content"].is_string() {
+            "reasoning".into()
         } else {
             "content".into()
         };
-        if (t == "content" || t == "tool_calls") && v.last() == Some(&t) {
+        if (t == "content" || t == "tool_calls" || t == "reasoning") && v.last() == Some(&t) {
             continue;
         }
         v.push(t);
@@ -74,8 +71,9 @@ fn summary(path: &str, b: &Value) -> Value {
         let u = &b["usage"];
         let calls: Vec<Value> = b["content"].as_array().unwrap().iter().filter(|c| c["type"] == "tool_use").map(|c| json!([c["name"], c["input"]])).collect();
         let has_text = b["content"].as_array().unwrap().iter().any(|c| c["type"] == "text" && c["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
+        let thinking = b["content"].as_array().unwrap().iter().any(|c| c["type"] == "thinking" && c["thinking"].as_str().is_some_and(|t| !t.trim().is_empty()));
         json!({"prompt": u["input_tokens"].as_u64().unwrap() + u["cache_read_input_tokens"].as_u64().unwrap(), "stop": b["stop_reason"], "calls": calls, "text": has_text,
-               "keys": keys(b), "model": b["model"]})
+               "thinking": thinking, "keys": keys(b), "model": b["model"]})
     } else if path == "/v1/chat/completions" {
         let c = &b["choices"][0];
         let m = &c["message"];
@@ -87,7 +85,8 @@ fn summary(path: &str, b: &Value) -> Value {
         let out = b["output"].as_array().unwrap();
         let calls: Vec<Value> = out.iter().filter(|o| o["type"] == "function_call").map(|o| json!([o["name"], serde_json::from_str::<Value>(o["arguments"].as_str().unwrap()).unwrap()])).collect();
         let has_text = out.iter().any(|o| o["type"] == "message" && o["content"][0]["text"].as_str().is_some_and(|t| !t.trim().is_empty()));
-        json!({"prompt": b["usage"]["input_tokens"], "status": b["status"], "calls": calls, "text": has_text, "keys": keys(b), "model": b["model"]})
+        let reasoning: Vec<Value> = out.iter().filter(|o| o["type"] == "reasoning").map(|o| json!([keys(o), o["content"][0]["text"].as_str().is_some_and(|t| !t.trim().is_empty())])).collect();
+        json!({"prompt": b["usage"]["input_tokens"], "status": b["status"], "calls": calls, "text": has_text, "reasoning": reasoning, "keys": keys(b), "model": b["model"]})
     }
 }
 
@@ -100,8 +99,22 @@ fn keys(v: &Value) -> Vec<String> {
 #[test]
 #[ignore]
 fn api_matches_oracle() {
-    let g: Value = serde_json::from_str(&std::fs::read_to_string("tests/golden/api.json").unwrap()).unwrap();
-    let _s = start();
+    gate("api.json", &[]);
+}
+
+#[test]
+#[ignore = "needs the gpt-oss-20b model file"]
+fn api_matches_oracle_gptoss() {
+    gate("api_gpt-oss.json", &["--model", &gptoss_path(), "--ctx-size", "4096"]);
+}
+
+fn http(method: &str, path: &str, body: Option<&Value>) -> (u16, String) {
+    common::http(PORT, method, path, body)
+}
+
+fn gate(golden: &str, args: &[&str]) {
+    let g = common::golden(golden);
+    let _s: Server = common::start_with(PORT, args);
     let mut fails = vec![];
     for (name, c) in g["cases"].as_object().unwrap() {
         let path = c["path"].as_str().unwrap();

@@ -213,11 +213,13 @@ pub async fn generate(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         ms.push(json!({"role": "user", "content": prompt}));
         app.prompt(&Chat { messages: ms.into(), ..options(&b) })
     };
+    // Templated output is chat output (gpt-oss: Harmony channels); raw and FIM output is not.
+    let messages = if raw_mode || !suffix.is_empty() { Value::Null } else { json!([]) };
     // A previous response's `context` continues that conversation.
     let tokens = tokens.map(|t| b["context"].as_array().into_iter().flatten().filter_map(|c| c.as_u64().map(super::tok_id)).chain(t).collect::<Vec<u32>>());
     let context = (!raw_mode).then(|| tokens.as_ref().map(Vec::clone).unwrap_or_default());
     let f = Ollama { app: app.clone(), t0, chat: false, context, a: Acc::default() };
-    let rx = tokens.and_then(|t| app.generate(t, options(&b)));
+    let rx = tokens.and_then(|t| app.generate(t, Chat { messages, ..options(&b) }));
     respond(rx, f, b["stream"].as_bool().unwrap_or(true)).await
 }
 
@@ -268,11 +270,21 @@ struct Ollama {
 
 impl Ollama {
     fn line(&self, text: &str, done: bool) -> Value {
+        self.line_thinking(text, "", done)
+    }
+
+    /// A line with `thinking` (gpt-oss reasoning) when non-empty.
+    fn line_thinking(&self, text: &str, thinking: &str, done: bool) -> Value {
         let mut v = json!({"model": self.app.alias, "created_at": rfc3339(SystemTime::now())});
-        if self.chat {
+        let o = if self.chat {
             v["message"] = json!({"role": "assistant", "content": text});
+            &mut v["message"]
         } else {
             v["response"] = text.into();
+            &mut v
+        };
+        if !thinking.is_empty() {
+            o["thinking"] = thinking.into();
         }
         v["done"] = done.into();
         v
@@ -285,9 +297,9 @@ impl Ollama {
         }).collect()
     }
 
-    fn last(&self, text: &str) -> Value {
+    fn last(&self, text: &str, thinking: &str) -> Value {
         let a = &self.a;
-        let mut v = self.line(text, true);
+        let mut v = self.line_thinking(text, thinking, true);
         v["done_reason"] = if a.finish == Some(Finish::Length) { "length" } else { "stop" }.into();
         if let Some(c) = &self.context {
             // ponytail: the response is re-encoded, not the sampled ids; same text either way.
@@ -310,6 +322,7 @@ impl Format for Ollama {
         match out {
             Out::Start { .. } => vec![],
             Out::Text(t) => vec![format!("{}\n", self.line(t, false))],
+            Out::Reasoning(t) => vec![format!("{}\n", self.line_thinking("", t, false))],
             Out::End { .. } => {
                 let mut v = vec![];
                 if !self.a.calls.is_empty() {
@@ -317,7 +330,7 @@ impl Format for Ollama {
                     l["message"]["tool_calls"] = self.calls();
                     v.push(format!("{l}\n"));
                 }
-                v.push(format!("{}\n", self.last("")));
+                v.push(format!("{}\n", self.last("", "")));
                 v
             }
             Out::Error(e) => vec![format!("{}\n", json!({ "error": self.err(e.clone()) }))],
@@ -325,7 +338,7 @@ impl Format for Ollama {
     }
 
     fn body(&self) -> Value {
-        let mut v = self.last(&self.a.text);
+        let mut v = self.last(&self.a.text, &self.a.reasoning);
         if !self.a.calls.is_empty() {
             v["message"]["tool_calls"] = self.calls();
         }

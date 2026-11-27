@@ -12,6 +12,7 @@ use crate::generate::{Batcher, Event, Finish, Request, Sampling, Utf8Stream};
 use crate::qwen3moe::Engine;
 use crate::template::ChatTemplate;
 use crate::tokenizer::Tokenizer;
+use crate::harmony::Harmony;
 use crate::toolcall::{Splitter, ToolCall};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -38,6 +39,8 @@ pub struct App {
     n_seq: usize,
     /// Requests accepted and not yet finished.
     busy: Arc<AtomicUsize>,
+    /// gpt-oss: chat output is Harmony (crate::harmony).
+    harmony: bool,
 }
 
 /// Request limits (`--max-request-mb`, `--queue-limit`, `--req-timeout`).
@@ -75,8 +78,9 @@ impl App {
         limits: Limits,
         load: impl FnOnce() -> Result<E, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
-        // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
-        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"].iter().filter_map(|t| tok.token_id(t)).collect();
+        // llama.cpp's EOG set: for the Qwen vocab EOS/EOT plus the FIM end tokens; for gpt-oss
+        // <|return|> and <|call|> (never <|end|>, which ends every Harmony message).
+        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|return|>", "<|call|>"].iter().filter_map(|t| tok.token_id(t)).collect();
         eog.push(tok.eos);
         let (jobs, rx) = mpsc::channel::<Request>();
         let (ready_tx, ready) = mpsc::channel();
@@ -113,7 +117,8 @@ impl App {
             })
             .map_err(|e| e.to_string())?;
         let (n_ctx, n_seq) = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
-        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama, limits, n_seq, busy: Arc::default() }))
+        let harmony = tok.token_id("<|channel|>").is_some();
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama, limits, n_seq, busy: Arc::default(), harmony }))
     }
 }
 
@@ -163,6 +168,7 @@ struct Timings {
 enum Out {
     Start { n_prompt: usize, n_cached: usize },
     Text(String),
+    Reasoning(String),
     End { calls: Vec<ToolCall>, finish: Finish, n_out: usize, stop_word: Option<String>, timings: Timings },
     /// Generation failed after the response started.
     Error(Value),
@@ -220,6 +226,17 @@ impl App {
     fn prompt(&self, chat: &Chat) -> Result<Vec<u32>, ApiError> {
         let mut messages = chat.messages.clone();
         flatten_content(&mut messages);
+        if self.harmony {
+            // The gpt-oss template reads `thinking` (llama.cpp common_chat_params_init_gpt_oss).
+            for m in messages.as_array_mut().into_iter().flatten() {
+                if let Some(r) = m.get("reasoning_content").filter(|r| r.is_string()).cloned() {
+                    m["thinking"] = r;
+                    if m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()) {
+                        m.as_object_mut().unwrap().remove("content");
+                    }
+                }
+            }
+        }
         let mut req = json!({ "messages": messages, "add_generation_prompt": true });
         if chat.tools.as_array().is_some_and(|t| !t.is_empty()) {
             req["tools"] = chat.tools.clone();
@@ -260,9 +277,11 @@ impl App {
         self.jobs.send(request(prompt, chat.max_tokens, chat.sampling, gtx)).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
         let app = self.clone();
         let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
+        // Raw prompts (messages Null) are not chat output.
+        let mut split = if self.harmony && !chat.messages.is_null() { Split::Harmony(Harmony::new(has_tools)) } else { Split::Qwen(Splitter::new(has_tools)) };
         tokio::spawn(async move {
             let _busy = busy;
-            let (mut utf8, mut split, mut n_out) = (Utf8Stream::default(), Splitter::new(has_tools), 0);
+            let (mut utf8, mut n_out) = (Utf8Stream::default(), 0);
             let mut stops = StopMatcher::new(chat.stop);
             let mut finish = None;
             let (mut t0, mut t1) = (std::time::Instant::now(), None);
@@ -296,7 +315,10 @@ impl App {
                         }
                         n_out += 1;
                         let (text, hit) = stops.push(&utf8.push(&app.tok.decode_bytes(&[t])));
-                        let text = split.push(&text);
+                        let (reasoning, text) = split.push(&text);
+                        if !reasoning.is_empty() {
+                            otx.send(Out::Reasoning(reasoning)).ok();
+                        }
                         if !text.is_empty() {
                             otx.send(Out::Text(text)).ok();
                         }
@@ -313,7 +335,10 @@ impl App {
                 otx.send(Out::Error(e.1)).ok();
                 return;
             };
-            let (rest, calls) = split.finish(&chat.tools);
+            let (reasoning, rest, calls) = split.finish(&chat.tools);
+            if !reasoning.is_empty() {
+                otx.send(Out::Reasoning(reasoning)).ok();
+            }
             let tail = stops.flush();
             let text = rest + &if calls.is_empty() { tail } else { String::new() };
             if !text.is_empty() {
@@ -324,6 +349,31 @@ impl App {
             otx.send(Out::End { calls, finish, n_out, stop_word: stops.hit, timings }).ok();
         });
         Ok(orx)
+    }
+}
+
+/// Chat output parsing: Qwen3-Coder tool calls, or gpt-oss Harmony channels.
+enum Split {
+    Qwen(Splitter),
+    Harmony(Harmony),
+}
+
+impl Split {
+    /// (reasoning, content) safe to stream now.
+    fn push(&mut self, t: &str) -> (String, String) {
+        match self {
+            Split::Qwen(s) => (String::new(), s.push(t)),
+            Split::Harmony(h) => h.push(t),
+        }
+    }
+    fn finish(self, tools: &Value) -> (String, String, Vec<ToolCall>) {
+        match self {
+            Split::Qwen(s) => {
+                let (c, calls) = s.finish(tools);
+                (String::new(), c, calls)
+            }
+            Split::Harmony(h) => h.finish(),
+        }
     }
 }
 
@@ -424,19 +474,23 @@ fn anthropic_to_chat(b: &Value) -> Result<Chat, ApiError> {
             }
             continue;
         };
-        let (mut parts, mut calls, mut tools) = (vec![], vec![], vec![]);
+        let (mut parts, mut calls, mut tools, mut reasoning) = (vec![], vec![], vec![], String::new());
         for bl in blocks {
             match bl["type"].as_str() {
                 Some("text") => parts.push(json!({"type": "text", "text": bl["text"]})),
+                Some("thinking") => reasoning += bl["thinking"].as_str().unwrap_or(""),
                 Some("tool_use") => calls.push(json!({"id": bl["id"], "type": "function", "function": {"name": bl["name"], "arguments": bl["input"].to_string()}})),
                 Some("tool_result") => tools.push(json!({"role": "tool", "tool_call_id": bl["tool_use_id"], "content": text_of(&bl["content"])})),
                 _ => {}
             }
         }
-        if !parts.is_empty() || !calls.is_empty() {
+        if !parts.is_empty() || !calls.is_empty() || !reasoning.is_empty() {
             let mut msg = json!({"role": role, "content": if parts.is_empty() { json!("") } else { json!(parts) }});
             if !calls.is_empty() {
                 msg["tool_calls"] = calls.into();
+            }
+            if !reasoning.is_empty() {
+                msg["reasoning_content"] = reasoning.into();
             }
             msgs.push(msg);
         }
@@ -507,8 +561,15 @@ fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
                     }
                 } else if ty == "function_call_output" {
                     msgs.push(json!({"role": "tool", "tool_call_id": it["call_id"], "content": text_of_output(&it["output"])}));
-                } else if ty == "reasoning" {
-                    // No reasoning in Qwen3-Coder's template.
+                } else if ty == "reasoning" && it["summary"].is_array() {
+                    let Some(text) = it["content"][0]["text"].as_str() else {
+                        return Err(ApiError::bad("item['content'][0]['text'] is not a string"));
+                    };
+                    if merge {
+                        msgs.last_mut().unwrap()["reasoning_content"] = text.into();
+                    } else {
+                        msgs.push(json!({"role": "assistant", "content": [], "reasoning_content": text}));
+                    }
                 } else {
                     return Err(ApiError::bad("Cannot determine type of 'item'"));
                 }
@@ -590,6 +651,7 @@ trait Format: Send + 'static {
 #[derive(Default)]
 struct Acc {
     text: String,
+    reasoning: String,
     calls: Vec<(String, ToolCall)>,
     n_prompt: usize,
     n_cached: usize,
@@ -604,6 +666,7 @@ impl Acc {
         match out {
             Out::Start { n_prompt, n_cached } => (self.n_prompt, self.n_cached) = (*n_prompt, *n_cached),
             Out::Text(t) => self.text += t,
+            Out::Reasoning(t) => self.reasoning += t,
             Out::End { calls, finish, n_out, stop_word, timings } => {
                 self.calls = calls.iter().map(|c| (rand_id(), c.clone())).collect();
                 (self.finish, self.n_out, self.stop_word, self.timings) = (Some(*finish), *n_out, stop_word.clone(), *timings);
@@ -636,6 +699,7 @@ struct Anthropic {
     model: String,
     a: Acc,
     text_open: bool,
+    think_open: bool,
 }
 
 impl Anthropic {
@@ -660,21 +724,35 @@ impl Format for Anthropic {
                 u["output_tokens"] = 0.into();
                 vec![sse(json!({"type": "message_start", "message": {"id": self.id, "type": "message", "role": "assistant", "content": [], "model": self.model, "stop_reason": null, "stop_sequence": null, "usage": u}}))]
             }
-            Out::Text(t) => {
+            // Blocks: thinking (0), then text, then tool uses (llama-server to_json_anthropic_stream).
+            Out::Reasoning(t) => {
                 let mut v = vec![];
+                if !self.think_open {
+                    self.think_open = true;
+                    v.push(sse(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}})));
+                }
+                v.push(sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": t}})));
+                v
+            }
+            Out::Text(t) => {
+                let (mut v, i) = (vec![], self.think_open as usize);
                 if !self.text_open {
                     self.text_open = true;
-                    v.push(sse(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})));
+                    v.push(sse(json!({"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}})));
                 }
-                v.push(sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}})));
+                v.push(sse(json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": t}})));
                 v
             }
             Out::End { .. } => {
-                let base = self.text_open as usize;
+                let base = self.think_open as usize + self.text_open as usize;
                 let mut v = vec![];
                 for (k, (id, c)) in self.a.calls.iter().enumerate() {
                     v.push(sse(json!({"type": "content_block_start", "index": base + k, "content_block": {"type": "tool_use", "id": id, "name": c.name}})));
                     v.push(sse(json!({"type": "content_block_delta", "index": base + k, "delta": {"type": "input_json_delta", "partial_json": c.arguments}})));
+                }
+                if self.think_open {
+                    // An empty signature: no cryptographic verification for local models.
+                    v.push(sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": ""}})));
                 }
                 for i in 0..base + self.a.calls.len() {
                     v.push(sse(json!({"type": "content_block_stop", "index": i})));
@@ -689,6 +767,9 @@ impl Format for Anthropic {
 
     fn body(&self) -> Value {
         let mut content = vec![];
+        if !self.a.reasoning.is_empty() {
+            content.push(json!({"type": "thinking", "thinking": self.a.reasoning, "signature": ""}));
+        }
         if !self.a.text.is_empty() {
             content.push(json!({"type": "text", "text": self.a.text}));
         }
@@ -703,10 +784,12 @@ impl Format for Anthropic {
 struct Responses {
     id: String,
     msg_id: String,
+    rs_id: String,
     model: String,
     created: u64,
     a: Acc,
     text_open: bool,
+    think_open: bool,
 }
 
 impl Responses {
@@ -716,11 +799,22 @@ impl Responses {
     fn part(&self) -> Value {
         json!({"type": "output_text", "annotations": [], "logprobs": [], "text": self.a.text})
     }
+    /// The reasoning item; llama-server's streamed one has no status.
+    fn rs_item(&self, status: bool) -> Value {
+        let mut i = json!({"id": self.rs_id, "summary": [], "type": "reasoning", "content": [{"text": self.a.reasoning, "type": "reasoning_text"}], "encrypted_content": ""});
+        if status {
+            i["status"] = "completed".into();
+        }
+        i
+    }
     fn fc_item(id: &str, c: &ToolCall) -> Value {
         json!({"id": format!("fc_{id}"), "type": "function_call", "status": "completed", "arguments": c.arguments, "call_id": format!("call_{id}"), "name": c.name})
     }
-    fn output(&self) -> Vec<Value> {
+    fn output(&self, status: bool) -> Vec<Value> {
         let mut o = vec![];
+        if self.think_open {
+            o.push(self.rs_item(status));
+        }
         if self.text_open {
             o.push(self.msg_item());
         }
@@ -735,7 +829,7 @@ impl Responses {
 impl Format for Responses {
     fn on(&mut self, out: &Out) -> Vec<String> {
         self.a.on(out);
-        let ix = |s: &Self| json!({"item_id": s.msg_id, "output_index": 0, "content_index": 0});
+        let ix = |s: &Self| json!({"item_id": s.msg_id, "output_index": s.think_open as usize, "content_index": 0});
         let with = |mut base: Value, ty: &str, extra: Value| {
             base["type"] = ty.into();
             for (k, v) in extra.as_object().unwrap() {
@@ -748,33 +842,45 @@ impl Format for Responses {
                 let r = json!({"id": self.id, "object": "response", "status": "in_progress"});
                 vec![sse(json!({"type": "response.created", "response": r})), sse(json!({"type": "response.in_progress", "response": r}))]
             }
+            Out::Reasoning(t) => {
+                let mut v = vec![];
+                if !self.think_open {
+                    self.think_open = true;
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": 0, "item": {"id": self.rs_id, "summary": [], "type": "reasoning", "content": [], "encrypted_content": "", "status": "in_progress"}})));
+                }
+                v.push(sse(json!({"type": "response.reasoning_text.delta", "output_index": 0, "content_index": 0, "delta": t, "item_id": self.rs_id})));
+                v
+            }
             Out::Text(t) => {
                 let mut v = vec![];
                 if !self.text_open {
                     self.text_open = true;
-                    v.push(sse(json!({"type": "response.output_item.added", "output_index": 0, "item": {"content": [], "id": self.msg_id, "role": "assistant", "status": "in_progress", "type": "message"}})));
+                    v.push(sse(json!({"type": "response.output_item.added", "output_index": self.think_open as usize, "item": {"content": [], "id": self.msg_id, "role": "assistant", "status": "in_progress", "type": "message"}})));
                     v.push(with(ix(self), "response.content_part.added", json!({"part": {"type": "output_text", "text": ""}})));
                 }
                 v.push(with(ix(self), "response.output_text.delta", json!({"delta": t})));
                 v
             }
             Out::End { .. } => {
-                let base = self.text_open as usize;
+                let base = self.think_open as usize + self.text_open as usize;
                 let mut v = vec![];
                 for (k, (id, c)) in self.a.calls.iter().enumerate() {
                     let fc = format!("fc_{id}");
                     v.push(sse(json!({"type": "response.output_item.added", "output_index": base + k, "item": {"id": fc, "arguments": "", "call_id": format!("call_{id}"), "name": c.name, "type": "function_call", "status": "in_progress"}})));
                     v.push(sse(json!({"type": "response.function_call_arguments.delta", "delta": c.arguments, "item_id": fc, "output_index": base + k})));
                 }
+                if self.think_open {
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": 0, "item": self.rs_item(false)})));
+                }
                 if self.text_open {
                     v.push(with(ix(self), "response.output_text.done", json!({"text": self.a.text})));
                     v.push(with(ix(self), "response.content_part.done", json!({"part": self.part()})));
-                    v.push(sse(json!({"type": "response.output_item.done", "output_index": 0, "item": self.msg_item()})));
+                    v.push(sse(json!({"type": "response.output_item.done", "output_index": self.think_open as usize, "item": self.msg_item()})));
                 }
                 for (k, (id, c)) in self.a.calls.iter().enumerate() {
                     v.push(sse(json!({"type": "response.output_item.done", "output_index": base + k, "item": Self::fc_item(id, c)})));
                 }
-                v.push(sse(json!({"type": "response.completed", "response": {"id": self.id, "object": "response", "created_at": self.created, "status": "completed", "model": self.model, "output": self.output(), "usage": self.usage()}})));
+                v.push(sse(json!({"type": "response.completed", "response": {"id": self.id, "object": "response", "created_at": self.created, "status": "completed", "model": self.model, "output": self.output(false), "usage": self.usage()}})));
                 v
             }
             Out::Error(e) => vec![format!("data: {}\n\n", json!({ "error": e }))],
@@ -782,7 +888,7 @@ impl Format for Responses {
     }
 
     fn body(&self) -> Value {
-        json!({"completed_at": now(), "created_at": self.created, "id": self.id, "model": self.model, "object": "response", "output": self.output(), "status": "completed", "usage": self.usage()})
+        json!({"completed_at": now(), "created_at": self.created, "id": self.id, "model": self.model, "object": "response", "output": self.output(true), "status": "completed", "usage": self.usage()})
     }
 }
 
@@ -813,6 +919,7 @@ impl Format for ChatCmpl {
         match out {
             Out::Start { .. } => vec![self.delta(json!({"role": "assistant", "content": null}))],
             Out::Text(t) => vec![self.delta(json!({"content": t}))],
+            Out::Reasoning(t) => vec![self.delta(json!({"reasoning_content": t}))],
             Out::End { .. } => {
                 let mut v: Vec<String> = self.a.calls.iter().enumerate().map(|(k, (id, c))| {
                     self.delta(json!({"tool_calls": [{"index": k, "id": id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}]}))
@@ -835,6 +942,9 @@ impl Format for ChatCmpl {
 
     fn body(&self) -> Value {
         let mut msg = json!({"role": "assistant", "content": self.a.text});
+        if !self.a.reasoning.is_empty() {
+            msg["reasoning_content"] = self.a.reasoning.clone().into();
+        }
         if !self.a.calls.is_empty() {
             msg["tool_calls"] = self.a.calls.iter().map(|(id, c)| json!({"type": "function", "function": {"name": c.name, "arguments": c.arguments}, "id": id})).collect();
         }
@@ -923,7 +1033,7 @@ impl Format for TextCmpl {
     fn on(&mut self, out: &Out) -> Vec<String> {
         self.a.on(out);
         match out {
-            Out::Start { .. } => vec![],
+            Out::Start { .. } | Out::Reasoning(_) => vec![],
             Out::Text(t) => vec![format!("data: {}\n\n", self.chunk(t, Value::Null))],
             Out::End { .. } => {
                 let mut v = vec![];
@@ -961,7 +1071,7 @@ impl Format for Native {
     fn on(&mut self, out: &Out) -> Vec<String> {
         self.a.on(out);
         match out {
-            Out::Start { .. } => vec![],
+            Out::Start { .. } | Out::Reasoning(_) => vec![],
             Out::Text(t) => {
                 self.n_text += 1;
                 let c = json!({"index": 0, "content": t, "tokens": [], "stop": false, "id_slot": -1, "tokens_predicted": self.n_text, "tokens_evaluated": self.a.n_prompt});
@@ -1044,7 +1154,7 @@ async fn messages(State(app): State<Arc<App>>, body: Bytes) -> Response {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let f = Anthropic { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), a: Acc::default(), text_open: false };
+    let f = Anthropic { id: format!("chatcmpl-{}", rand_id()), model: app.alias.clone(), a: Acc::default(), text_open: false, think_open: false };
     let rx = anthropic_to_chat(&b).and_then(|c| app.run(c));
     respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
 }
@@ -1054,7 +1164,7 @@ async fn responses(State(app): State<Arc<App>>, body: Bytes) -> Response {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let f = Responses { id: format!("resp_{}", rand_id()), msg_id: format!("msg_{}", rand_id()), model: app.alias.clone(), created: now(), a: Acc::default(), text_open: false };
+    let f = Responses { id: format!("resp_{}", rand_id()), msg_id: format!("msg_{}", rand_id()), rs_id: format!("rs_{}", rand_id()), model: app.alias.clone(), created: now(), a: Acc::default(), text_open: false, think_open: false };
     let rx = responses_to_chat(&b).and_then(|c| app.run(c));
     respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
 }
