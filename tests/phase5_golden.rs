@@ -6,11 +6,13 @@
 //!
 //! Phase 13e: the same gate on gpt-oss-20b (tests/golden/api_gpt-oss.json, from
 //! tools/capture_api_gptoss.py) adds reasoning: whether each response has it, and where it streams.
+//! Phase 14e: GLM-4.7-Flash (tests/golden/api_glm.json, `capture_api_gptoss.py URL glm`): `<think>`
+//! reasoning, GLM tool-call tags, and chat_template_kwargs enable_thinking=false.
 //!
 //! Needs the GPU and the model: cargo test --release --test phase5_golden -- --ignored
 
 mod common;
-use common::{events, gptoss_path, Server};
+use common::{events, glm_path, gptoss_path, Server};
 use serde_json::{json, Value};
 
 const PORT: u16 = 8097;
@@ -106,6 +108,12 @@ fn api_matches_oracle() {
 #[ignore = "needs the gpt-oss-20b model file"]
 fn api_matches_oracle_gptoss() {
     gate("api_gpt-oss.json", &["--model", &gptoss_path(), "--ctx-size", "4096"]);
+}
+
+#[test]
+#[ignore = "needs the GLM-4.7-Flash model file"]
+fn api_matches_oracle_glm() {
+    gate("api_glm.json", &["--model", &glm_path(), "--ctx-size", "4096"]);
 }
 
 fn http(method: &str, path: &str, body: Option<&Value>) -> (u16, String) {

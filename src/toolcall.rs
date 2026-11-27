@@ -1,5 +1,6 @@
 //! Qwen3-Coder tool calls in model output:
-//! `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>`.
+//! `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>`,
+//! and GLM's (`GlmSplit`): `<tool_call>NAME<arg_key>P</arg_key><arg_value>VALUE</arg_value></tool_call>`.
 //!
 //! `Splitter` streams the text before the first `<tool_call>` and keeps the rest, which `parse`
 //! turns into calls with JSON arguments typed by the tool's schema.
@@ -21,11 +22,16 @@ pub struct Splitter {
     held: String,
     in_calls: bool,
     enabled: bool,
+    glm: bool,
 }
 
 impl Splitter {
     pub fn new(enabled: bool) -> Self {
-        Self { held: String::new(), in_calls: false, enabled }
+        Self { held: String::new(), in_calls: false, enabled, glm: false }
+    }
+
+    fn starts(&self) -> &'static [&'static str] {
+        if self.glm { &STARTS[..1] } else { &STARTS }
     }
 
     /// Feed generated text; returns content that is safe to stream now.
@@ -37,7 +43,7 @@ impl Splitter {
         if self.in_calls {
             return String::new();
         }
-        if let Some(p) = STARTS.iter().filter_map(|m| self.held.find(m)).min() {
+        if let Some(p) = self.starts().iter().filter_map(|m| self.held.find(m)).min() {
             self.in_calls = true;
             let text = strip_nl(&self.held[..p]).to_owned();
             self.held.drain(..p);
@@ -45,7 +51,8 @@ impl Splitter {
         }
         // Hold back a suffix that could still grow into a call start, and the newlines before it.
         let held = &self.held;
-        let keep = STARTS
+        let keep = self
+            .starts()
             .iter()
             .flat_map(|m| (1..m.len()).filter(move |&n| held.ends_with(&m[..n])))
             .max()
@@ -60,13 +67,93 @@ impl Splitter {
     /// End of generation: (remaining content, tool calls). Text after the calls is dropped.
     pub fn finish(self, tools: &serde_json::Value) -> (String, Vec<ToolCall>) {
         if self.in_calls {
-            let calls = parse(&self.held, tools);
+            let calls = if self.glm { parse_glm(&self.held, tools) } else { parse(&self.held, tools) };
             if !calls.is_empty() {
                 return (String::new(), calls);
             }
         }
         (self.held, vec![])
     }
+}
+
+/// GLM output: reasoning up to `</think>` when the prompt opened `<think>`, then content and
+/// `<tool_call>` blocks (llama.cpp's auto parser for the GLM-4.7 template).
+pub struct GlmSplit {
+    /// Some: still in reasoning, holding a possible partial `</think>`.
+    think: Option<String>,
+    calls: Splitter,
+}
+
+const THINK_END: &str = "</think>";
+
+impl GlmSplit {
+    pub fn new(thinking: bool, tools: bool) -> Self {
+        Self { think: thinking.then(String::new), calls: Splitter { glm: true, ..Splitter::new(tools) } }
+    }
+
+    /// Feed generated text; returns (reasoning, content) safe to stream now.
+    pub fn push(&mut self, delta: &str) -> (String, String) {
+        let Some(h) = &mut self.think else { return (String::new(), self.calls.push(delta)) };
+        h.push_str(delta);
+        if let Some(p) = h.find(THINK_END) {
+            let (r, rest) = (h[..p].to_owned(), h[p + THINK_END.len()..].to_owned());
+            self.think = None;
+            return (r, self.calls.push(&rest));
+        }
+        let keep = (1..THINK_END.len()).filter(|&n| h.ends_with(&THINK_END[..n])).max().unwrap_or(0);
+        let r: String = h.drain(..h.len() - keep).collect();
+        (r, String::new())
+    }
+
+    /// End of generation: (reasoning, content) still held, and the tool calls.
+    pub fn finish(self, tools: &serde_json::Value) -> (String, String, Vec<ToolCall>) {
+        match self.think {
+            Some(h) => (h, String::new(), vec![]),
+            None => {
+                let (c, calls) = self.calls.finish(tools);
+                (String::new(), c, calls)
+            }
+        }
+    }
+}
+
+/// Every complete GLM `<tool_call>` block, in order.
+fn parse_glm(s: &str, tools: &serde_json::Value) -> Vec<ToolCall> {
+    let tag = |b: &str, open: &str, close: &str| -> Option<(String, usize)> {
+        let p = b.find(open)? + open.len();
+        let e = p + b[p..].find(close)?;
+        Some((b[p..e].to_owned(), e + close.len()))
+    };
+    let mut calls = vec![];
+    let mut rest = s;
+    while let Some(p) = rest.find("<tool_call>") {
+        rest = &rest[p + "<tool_call>".len()..];
+        let end = rest.find("</tool_call>").unwrap_or(rest.len());
+        let body = &rest[..end];
+        rest = &rest[end..];
+        let name = body[..body.find("<arg_key>").unwrap_or(body.len())].trim().to_owned();
+        let props = schema_props(tools, &name);
+        let (mut args, mut b) = (vec![], body);
+        while let Some((key, n)) = tag(b, "<arg_key>", "</arg_key>") {
+            let Some((v, m)) = tag(&b[n..], "<arg_value>", "</arg_value>") else { break };
+            b = &b[n + m..];
+            let ty = props.and_then(|s| s[key.trim()]["type"].as_str());
+            args.push(format!("{}:{}", json_str(key.trim()), typed(&v, ty)));
+        }
+        calls.push(ToolCall { name, arguments: format!("{{{}}}", args.join(",")) });
+    }
+    calls
+}
+
+/// The `properties` of tool `name`'s parameters.
+fn schema_props<'a>(tools: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| t.get("function").unwrap_or(t))
+        .find(|f| f["name"] == name)
+        .map(|f| &f["parameters"]["properties"])
 }
 
 /// Without up to two trailing newlines.
@@ -87,13 +174,7 @@ pub fn parse(s: &str, tools: &serde_json::Value) -> Vec<ToolCall> {
         let end = rest.find("</function>").unwrap_or(rest.len());
         let body = &rest[..end];
         rest = &rest[end..];
-        let schema = tools
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|t| t.get("function").unwrap_or(t))
-            .find(|f| f["name"] == name.as_str())
-            .map(|f| &f["parameters"]["properties"]);
+        let schema = schema_props(tools, &name);
         let mut args = vec![];
         let mut b = body;
         while let Some(p) = b.find("<parameter=") {
@@ -164,5 +245,28 @@ mod tests {
         let mut s = Splitter::new(true);
         assert_eq!(s.push("ok\n<function=shell>\n</function>"), "ok");
         assert_eq!(s.finish(&tools()).1, vec![ToolCall { name: "shell".into(), arguments: "{}".into() }]);
+    }
+    #[test]
+    fn glm_streams_reasoning_then_content_and_calls() {
+        let mut g = GlmSplit::new(true, true);
+        let (mut r, mut c) = (String::new(), String::new());
+        for d in ["Need ", "the dir.</th", "ink>Listing.<tool_", "call>shell<arg_key>command</arg_key><arg_value>[\"ls\"]</arg_value>",
+                  "<arg_key>note</arg_key><arg_value>{\"a\": 1}\nx</arg_value><arg_key>n</arg_key><arg_value> 3 </arg_value></tool_call>",
+                  "<tool_call>shell</tool_call>"] {
+            let (a, b) = g.push(d);
+            (r, c) = (r + &a, c + &b);
+        }
+        let (r2, rest, calls) = g.finish(&tools());
+        assert_eq!((r.as_str(), c.as_str(), r2.as_str(), rest.as_str()), ("Need the dir.", "Listing.", "", ""));
+        assert_eq!(calls, vec![
+            ToolCall { name: "shell".into(), arguments: r#"{"command":["ls"],"note":"{\"a\": 1}\nx","n":3}"#.into() },
+            ToolCall { name: "shell".into(), arguments: "{}".into() },
+        ]);
+        // Thinking off: all content; unfinished reasoning stays reasoning.
+        let mut g = GlmSplit::new(false, false);
+        assert_eq!(g.push("4</think>"), (String::new(), "4</think>".into()));
+        let mut g = GlmSplit::new(true, false);
+        assert_eq!(g.push("hmm</"), ("hmm".into(), String::new()));
+        assert_eq!(g.finish(&tools()), ("</".into(), String::new(), vec![]));
     }
 }

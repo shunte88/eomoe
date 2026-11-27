@@ -1007,3 +1007,23 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   - `attention_mla` uses CUDA cores and walks the positions one at a time per warp. A 19K prefill wants a tensor-core tile.
   - `mm_heads` handles one token per warp, with no token tiling.
   - The expert pin (~17 GB) has no MemAvailable guard beyond the existing pageable fallback when pinning fails.
+
+### Phase 14e: GLM-4.7-Flash serving (2026-11-27), gated
+
+- **Output parsing (`toolcall::GlmSplit`):**
+  - When the prompt ends `<think>` (thinking on, the template default), output is reasoning up to `</think>`, holding back a partial `</think>`. After that it is content plus `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>` blocks. `Splitter` gained a GLM mode: it starts only at `<tool_call>` and parses with `parse_glm`.
+  - Argument values are typed by schema, as in llama.cpp's auto parser (`build_tool_parser_tag_tagged`): a string param keeps the raw text, anything else is JSON when it parses.
+  - Server: `Split::Glm` is used when the vocab has `<arg_key>` and `<think>`. `<|user|>` and `<|observation|>` are EOG.
+  - `chat_template_kwargs` flows from chat, Anthropic, Responses and raw chat into the template. Ollama `think: false` maps to `enable_thinking: false`.
+- **Fix found by the gate (all models):** tools now reach the template as `{type, function: {name, description, parameters}}` only, with empty parameters → `{type: object, properties: {}}`, exactly as llama.cpp's `common_chat_tools_to_json_oaicompat` does. The Responses converter had been adding `strict`, which GLM's template dumps verbatim: +4 prompt tokens per Responses tool request.
+- **Gates:**
+  - `toolcall::tests::glm_streams_reasoning_then_content_and_calls`. Mutations, all red: no `</think>` hold-back; every value typed as a string; the text after `</think>` bypassing the call splitter (only red after the test fed `</think>` and a partial `<tool_` in one delta, now part of the test).
+  - `phase5_golden::api_matches_oracle_glm`: tests/golden/api_glm.json from `tools/capture_api_gptoss.py URL glm` (now takes a name argument), captured from the llama.cpp `e6443bd` oracle (GPU, `-ngl 99 -ot exps=CPU -c 4096`, fenced at MemoryMax 18G, stopped before eomoe ran).
+    - 10 cases: chat/messages/responses × text, tool call, tool result with reasoning in the history, plus chat with `enable_thinking: false`. Streamed and full.
+    - All match: prompt tokens 17/175/209, stop/finish, calls `get_weather {"city":"Paris"}`, reasoning presence and keys (none when thinking is off), and streamed event shapes. `count_tokens` 175 also matches.
+    - Mutations, all red: generation prompt `<think>` not detected (reasoning streamed as content), `chat_template_kwargs` dropped, `<|user|>`/`<|observation|>` not EOG, `strict` back in the Responses tools.
+  - Full regression, everything except 11b (not run, by the user's rule): lib 34, phase1 4, phase2 2, phase3 4, phase4 2, phase5 3, phase6 5, phase7 2, phase8 1, phase11 2, 11c 2, 11d 1, phase12 3, phase13 6, phase14 6. All pass and clippy is clean.
+- **Smoke tests (`eomoe serve --model GLM-4.7-Flash-Q4_K.gguf`, ctx 32768, 7316 MiB VRAM):**
+  - Claude Code with the **stock tool set** and a relative path (`-p "calc.py … bug in add …" --allowedTools "Read,Edit"`): fixed `a - b` → `a + b`, then DONE, in 5m34s. 4 requests at 18.8–20.2K prompt tokens, decode about 20 tok/s. The time is almost all the first prefill: 147.7 s for 18.8K (127 tok/s).
+  - Codex `exec --sandbox workspace-write`: fixed `mul`, then DONE, in 35 s. 8 requests at 2.4–3.3K prompt tokens, prefill 417 tok/s, decode 23–26 tok/s.
+- **Not done (ponytail):** long-context prefill. `attention_mla` is CUDA-core and goes 417 tok/s at 2.4K but 127 tok/s at 19K, so the next GLM speed win is a tensor-core MLA tile (as `attention_tc` did for Qwen). No grammar-constrained GLM tool calls (greedy output matched without them).

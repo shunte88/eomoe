@@ -138,7 +138,9 @@ fn options(b: &Value) -> Chat {
     };
     // num_predict -1 (default) and -2 (fill the context) both mean no limit here.
     let max_tokens = o["num_predict"].as_i64().filter(|&n| n >= 0).map_or(usize::MAX, |n| n as usize);
-    Chat { messages: Value::Null, tools: json!([]), max_tokens, sampling, stop }
+    // Ollama's `think: false` turns thinking off where the template has a switch (GLM).
+    let kwargs = if b["think"] == false { json!({"enable_thinking": false}) } else { Value::Null };
+    Chat { messages: Value::Null, tools: json!([]), max_tokens, sampling, stop, kwargs }
 }
 
 /// Ollama messages -> OpenAI chat messages (tool-call arguments stay objects; images dropped).

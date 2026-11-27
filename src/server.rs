@@ -13,7 +13,7 @@ use crate::qwen3moe::Engine;
 use crate::template::ChatTemplate;
 use crate::tokenizer::Tokenizer;
 use crate::harmony::Harmony;
-use crate::toolcall::{Splitter, ToolCall};
+use crate::toolcall::{GlmSplit, Splitter, ToolCall};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -41,6 +41,8 @@ pub struct App {
     busy: Arc<AtomicUsize>,
     /// gpt-oss: chat output is Harmony (crate::harmony).
     harmony: bool,
+    /// GLM: `<think>` reasoning and `<arg_key>` tool calls; the token that opens reasoning.
+    glm_think: Option<u32>,
 }
 
 /// Request limits (`--max-request-mb`, `--queue-limit`, `--req-timeout`).
@@ -79,8 +81,9 @@ impl App {
         load: impl FnOnce() -> Result<E, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
         // llama.cpp's EOG set: for the Qwen vocab EOS/EOT plus the FIM end tokens; for gpt-oss
-        // <|return|> and <|call|> (never <|end|>, which ends every Harmony message).
-        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|return|>", "<|call|>"].iter().filter_map(|t| tok.token_id(t)).collect();
+        // <|return|> and <|call|> (never <|end|>, which ends every Harmony message); for GLM
+        // <|user|> and <|observation|> (the next turn's role).
+        let mut eog: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|return|>", "<|call|>", "<|user|>", "<|observation|>"].iter().filter_map(|t| tok.token_id(t)).collect();
         eog.push(tok.eos);
         let (jobs, rx) = mpsc::channel::<Request>();
         let (ready_tx, ready) = mpsc::channel();
@@ -118,7 +121,8 @@ impl App {
             .map_err(|e| e.to_string())?;
         let (n_ctx, n_seq) = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
         let harmony = tok.token_id("<|channel|>").is_some();
-        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama, limits, n_seq, busy: Arc::default(), harmony }))
+        let glm_think = tok.token_id("<arg_key>").and(tok.token_id("<think>"));
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama, limits, n_seq, busy: Arc::default(), harmony, glm_think }))
     }
 }
 
@@ -155,6 +159,8 @@ struct Chat {
     max_tokens: usize,
     sampling: Sampling,
     stop: Vec<String>,
+    /// chat_template_kwargs (e.g. GLM's enable_thinking).
+    kwargs: Value,
 }
 
 /// Wall time of a request's prefill (start to first token) and decode (first token to end), ms.
@@ -237,9 +243,15 @@ impl App {
                 }
             }
         }
-        let mut req = json!({ "messages": messages, "add_generation_prompt": true });
+        let mut req = json!({ "messages": messages, "add_generation_prompt": true, "chat_template_kwargs": chat.kwargs });
         if chat.tools.as_array().is_some_and(|t| !t.is_empty()) {
-            req["tools"] = chat.tools.clone();
+            // The template sees only name/description/parameters (llama.cpp common_chat_tools_to_json_oaicompat).
+            req["tools"] = chat.tools.as_array().unwrap().iter().map(|t| {
+                let f = t.get("function").unwrap_or(t);
+                let p = &f["parameters"];
+                let p = if p.is_null() || p.as_object().is_some_and(|o| o.is_empty()) { json!({"type": "object", "properties": {}}) } else { p.clone() };
+                json!({"type": "function", "function": {"name": f["name"], "description": f["description"].as_str().unwrap_or(""), "parameters": p}})
+            }).collect();
         }
         let text = self.tpl.render(&req).map_err(|e| ApiError::bad(format!("chat template: {e}")))?;
         Ok(self.tok.encode(&text, true))
@@ -274,11 +286,21 @@ impl App {
         let (gtx, mut grx) = tmpsc::unbounded_channel();
         let (otx, orx) = tmpsc::unbounded_channel();
         let n_prompt = prompt.len();
+        let think_open = self.glm_think.is_some_and(|t| prompt.last() == Some(&t));
         self.jobs.send(request(prompt, chat.max_tokens, chat.sampling, gtx)).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "model thread stopped"))?;
         let app = self.clone();
         let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
         // Raw prompts (messages Null) are not chat output.
-        let mut split = if self.harmony && !chat.messages.is_null() { Split::Harmony(Harmony::new(has_tools)) } else { Split::Qwen(Splitter::new(has_tools)) };
+        let chat_out = !chat.messages.is_null();
+        let mut split = if !chat_out {
+            Split::Qwen(Splitter::new(has_tools))
+        } else if self.harmony {
+            Split::Harmony(Harmony::new(has_tools))
+        } else if self.glm_think.is_some() {
+            Split::Glm(GlmSplit::new(think_open, has_tools))
+        } else {
+            Split::Qwen(Splitter::new(has_tools))
+        };
         tokio::spawn(async move {
             let _busy = busy;
             let (mut utf8, mut n_out) = (Utf8Stream::default(), 0);
@@ -352,10 +374,11 @@ impl App {
     }
 }
 
-/// Chat output parsing: Qwen3-Coder tool calls, or gpt-oss Harmony channels.
+/// Chat output parsing: Qwen3-Coder tool calls, gpt-oss Harmony channels, or GLM.
 enum Split {
     Qwen(Splitter),
     Harmony(Harmony),
+    Glm(GlmSplit),
 }
 
 impl Split {
@@ -364,6 +387,7 @@ impl Split {
         match self {
             Split::Qwen(s) => (String::new(), s.push(t)),
             Split::Harmony(h) => h.push(t),
+            Split::Glm(g) => g.push(t),
         }
     }
     fn finish(self, tools: &Value) -> (String, String, Vec<ToolCall>) {
@@ -373,6 +397,7 @@ impl Split {
                 (String::new(), c, calls)
             }
             Split::Harmony(h) => h.finish(),
+            Split::Glm(g) => g.finish(tools),
         }
     }
 }
@@ -509,6 +534,7 @@ fn anthropic_to_chat(b: &Value) -> Result<Chat, ApiError> {
         max_tokens: b["max_tokens"].as_u64().unwrap_or(4096) as usize,
         sampling: sampling(b),
         stop: b["stop_sequences"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+        kwargs: b["chat_template_kwargs"].clone(),
     })
 }
 
@@ -582,7 +608,7 @@ fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
         .into_iter()
         .flatten()
         .filter(|t| t["type"] == "function")
-        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"], "strict": t.get("strict").cloned().unwrap_or(json!(true))}}))
+        .map(|t| json!({"type": "function", "function": {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}}))
         .collect();
     Ok(Chat {
         messages: msgs.into(),
@@ -591,6 +617,7 @@ fn responses_to_chat(b: &Value) -> Result<Chat, ApiError> {
         max_tokens: b["max_output_tokens"].as_u64().map_or(usize::MAX, |n| n as usize),
         sampling: sampling(b),
         stop: vec![],
+        kwargs: b["chat_template_kwargs"].clone(),
     })
 }
 
@@ -619,6 +646,7 @@ fn raw_chat(b: &Value) -> Chat {
         max_tokens: max.filter(|&n| n >= 0).map_or(usize::MAX, |n| n as usize),
         sampling: sampling(b),
         stop,
+        kwargs: b["chat_template_kwargs"].clone(),
     }
 }
 

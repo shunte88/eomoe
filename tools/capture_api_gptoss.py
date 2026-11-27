@@ -4,7 +4,10 @@ the history) into tests/golden/api_gpt-oss.json, in tools/capture_api_golden.py'
 
   systemd-run --user --scope -p MemoryMax=18G -p MemorySwapMax=0 llama-server \\
       -m gpt-oss-20b-MXFP4.gguf -ngl 99 -ot exps=CPU -c 4096 --port 8099 --jinja --alias local-code
-  python3 -I tools/capture_api_gptoss.py [base_url]
+  python3 -I tools/capture_api_gptoss.py [base_url] [name]
+
+name (default gpt-oss) picks tests/golden/api_<name>.json; "glm" (GLM-4.7-Flash: <think> reasoning, its
+own tool-call tags) adds a chat_template_kwargs enable_thinking=false case.
 """
 import json
 import sys
@@ -13,7 +16,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8099"
-OUT = Path(__file__).resolve().parent.parent / "tests" / "golden" / "api_gpt-oss.json"
+NAME = sys.argv[2] if len(sys.argv) > 2 else "gpt-oss"
+OUT = Path(__file__).resolve().parent.parent / "tests" / "golden" / f"api_{NAME}.json"
 PROMPT = "What is the capital of France? Answer in one word."
 ASK = "What's the weather in Paris right now?"
 THOUGHT = "The user wants the current weather in Paris. Use get_weather."
@@ -50,6 +54,9 @@ CASES = {
         {"type": "function_call", "call_id": "call_01", "name": "get_weather", "arguments": json.dumps(ARGS)},
         {"type": "function_call_output", "call_id": "call_01", "output": RESULT}]}),
 }
+if NAME == "glm":
+    CASES["chat_nothink"] = ("/v1/chat/completions", {"messages": [{"role": "user", "content": PROMPT}], "max_tokens": 200,
+                                                      "chat_template_kwargs": {"enable_thinking": False}})
 
 
 def post(path, body, stream):
