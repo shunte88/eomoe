@@ -69,6 +69,9 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
 | `--moeexperts` | `MOE_EXPERTS` | the model's (8): fewer experts per token is faster at some quality cost; 4 decodes ~1.6x faster and keeps 80% of greedy choices |
 | `--parallel` | `PARALLEL` | 4 (requests served at once; they share the KV pool, 1..=16) |
+| `--queue-limit` | `QUEUE_LIMIT` | no limit (requests that may wait beyond `--parallel`; more get 503 "server busy") |
+| `--req-timeout` | `REQ_TIMEOUT` | no limit (seconds per request, queueing included; then generation stops with finish reason `length`) |
+| `--max-request-mb` | `MAX_REQUEST_MB` | 32 (larger request bodies get 413) |
 | `--alias` | | `local-code` |
 | `--api-key` | `LLAMA_API_KEY` | none (comma-separated keys; requests then need `Authorization: Bearer KEY` or `x-api-key: KEY`) |
 | `--api-key-file` | `LLAMA_ARG_API_KEY_FILE` | none (one key per line, `#` comments) |

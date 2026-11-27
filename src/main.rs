@@ -37,8 +37,9 @@ fn run() -> Result<(), String> {
             let g = Gguf::open(&s.model)?;
             let (tok, tpl) = (Tokenizer::from_gguf(&g)?, ChatTemplate::from_gguf(&g)?);
             let (path, ctx, cache, par, moe) = (s.model.clone(), s.ctx_size, s.cache_mib.unwrap_or(usize::MAX >> 20), s.parallel, s.moe_experts);
+            let limits = server::Limits { max_body: s.max_request_mb << 20, queue: s.queue_limit, timeout: s.req_timeout.map(std::time::Duration::from_secs) };
             // The engine is built on, and stays on, the server's model thread.
-            let app = server::App::new(tok, tpl, s.alias.clone(), server::ollama::describe(&g, &s.model), s.cache_ram, move || {
+            let app = server::App::new(tok, tpl, s.alias.clone(), server::ollama::describe(&g, &s.model), s.cache_ram, limits, move || {
                 let mut m = GpuModel::with_cache(Gguf::open(&path)?, ctx, cache)?;
                 m.set_n_seq(par);
                 if let Some(n) = moe {

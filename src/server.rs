@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use tokio::sync::mpsc as tmpsc;
 
@@ -34,6 +34,34 @@ pub struct App {
     n_ctx: usize,
     /// The model as the Ollama API describes it (`ollama::describe`).
     ollama: Value,
+    limits: Limits,
+    n_seq: usize,
+    /// Requests accepted and not yet finished.
+    busy: Arc<AtomicUsize>,
+}
+
+/// Request limits (`--max-request-mb`, `--queue-limit`, `--req-timeout`).
+pub struct Limits {
+    /// Request body bytes; larger gets 413.
+    pub max_body: usize,
+    /// Requests that may wait for a sequence slot; None: no limit.
+    pub queue: Option<usize>,
+    /// Wall time from acceptance after which generation stops (finish "length").
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { max_body: 32 << 20, queue: None, timeout: None }
+    }
+}
+
+/// Holds one of `App::busy` while a request is in flight.
+struct Busy(Arc<AtomicUsize>);
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl App {
@@ -44,6 +72,7 @@ impl App {
         alias: String,
         ollama: Value,
         ram_cache: usize,
+        limits: Limits,
         load: impl FnOnce() -> Result<E, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
         // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
@@ -59,7 +88,7 @@ impl App {
             .spawn(move || {
                 let mut b = match load() {
                     Ok(e) => {
-                        ready_tx.send(Ok(e.n_ctx())).ok();
+                        ready_tx.send(Ok((e.n_ctx(), e.n_seq()))).ok();
                         let mut b = Batcher::new(e, eog_t);
                         b.ram_cache = ram_cache;
                         b.token_bytes = token_bytes;
@@ -83,8 +112,8 @@ impl App {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let n_ctx = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
-        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama }))
+        let (n_ctx, n_seq) = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama, limits, n_seq, busy: Arc::default() }))
     }
 }
 
@@ -219,6 +248,12 @@ impl App {
         if let Some(t) = prompt.iter().find(|&&t| t as usize >= self.tok.n_vocab()) {
             return Err(ApiError::bad(format!("invalid token id {t} in the prompt (vocabulary size {})", self.tok.n_vocab())));
         }
+        let busy = Busy(self.busy.clone());
+        let in_flight = self.busy.fetch_add(1, Ordering::Relaxed);
+        if let Some(q) = self.limits.queue.filter(|&q| in_flight >= self.n_seq + q) {
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable_error", format!("server busy: {in_flight} requests in flight (parallel {} + queue limit {q}), try again", self.n_seq)));
+        }
+        let deadline = self.limits.timeout.map(|t| tokio::time::Instant::now() + t);
         let (gtx, mut grx) = tmpsc::unbounded_channel();
         let (otx, orx) = tmpsc::unbounded_channel();
         let n_prompt = prompt.len();
@@ -226,13 +261,31 @@ impl App {
         let app = self.clone();
         let has_tools = chat.tools.as_array().is_some_and(|t| !t.is_empty());
         tokio::spawn(async move {
+            let _busy = busy;
             let (mut utf8, mut split, mut n_out) = (Utf8Stream::default(), Splitter::new(has_tools), 0);
             let mut stops = StopMatcher::new(chat.stop);
             let mut finish = None;
             let (mut t0, mut t1) = (std::time::Instant::now(), None);
-            while let Some(g) = grx.recv().await {
+            let mut started = false;
+            loop {
+                let g = match deadline {
+                    Some(d) => match tokio::time::timeout_at(d, grx.recv()).await {
+                        Ok(g) => g,
+                        Err(_) => {
+                            // --req-timeout: dropping grx stops the model.
+                            if !started {
+                                otx.send(Out::Start { n_prompt, n_cached: 0 }).ok();
+                            }
+                            finish = Some(Finish::Length);
+                            break;
+                        }
+                    },
+                    None => grx.recv().await,
+                };
+                let Some(g) = g else { break };
                 match g {
                     Event::Started { n_cached } => {
+                        started = true;
                         t0 = std::time::Instant::now();
                         otx.send(Out::Start { n_prompt, n_cached }).ok();
                     }
@@ -1111,6 +1164,7 @@ pub fn router(app: Arc<App>, keys: Vec<String>) -> Router {
         .route("/api/ps", get(ollama::ps))
         .route("/api/version", get(ollama::version))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
+        .layer(axum::extract::DefaultBodyLimit::max(app.limits.max_body))
         .with_state(app)
         .layer(axum::middleware::from_fn_with_state(keys, check_key))
 }

@@ -22,6 +22,7 @@ pub struct CliArgs {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once
 pub enum Command {
     /// Download the model and install the Codex and Claude Code clients
     Install,
@@ -63,6 +64,15 @@ pub struct ServeArgs {
     /// Host-RAM prompt cache in MiB: displaced prompts' KV, restored when they return; 0 off, -1 no limit [config: server.cache_ram, default: 0 until its gate runs]
     #[clap(long, env = "LLAMA_ARG_CACHE_RAM", allow_hyphen_values = true)]
     pub cache_ram: Option<i64>,
+    /// Largest request body in MiB; larger gets 413 [config: server.max_request_mb, default: 32]
+    #[clap(long, env = "MAX_REQUEST_MB")]
+    pub max_request_mb: Option<usize>,
+    /// Requests that may wait beyond --parallel; more get 503 [config: server.queue_limit, default: no limit]
+    #[clap(long, env = "QUEUE_LIMIT")]
+    pub queue_limit: Option<usize>,
+    /// Seconds a request may take, queueing included; then generation stops (finish "length") [config: server.req_timeout, default: no limit]
+    #[clap(long, env = "REQ_TIMEOUT")]
+    pub req_timeout: Option<u64>,
     /// Model name served to clients [config: server.alias, default: local-code]
     #[clap(long)]
     pub alias: Option<String>,

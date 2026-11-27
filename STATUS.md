@@ -757,3 +757,21 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - The new gate's bit-identical check compares back-to-back passes. GPU logits depend on which experts are already in the VRAM cache: a streamed expert and a cached one sum in a different order. The first, cold pass differs from warm passes by up to 1.0 at a routing near-tie (the same effect as the phase3_golden note), and so does a pass after unrelated decoding. Repeated passes are bit-identical.
   - Each N is therefore compared against a fresh warm baseline at N=8.
   - A mutation run, with a setter that ignores N, went red: "N=6 changed nothing".
+
+## Phase 12b: request limits (2026-11-27)
+
+- **`--max-request-mb`** (`MAX_REQUEST_MB`, config `server.max_request_mb`): default 32, matching koboldcpp's maxrequestsize. A larger body gets 413.
+  - Before this, axum's built-in 2 MB limit applied silently.
+- **`--queue-limit Q`** (`QUEUE_LIMIT`, `server.queue_limit`): at most `--parallel` + Q requests in flight. More get 503 `unavailable_error` "server busy: ... try again", the way Ollama's OLLAMA_MAX_QUEUE does. Default: no limit.
+- **`--req-timeout S`** (`REQ_TIMEOUT`, `server.req_timeout`): S seconds from acceptance, queueing included. After that, generation stops and the request finishes with reason `length` (dropping the receiver stops the model). Default: no limit.
+- **Gate:** `tests/phase12_limits.rs`. It is model-free: a stub engine (20 ms per pass, never EOG) plus the tokenizer from the GGUF. Red first: it did not compile without `server::Limits`.
+  - A 1.5 MiB body under a 1 MiB limit gets 413. The bulk sits in an ignored field so the check runs fast.
+  - A 1000-token request under a 1 s timeout comes back 200 in under 3 s, with finish `length` and between 10 and 1000 tokens.
+  - With parallel 1 and queue limit 0, a second request while one runs gets 503 with "busy". After the first finishes, a new request gets 200.
+  - Mutation runs, one feature removed at a time, each went red:
+    - no body layer: 413 became 200;
+    - no queue check: 503 became 200;
+    - no deadline: "stopped after 20.29s, 1000 tokens".
+  ```
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.19s
+  ```
