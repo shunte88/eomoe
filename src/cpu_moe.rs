@@ -153,7 +153,7 @@ mod avx2 {
     pub unsafe fn dot_q4_k(row: &[u8], x: &[f32]) -> f32 {
         let mut acc = _mm256_setzero_ps();
         let m4 = _mm256_set1_epi32(0xF);
-        for (sb, b) in row.chunks_exact(144).enumerate() {
+        for (sb, b) in row.as_chunks::<144>().0.iter().enumerate() {
             let (d, dmin) = (f16(b, 0), f16(b, 2));
             let (sc, qs) = (&b[4..16], &b[16..144]);
             let xb = x.as_ptr().add(sb * 256);
@@ -182,7 +182,7 @@ mod avx2 {
     pub unsafe fn dot_q6_k(row: &[u8], x: &[f32]) -> f32 {
         let mut acc = _mm256_setzero_ps();
         let (m4, m3, k32) = (_mm256_set1_epi32(0xF), _mm256_set1_epi32(3), _mm256_set1_epi32(32));
-        for (sb, b) in row.chunks_exact(210).enumerate() {
+        for (sb, b) in row.as_chunks::<210>().0.iter().enumerate() {
             let d = f16(b, 208);
             for n in 0..2 {
                 let (ql, qh, sc) = (b.as_ptr().add(64 * n), b.as_ptr().add(128 + 32 * n), &b[192 + 8 * n..200 + 8 * n]);
@@ -309,7 +309,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut tot = 0u64;
         for it in 0..60 {
-            tot += (0..per).into_par_iter().map(|j| ws[(it * per + j) % n_ex].iter().map(|b| b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).fold(0u64, u64::wrapping_add)).fold(0, u64::wrapping_add)).reduce(|| 0, u64::wrapping_add);
+            tot += (0..per).into_par_iter().map(|j| ws[(it * per + j) % n_ex].iter().map(|b| b.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).fold(0u64, u64::wrapping_add)).fold(0, u64::wrapping_add)).reduce(|| 0, u64::wrapping_add);
         }
         let us = t0.elapsed().as_micros() as f64 / 60.0;
         let bytes: usize = ws[0].iter().map(|b| b.len()).sum::<usize>() * per;

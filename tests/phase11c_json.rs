@@ -1,7 +1,7 @@
 //! Phase 11 gate (c): constrained output through the server. With `response_format`
 //! json_object the reply is one JSON value (as llama-server: no schema means schema {}, any
 //! value, server-common.cpp; not OpenAI's object-only rule); with json_schema it also matches the schema
-//! (keys, required, types, enum). Both end with finish_reason "stop", not "length".
+//! (keys, required, types, enum, and Pydantic's $ref/$defs and anyOf). Both end with finish_reason "stop", not "length".
 //! Gate revision: no oracle capture (CPU-oracle runs locked the machine, see STATUS); the
 //! check is that the output parses and validates, which is what llama-server guarantees.
 //!
@@ -44,6 +44,16 @@ fn response_format_yields_valid_json() {
     assert_eq!(keys, ["age", "lang", "name"], "{text}");
     assert!(o["name"].is_string() && o["age"].is_i64(), "{text}");
     assert!(["rust", "python", "go"].contains(&o["lang"].as_str().unwrap()), "{text}");
+
+    // What Pydantic emits: $defs + $ref, Optional[int] as anyOf [integer, null].
+    let schema = json!({"$defs": {"Pet": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["cat", "dog"]}, "name": {"type": "string"}}, "required": ["kind", "name"]}},
+                        "type": "object", "properties": {"owner": {"type": "string"}, "pet": {"$ref": "#/$defs/Pet"}, "age": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+                        "required": ["owner", "pet", "age"]});
+    let (v, text) = ask("Invent a pet owner and their pet.", json!({"type": "json_schema", "json_schema": {"name": "owner", "schema": schema}}));
+    eprintln!("pydantic: {text}");
+    assert!(v["owner"].is_string() && (v["age"].is_i64() || v["age"].is_null()), "{text}");
+    assert!(["cat", "dog"].contains(&v["pet"]["kind"].as_str().unwrap_or("")) && v["pet"]["name"].is_string(), "{text}");
+    assert_eq!(v.as_object().unwrap().len() + v["pet"].as_object().unwrap().len(), 5, "no extra keys: {text}");
 }
 
 fn complete(path: &str, prompt: &str, max: u32, bias: Value) -> String {

@@ -100,3 +100,23 @@ fn completions_match_oracle() {
     }
     assert!(fails.is_empty(), "mismatches: {fails:?}");
 }
+
+/// Token ids from the client are checked against the vocabulary: a bad id is a 400, not a
+/// panic that kills the handler or the model thread (later requests must still work).
+#[test]
+#[ignore]
+fn bad_token_ids_are_rejected() {
+    let _s = common::start(PORT);
+    let big = serde_json::json!(4294967296u64 + 13); // wraps to 13 if cast blindly
+    for (path, body) in [
+        ("/v1/completions", serde_json::json!({"prompt": [9_999_999], "max_tokens": 1})),
+        ("/completion", serde_json::json!({"prompt": [9_999_999], "n_predict": 1})),
+        ("/v1/completions", serde_json::json!({"prompt": [big], "max_tokens": 1})),
+        ("/api/generate", serde_json::json!({"model": "local-code", "prompt": "hi", "context": [9_999_999], "stream": false, "options": {"num_predict": 1}})),
+    ] {
+        let (st, b) = common::http(PORT, "POST", path, Some(&body));
+        assert_eq!(st, 400, "{path} {body}: {b}");
+    }
+    let (st, b) = common::http(PORT, "POST", "/v1/completions", Some(&serde_json::json!({"prompt": "fn main", "max_tokens": 2})));
+    assert_eq!(st, 200, "server still up: {b}");
+}

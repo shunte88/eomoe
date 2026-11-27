@@ -25,22 +25,22 @@ pub(crate) fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 pub fn dequant_row(ty: GgmlType, x: &[u8], y: &mut [f32]) {
     match ty {
         GgmlType::F32 => {
-            for (o, c) in y.iter_mut().zip(x.chunks_exact(4)) {
-                *o = f32::from_le_bytes(c.try_into().unwrap());
+            for (o, c) in y.iter_mut().zip(x.as_chunks::<4>().0) {
+                *o = f32::from_le_bytes(*c);
             }
         }
         GgmlType::F16 => {
-            for (o, c) in y.iter_mut().zip(x.chunks_exact(2)) {
-                *o = f16::from_le_bytes([c[0], c[1]]).to_f32();
+            for (o, c) in y.iter_mut().zip(x.as_chunks::<2>().0) {
+                *o = f16::from_le_bytes(*c).to_f32();
             }
         }
         GgmlType::BF16 => {
-            for (o, c) in y.iter_mut().zip(x.chunks_exact(2)) {
-                *o = bf16::from_le_bytes([c[0], c[1]]).to_f32();
+            for (o, c) in y.iter_mut().zip(x.as_chunks::<2>().0) {
+                *o = bf16::from_le_bytes(*c).to_f32();
             }
         }
         GgmlType::Q8_0 => {
-            for (yb, b) in y.chunks_exact_mut(32).zip(x.chunks_exact(34)) {
+            for (yb, b) in y.as_chunks_mut::<32>().0.iter_mut().zip(x.as_chunks::<34>().0) {
                 let d = h(b, 0);
                 for (o, &q) in yb.iter_mut().zip(&b[2..]) {
                     *o = d * (q as i8) as f32;
@@ -48,7 +48,7 @@ pub fn dequant_row(ty: GgmlType, x: &[u8], y: &mut [f32]) {
             }
         }
         GgmlType::Q4_K => {
-            for (yb, b) in y.chunks_exact_mut(QK_K).zip(x.chunks_exact(144)) {
+            for (yb, b) in y.as_chunks_mut::<QK_K>().0.iter_mut().zip(x.as_chunks::<144>().0) {
                 let (d, min) = (h(b, 0), h(b, 2));
                 let (scales, qs) = (&b[4..16], &b[16..144]);
                 for j in 0..4 {
@@ -66,7 +66,7 @@ pub fn dequant_row(ty: GgmlType, x: &[u8], y: &mut [f32]) {
         }
         GgmlType::Q5_K => unimplemented!("Q5_K dequant"),
         GgmlType::Q6_K => {
-            for (yb, b) in y.chunks_exact_mut(QK_K).zip(x.chunks_exact(210)) {
+            for (yb, b) in y.as_chunks_mut::<QK_K>().0.iter_mut().zip(x.as_chunks::<210>().0) {
                 let d = h(b, 208);
                 for n in 0..2 {
                     let ql = &b[64 * n..64 * n + 64];
@@ -94,9 +94,8 @@ pub fn dequant_row(ty: GgmlType, x: &[u8], y: &mut [f32]) {
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     // 8 accumulators so LLVM vectorizes without needing fast-math.
     let mut acc = [0f32; 8];
-    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
-    let (ra, rb) = (ca.remainder(), cb.remainder());
-    for (x, y) in ca.zip(cb) {
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    for (x, y) in ca.iter().zip(cb) {
         for i in 0..8 {
             acc[i] += x[i] * y[i];
         }

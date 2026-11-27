@@ -129,7 +129,7 @@ impl<E: Engine> Batcher<E> {
                 (req.sink)(Event::Done(Finish::Length));
                 continue;
             }
-            let reuse = |s: &Slot| s.cached.iter().zip(&req.prompt).take_while(|(a, b)| a == b).count().min(req.prompt.len() - 1);
+            let reuse = |s: &Slot| lcp(&s.cached, &req.prompt).min(req.prompt.len() - 1);
             let (si, n) = (self.slots.iter().enumerate())
                 .filter(|(_, s)| s.job.is_none())
                 .map(|(i, s)| (i, reuse(s)))
@@ -248,12 +248,11 @@ impl<E: Engine> Batcher<E> {
         if self.ram_cache == 0 {
             return None;
         }
-        let lcp = |a: &[u32]| a.iter().zip(prompt).take_while(|(x, y)| x == y).count();
         let better = |snaps: &std::collections::VecDeque<Snap>, cached: &[u32]| {
-            let n = lcp(cached);
+            let n = lcp(cached, prompt);
             let mut best = (if cached.is_empty() { -1.0 } else { n as f32 / cached.len() as f32 }, n as f32 / prompt.len() as f32, None);
             for (i, s) in snaps.iter().enumerate() {
-                let n = lcp(&s.tokens);
+                let n = lcp(&s.tokens, prompt);
                 let (keep, sim) = (n as f32 / s.tokens.len() as f32, n as f32 / prompt.len() as f32);
                 if keep >= 0.25 && best.0 < keep && best.1 < sim {
                     best = (keep, sim, Some((i, n)));
@@ -262,7 +261,7 @@ impl<E: Engine> Batcher<E> {
             best.2
         };
         let cached = &self.slots[si].cached;
-        let keep = if cached.is_empty() { 0.0 } else { lcp(cached) as f32 / cached.len() as f32 };
+        let keep = if cached.is_empty() { 0.0 } else { lcp(cached, prompt) as f32 / cached.len() as f32 };
         if keep >= 0.5 && better(&self.snaps, cached).is_none() {
             return None;
         }
@@ -287,7 +286,6 @@ impl<E: Engine> Batcher<E> {
     /// Save the selected sequence `si` to the RAM cache (llama-server's prompt_cache.alloc).
     fn ram_save(&mut self, si: usize) {
         let tokens = &self.slots[si].cached;
-        let lcp = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
         if self.ram_cache == 0 || tokens.is_empty() || self.snaps.iter().any(|s| lcp(&s.tokens, tokens) == tokens.len()) {
             return;
         }
@@ -344,12 +342,17 @@ fn allow_json(logits: &mut [f32], schema: &serde_json::Value, text: &[u8], bytes
     };
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-    let keep: Vec<(usize, f32)> = idx.into_iter().filter(|&t| ok(t)).take(64).map(|t| (t, logits[t])).collect();
+    let keep: Vec<(usize, f32)> = idx.into_iter().filter(|&t| logits[t] > f32::NEG_INFINITY && ok(t)).take(64).map(|t| (t, logits[t])).collect();
     logits.fill(f32::NEG_INFINITY);
     for &(t, l) in &keep {
         logits[t] = l;
     }
     !keep.is_empty()
+}
+
+/// Length of the common prefix of two token sequences.
+fn lcp(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 /// xorshift64*: uniform in [0, 1).
@@ -633,6 +636,16 @@ mod tests {
             assert_eq!((done, got.1), (crate::constrain::State::Done, Some(Finish::Stop)), "{schema} -> {:?}", String::from_utf8_lossy(&text));
             println!("{schema} -> {}", String::from_utf8_lossy(&text));
         }
+        // Every token that could start the JSON is banned: stop, never sample a banned token
+        // (no EOG here, so a fall-through draw cannot land on it by luck).
+        let mut b = Batcher::new(fake(1), vec![]);
+        b.token_bytes = bytes.clone();
+        let (mut r, seen) = req(&[4], 40);
+        r.sampling.schema = Some(json!({}));
+        r.sampling.logit_bias = vec![(0, f32::NEG_INFINITY), (1, f32::NEG_INFINITY), (3, f32::NEG_INFINITY)];
+        r.sampling.temperature = 1.0;
+        let got = run_all(&mut b, vec![(r, seen)]).remove(0);
+        assert_eq!((got.0, got.1), (vec![], Some(Finish::Stop)));
     }
 
     #[test]

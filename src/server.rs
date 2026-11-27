@@ -216,6 +216,9 @@ impl App {
             e.1["n_ctx"] = self.n_ctx.into();
             return Err(e);
         }
+        if let Some(t) = prompt.iter().find(|&&t| t as usize >= self.tok.n_vocab()) {
+            return Err(ApiError::bad(format!("invalid token id {t} in the prompt (vocabulary size {})", self.tok.n_vocab())));
+        }
         let (gtx, mut grx) = tmpsc::unbounded_channel();
         let (otx, orx) = tmpsc::unbounded_channel();
         let n_prompt = prompt.len();
@@ -319,6 +322,11 @@ fn sampling(body: &Value) -> Sampling {
     }
 }
 
+/// A client token id; ids past u32 map to u32::MAX (invalid) instead of wrapping onto real tokens.
+pub fn tok_id(id: u64) -> u32 {
+    u32::try_from(id).unwrap_or(u32::MAX)
+}
+
 /// OpenAI `{"<id>": bias}` or llama.cpp `[[id, bias]]`; bias `false` bans the token.
 fn logit_bias(v: &Value) -> Vec<(u32, f32)> {
     let pairs: Vec<(Option<u64>, &Value)> = match v {
@@ -326,7 +334,7 @@ fn logit_bias(v: &Value) -> Vec<(u32, f32)> {
         Value::Array(a) => a.iter().map(|p| (p[0].as_u64(), &p[1])).collect(),
         _ => vec![],
     };
-    pairs.into_iter().filter_map(|(id, b)| Some((id? as u32, if *b == false { f32::NEG_INFINITY } else { b.as_f64()? as f32 }))).collect()
+    pairs.into_iter().filter_map(|(id, b)| Some((tok_id(id?), if *b == false { f32::NEG_INFINITY } else { b.as_f64()? as f32 }))).collect()
 }
 
 /// The JSON schema a request constrains its output to: OpenAI `response_format` (json_object,
@@ -787,7 +795,7 @@ impl App {
     fn raw_prompt(&self, p: &Value) -> Result<Vec<u32>, ApiError> {
         match p {
             Value::String(s) => Ok(self.tok.encode(s, true)),
-            Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_u64) => Ok(a.iter().map(|t| t.as_u64().unwrap() as u32).collect()),
+            Value::Array(a) if !a.is_empty() && a.iter().all(Value::is_u64) => Ok(a.iter().map(|t| tok_id(t.as_u64().unwrap())).collect()),
             Value::Array(a) if a.len() == 1 => self.raw_prompt(&a[0]),
             Value::Null => Err(ApiError::bad("\"prompt\" is required")),
             _ => Err(ApiError::bad("\"prompt\" must be a string or an array of token ids (one prompt per request)")),
@@ -1029,8 +1037,10 @@ async fn native(app: Arc<App>, body: Bytes, infill: bool) -> Response {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
-    let f = Native { model: app.alias.clone(), prompt: String::from_utf8_lossy(&app.tok.decode_bytes(&p)).into_owned(), n_text: 0, a: Acc::default() };
-    respond(app.generate(p, raw_chat(&b)), f, b["stream"].as_bool().unwrap_or(false)).await
+    let rx = app.generate(p.clone(), raw_chat(&b)); // validates the ids before they are decoded
+    let prompt = if rx.is_ok() { String::from_utf8_lossy(&app.tok.decode_bytes(&p)).into_owned() } else { String::new() };
+    let f = Native { model: app.alias.clone(), prompt, n_text: 0, a: Acc::default() };
+    respond(rx, f, b["stream"].as_bool().unwrap_or(false)).await
 }
 
 async fn count_tokens(State(app): State<Arc<App>>, body: Bytes) -> Response {

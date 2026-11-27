@@ -57,7 +57,7 @@ pub struct ServeArgs {
     /// Requests served at once; they share the context's KV pool [config: server.parallel, default: 4]
     #[clap(long, env = "PARALLEL")]
     pub parallel: Option<usize>,
-    /// Host-RAM prompt cache in MiB: displaced prompts' KV, restored when they return; 0 off, -1 no limit [config: server.cache_ram, default: 8192]
+    /// Host-RAM prompt cache in MiB: displaced prompts' KV, restored when they return; 0 off, -1 no limit [config: server.cache_ram, default: 0 until its gate runs]
     #[clap(long, env = "LLAMA_ARG_CACHE_RAM", allow_hyphen_values = true)]
     pub cache_ram: Option<i64>,
     /// Model name served to clients [config: server.alias, default: local-code]

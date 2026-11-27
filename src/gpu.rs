@@ -354,8 +354,8 @@ impl GpuModel {
         // The expert banks get what is left: the requested MiB, capped by free VRAM.
         let (free, _) = result::mem_get_info().map_err(err)?;
         let budget = (cache_mib << 20).min(free.saturating_sub(VRAM_RESERVE));
-        if budget < cache_mib << 20 {
-            if cache_mib != usize::MAX >> 20 { log::warn!("gpu: expert cache capped at {} MiB of free VRAM (asked {cache_mib})", budget >> 20); }
+        if budget < cache_mib << 20 && cache_mib != usize::MAX >> 20 {
+            log::warn!("gpu: expert cache capped at {} MiB of free VRAM (asked {cache_mib})", budget >> 20);
         }
         let frac = (budget as f64 / host_bytes as f64).min(1.0);
         let mut groups = vec![];

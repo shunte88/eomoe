@@ -2,9 +2,11 @@
 //! of JSON that matches a schema? The sampler keeps only tokens that leave the output a valid
 //! prefix, and ends generation once the value is complete.
 //!
-//! Schema subset: `type` (one or a list), `properties` + `required` (other keys are not allowed
-//! when `properties` is given, keys in any order), `additionalProperties` (schema), `items`,
-//! `enum`, `const`. Anything else is accepted unchecked.
+//! Schema subset: `type` (one or a list), `properties` + `required` (keys in any order; a
+//! required key not in `properties` takes any value), `additionalProperties` (false, true or a
+//! schema; absent means false when `properties` is given, as llama.cpp), `items`, `enum`,
+//! `const`, `anyOf` / `oneOf` (oneOf checked as anyOf), `$ref` to `#/...` in the same schema.
+//! Anything else (`allOf`, `pattern`, `minItems`, formats ...) is accepted unchecked.
 //! ponytail: the output is re-parsed from the start for every candidate token (O(len) each);
 //! an incremental parser state per stream if long structured outputs get slow.
 
@@ -27,9 +29,11 @@ type R<T = ()> = Result<T, State>;
 const MAX_WS: usize = 16;
 /// Digits per number part, as llama.cpp's JSON grammar ([1-9][0-9]{0,15}, fraction {1,16}).
 const MAX_DIGITS: usize = 16;
+/// Nesting depth of objects and arrays.
+pub const MAX_DEPTH: usize = 64;
 
 pub fn check(schema: &Value, text: &[u8]) -> State {
-    let mut p = P { s: text, i: 0 };
+    let mut p = P { s: text, i: 0, root: schema, depth: 0 };
     // No whitespace before the value: the model cannot pad its way to the length limit.
     let r = p.value(schema).and_then(|_| p.ws());
     match r {
@@ -43,9 +47,12 @@ pub fn check(schema: &Value, text: &[u8]) -> State {
 struct P<'a> {
     s: &'a [u8],
     i: usize,
+    /// For `$ref`.
+    root: &'a Value,
+    depth: usize,
 }
 
-impl P<'_> {
+impl<'a> P<'a> {
     fn peek(&self) -> R<u8> {
         self.s.get(self.i).copied().ok_or(State::Partial)
     }
@@ -77,7 +84,28 @@ impl P<'_> {
         }
     }
 
-    fn value(&mut self, sch: &Value) -> R {
+    fn value(&mut self, sch: &'a Value) -> R {
+        if let Some(r) = sch.get("$ref").and_then(Value::as_str) {
+            // Unresolvable: unchecked, like the other unsupported keywords.
+            let to = r.strip_prefix('#').and_then(|ptr| self.root.pointer(ptr)).unwrap_or(&Value::Null);
+            return self.value(to);
+        }
+        if let Some(alts) = sch.get("anyOf").or(sch.get("oneOf")).and_then(Value::as_array) {
+            // JSON values are self-delimiting, so the first alternative that parses wins.
+            let mut partial = false;
+            for a in alts {
+                let mut q = P { s: self.s, i: self.i, root: self.root, depth: self.depth };
+                match q.value(a) {
+                    Ok(()) => {
+                        self.i = q.i;
+                        return Ok(());
+                    }
+                    Err(State::Partial) => partial = true,
+                    Err(_) => {}
+                }
+            }
+            return Err(if partial { State::Partial } else { State::Invalid });
+        }
         let options: Vec<&Value> = match sch.get("enum").and_then(Value::as_array) {
             Some(e) => e.iter().collect(),
             None => sch.get("const").into_iter().collect(),
@@ -92,6 +120,9 @@ impl P<'_> {
         };
         let ok = |t: &str| types.is_empty() || types.contains(&t) || (t == "number" && types.contains(&"integer"));
         let c = self.peek()?;
+        if matches!(c, b'{' | b'[') && self.depth >= MAX_DEPTH {
+            return Err(State::Invalid);
+        }
         match c {
             b'{' if ok("object") => self.object(sch),
             b'[' if ok("array") => self.array(sch),
@@ -108,7 +139,7 @@ impl P<'_> {
     fn one_of(&mut self, options: &[&Value]) -> R {
         let mut partial = false;
         for o in options {
-            let mut q = P { s: self.s, i: self.i };
+            let mut q = P { s: self.s, i: self.i, root: self.root, depth: self.depth };
             match q.lit(o.to_string().as_bytes()) {
                 Ok(()) => {
                     self.i = q.i;
@@ -121,11 +152,20 @@ impl P<'_> {
         Err(if partial { State::Partial } else { State::Invalid })
     }
 
-    fn object(&mut self, sch: &Value) -> R {
+    fn object(&mut self, sch: &'a Value) -> R {
         let props = sch.get("properties").and_then(Value::as_object);
         let required: Vec<&str> = sch.get("required").and_then(Value::as_array).map_or(vec![], |r| r.iter().filter_map(Value::as_str).collect());
-        let extra = sch.get("additionalProperties").filter(|v| v.is_object());
+        // The schema for keys outside `properties`/`required`; None: not allowed.
+        let extra: Option<&Value> = match sch.get("additionalProperties") {
+            Some(Value::Bool(false)) => None,
+            Some(v @ Value::Object(_)) => Some(v),
+            Some(_) => Some(&Value::Null),
+            None => props.is_none().then_some(&Value::Null),
+        };
+        let named = |k: &str| props.is_some_and(|p| p.contains_key(k)) || required.contains(&k);
+        let n_named = props.map_or(0, |p| p.len()) + required.iter().filter(|r| !props.is_some_and(|p| p.contains_key(**r))).count();
         let mut seen: Vec<String> = vec![];
+        self.depth += 1;
         self.eat(b'{')?;
         self.ws()?;
         if self.peek()? != b'}' {
@@ -136,7 +176,8 @@ impl P<'_> {
                     Err(State::Partial) => {
                         // A partial key must start one still allowed.
                         let part = String::from_utf8_lossy(self.s.get(start + 1..).unwrap_or_default()).into_owned();
-                        let fits = props.map_or(true, |p| p.keys().any(|k| k.starts_with(part.as_str()) && !seen.contains(k)));
+                        let names = props.into_iter().flat_map(|p| p.keys().map(String::as_str)).chain(required.iter().copied());
+                        let fits = extra.is_some() || names.into_iter().any(|k| k.starts_with(part.as_str()) && !seen.iter().any(|s| s == k));
                         return Err(if fits { State::Partial } else { State::Invalid });
                     }
                     Err(e) => return Err(e),
@@ -144,9 +185,10 @@ impl P<'_> {
                 if seen.contains(&key) {
                     return Err(State::Invalid);
                 }
-                let vs = match props {
-                    Some(p) => p.get(&key).ok_or(State::Invalid)?,
-                    None => extra.unwrap_or(&Value::Null),
+                let vs = match props.and_then(|p| p.get(&key)) {
+                    Some(v) => v,
+                    None if named(&key) => &Value::Null,
+                    None => extra.ok_or(State::Invalid)?,
                 };
                 seen.push(key);
                 self.ws()?;
@@ -156,7 +198,7 @@ impl P<'_> {
                 self.ws()?;
                 match self.peek()? {
                     // Another key only if one is left.
-                    b',' if props.map_or(true, |p| p.len() > seen.len()) => {
+                    b',' if extra.is_some() || n_named > seen.len() => {
                         self.i += 1;
                         self.ws()?;
                     }
@@ -168,15 +210,18 @@ impl P<'_> {
         if required.iter().any(|r| !seen.iter().any(|s| s == r)) {
             return Err(State::Invalid);
         }
+        self.depth -= 1;
         self.eat(b'}')
     }
 
-    fn array(&mut self, sch: &Value) -> R {
+    fn array(&mut self, sch: &'a Value) -> R {
         let items = sch.get("items").unwrap_or(&Value::Null);
+        self.depth += 1;
         self.eat(b'[')?;
         self.ws()?;
         if self.peek()? == b']' {
             self.i += 1;
+            self.depth -= 1;
             return Ok(());
         }
         loop {
@@ -189,6 +234,7 @@ impl P<'_> {
                 }
                 b']' => {
                     self.i += 1;
+                    self.depth -= 1;
                     return Ok(());
                 }
                 _ => return Err(State::Invalid),
@@ -308,6 +354,31 @@ mod tests {
             assert_eq!(c(&s, t), want, "{t:?}");
         }
         assert_eq!(c(&json!({"const": 42}), "4"), Partial);
+    }
+
+    #[test]
+    fn any_of_refs_and_additional_properties() {
+        // What Pydantic emits: $defs + $ref, Optional as anyOf [T, null].
+        let s = json!({"$defs": {"Pet": {"type": "object", "properties": {"n": {"type": "string"}}, "required": ["n"]}},
+                       "type": "object", "properties": {"pet": {"$ref": "#/$defs/Pet"}, "age": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+                       "required": ["pet", "age"]});
+        for (t, want) in [
+            ("{\"pet\": {\"n\": \"x\"}, \"age\": null}", Done), ("{\"pet\": {\"n\": \"x\"}, \"age\": 3}", Done),
+            ("{\"pet\": {\"n\": 1", Invalid), ("{\"pet\": {\"n\": \"x\"}, \"age\": \"3", Invalid), ("{\"pet\": {\"n\": \"x\"}, \"age\": nu", Partial),
+        ] {
+            assert_eq!(c(&s, t), want, "{t:?}");
+        }
+        let open = json!({"type": "object", "properties": {"a": {"type": "integer"}}, "additionalProperties": {"type": "string"}});
+        assert_eq!(c(&open, "{\"a\": 1, \"zz\": \"x\"}"), Done);
+        assert_eq!(c(&open, "{\"zz\": 2"), Invalid);
+        assert_eq!(c(&json!({"type": "object", "properties": {"a": {}}, "additionalProperties": true}), "{\"b\": [1]}"), Done);
+        assert_eq!(c(&json!({"type": "object", "additionalProperties": false}), "{\"b"), Invalid);
+        assert_eq!(c(&json!({"type": "object", "additionalProperties": false}), "{}"), Done);
+        // A required key missing from `properties` is still allowed (any value), not a dead end.
+        assert_eq!(c(&json!({"type": "object", "properties": {"a": {}}, "required": ["b"]}), "{\"b\": 1}"), Done);
+        // Nesting is capped: the model cannot recurse the parser's stack away.
+        assert_eq!(c(&json!({}), &"[".repeat(MAX_DEPTH + 1)), Invalid);
+        assert_eq!(c(&json!({}), &"[".repeat(MAX_DEPTH)), Partial);
         assert_eq!(c(&json!({"type": ["string", "null"]}), "null"), Done);
     }
 }

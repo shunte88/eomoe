@@ -545,6 +545,34 @@ Implementation, in `src/server.rs`:
 - The test server helpers moved to `tests/common`.
 - Regression gates: lib 20/20, phase5, phase8.
 
+## Phase 11 code review fixes, v0.1.3 (2026-11-27)
+
+The two-axis review (Standards and Spec, `aa3b023..HEAD`) ran after v0.1.2 shipped. I fixed:
+
+- **A bad token id killed the server.** Prompt ids from `/v1/completions`, `/completion` and Ollama's `context` went unchecked to the model thread. A gate request with id 9999999 got a 500 and stopped the engine thread.
+  - `App::generate` (every route) now returns 400 for ids >= n_vocab. The native route decodes only after that check passes.
+  - Ids above u32 no longer wrap onto real tokens. This applies to logit_bias too.
+  - Gate: `phase11_golden::bad_token_ids_are_rejected`, red (500), then green, and later requests still answer.
+- **Schema subset gaps.** README promises were stronger than the checker. `constrain.rs` now covers:
+  - `anyOf`/`oneOf`;
+  - `$ref` to `#/...` (Pydantic `$defs`);
+  - `additionalProperties` true or a schema next to `properties`, and `false` without `properties`;
+  - a required key that is not listed in `properties`, which used to be a dead end that stopped with incomplete JSON.
+  - Nesting is capped at 64.
+  - Unit test: `any_of_refs_and_additional_properties`, red then green.
+  - The GPU gate gained a Pydantic-shaped schema: `$defs`/`$ref`, `Optional` as `anyOf`, enum, and no extra keys.
+- **logit_bias with a schema.** When every JSON-valid token was banned, a −inf row was sampled and an invalid token was emitted. Banned tokens are now never kept, so generation stops instead. The unit test was red-capable only without an EOG token, because a NaN draw fell through to EOG by luck.
+- **Ollama defaults.** With options unset, Ollama now uses its own top_p 0.9 and min_p 0. `repeat_penalty` and `num_ctx` are ignored, marked with a ponytail comment.
+- **Help text.** `--cache-ram` help said the default is 8192; it is 0.
+- **Clippy.** `cargo clippy --all-targets` is now clean. 24 warnings were fixed: `as_chunks` in quant/cpu_moe/dot, a collapsed `if`, a float literal, `about`'s unit argument, and an allow for axum's large Response error. The shared `lcp` helper replaces 3 copies. Rust-analyzer reports 0 diagnostics.
+
+Not fixed (noted):
+- **11b:** snapshots use pageable RAM with per-page synchronous copies, not pinned RAM. This is unmeasured until the 11b gate can run after the RAM upgrade. It is not a known cause of the lockups.
+- **llama.vscode extras:** `t_max_predict_ms`, `n_indent` and `samplers` are ignored.
+- **Raw prompts:** multiple or mixed prompts get a 400.
+- **Ollama `context`:** it is re-encoded (flagged ponytail).
+- **Ollama FIM:** token strings are hard-coded.
+
 ## `eomoe about` (2026-11-27)
 
 `eomoe about` prints the third-party components and their licenses:

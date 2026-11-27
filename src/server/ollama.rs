@@ -100,6 +100,7 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 /// The request body, after checking its model names ours. `show` reports the name with its tag.
+#[allow(clippy::result_large_err)] // axum's Response, built once per bad request
 fn body(app: &App, raw: &[u8], show: bool) -> Result<Value, Response> {
     let b: Value = serde_json::from_slice(raw).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     // `name` is the older field; the ollama CLI sends both, with `model` empty.
@@ -118,6 +119,14 @@ fn body(app: &App, raw: &[u8], show: bool) -> Result<Value, Response> {
 fn options(b: &Value) -> Chat {
     let o = &b["options"];
     let mut sampling = sampling(o);
+    // Ollama's own defaults where they differ from llama.cpp's (api/types.go DefaultOptions).
+    // ponytail: repeat_penalty and num_ctx are ignored (no repetition penalty; context is the server's).
+    if o["top_p"].is_null() {
+        sampling.top_p = 0.9;
+    }
+    if o["min_p"].is_null() {
+        sampling.min_p = 0.0;
+    }
     sampling.schema = match &b["format"] {
         Value::String(s) if s == "json" => Some(json!({"type": "object"})), // Ollama's JSON grammar: root ::= object
         s @ Value::Object(_) => Some(s.clone()),
@@ -205,7 +214,7 @@ pub async fn generate(State(app): State<Arc<App>>, raw: Bytes) -> Response {
         app.prompt(&Chat { messages: ms.into(), ..options(&b) })
     };
     // A previous response's `context` continues that conversation.
-    let tokens = tokens.map(|t| b["context"].as_array().into_iter().flatten().filter_map(|c| c.as_u64().map(|c| c as u32)).chain(t).collect::<Vec<u32>>());
+    let tokens = tokens.map(|t| b["context"].as_array().into_iter().flatten().filter_map(|c| c.as_u64().map(super::tok_id)).chain(t).collect::<Vec<u32>>());
     let context = (!raw_mode).then(|| tokens.as_ref().map(Vec::clone).unwrap_or_default());
     let f = Ollama { app: app.clone(), t0, chat: false, context, a: Acc::default() };
     let rx = tokens.and_then(|t| app.generate(t, options(&b)));

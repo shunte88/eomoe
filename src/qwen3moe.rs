@@ -171,7 +171,7 @@ pub fn route(logits: &[f32], n_expert: usize, k: usize) -> Vec<Vec<(usize, f32)>
             let mut idx: Vec<usize> = (0..n_expert).collect();
             idx.sort_by(|a, b| p[*b].total_cmp(&p[*a]));
             let top = &idx[..k];
-            let wsum: f32 = top.iter().map(|&i| p[i] / s).sum::<f32>().max(6.103515625e-5);
+            let wsum: f32 = top.iter().map(|&i| p[i] / s).sum::<f32>().max(6.103_515_6e-5);
             top.iter().map(|&i| (i, p[i] / s / wsum)).collect()
         })
         .collect()
