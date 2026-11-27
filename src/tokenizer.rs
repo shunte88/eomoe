@@ -7,6 +7,9 @@ use std::collections::HashMap;
 // llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2.
 const QWEN2_PRE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// o200k (gpt-oss), the original regex from its tokenizer.json, as HF `tokenizers` runs it.
+const GPT4O_PRE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 // GGUF tokenizer.ggml.token_type values.
 const TT_UNKNOWN: i64 = 2;
 const TT_CONTROL: i64 = 3;
@@ -51,9 +54,11 @@ impl Tokenizer {
     pub fn from_gguf(g: &Gguf) -> Result<Self, String> {
         let model = g.str("tokenizer.ggml.model").unwrap_or("");
         let pre = g.str("tokenizer.ggml.pre").unwrap_or("");
-        if model != "gpt2" || pre != "qwen2" {
-            return Err(format!("unsupported tokenizer {model}/{pre} (only gpt2/qwen2)"));
-        }
+        let pre_re = match (model, pre) {
+            ("gpt2", "qwen2") => QWEN2_PRE,
+            ("gpt2", "gpt-4o") => GPT4O_PRE,
+            _ => return Err(format!("unsupported tokenizer {model}/{pre} (gpt2 with qwen2 or gpt-4o)")),
+        };
         let strs = |k: &str| -> Result<Vec<String>, String> {
             g.arr(k)
                 .ok_or(format!("missing {k}"))?
@@ -98,7 +103,7 @@ impl Tokenizer {
             specials,
             byte_enc,
             byte_dec,
-            pre: Regex::new(QWEN2_PRE).map_err(|e| e.to_string())?,
+            pre: Regex::new(pre_re).map_err(|e| e.to_string())?,
             eos,
         })
     }

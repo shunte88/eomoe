@@ -789,3 +789,17 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - **12c (architecture seam):** folded into 13c. One adapter makes a hypothetical seam; the gpt-oss CPU reference is the second adapter, and it shapes the seam.
   - **CUDA Q8_0 and MXFP4 kernels:** move to 13d. They are gated end to end there, gpt-oss GPU against the CPU reference, the way phase3 gated the Q4_K/Q6_K kernels.
   - **Q5_K:** dropped until a model file needs it. Neither Qwen3-Coder Q4_K_M nor gpt-oss MXFP4 uses it.
+
+## Phase 13a: o200k tokenizer, gpt-oss-20b (2026-11-27)
+
+- **What changed:** `tokenizer.ggml.pre = gpt-4o` selects the original regex from gpt-oss's tokenizer.json. Byte-level BPE, the vocab, the merges and the special-token partitioning are shared with qwen2.
+- **Gate:** `tests/phase13_gptoss.rs::tokenize_matches_hf`. 28 cases:
+  - the phase1 corpus;
+  - capitalised contractions, digit runs, CamelCase, CJK/Korean, emoji and accents, CRLF and trailing spaces, code;
+  - Harmony special tokens, NBSP and em-space, a 300-char run.
+  - The oracle is HF `tokenizers` running `openai/gpt-oss-20b`'s tokenizer.json: `uv run --with tokenizers python tools/capture_tokenize_hf.py openai/gpt-oss-20b gpt-oss`. It is model-free and needs no llama-server.
+  - Red first: `unsupported tokenizer gpt2/gpt-4o`.
+  - Green: `test result: ok. 1 passed`. Decode round-trips every case.
+  - A mutation run with the qwen2 regex gave 7 mismatches.
+  - Phase 1 is unchanged.
+- **Note (flagged):** llama.cpp runs a hand-rewritten form of this regex, `[^a-z]` lookaheads for its own regex engine. eomoe follows the model's own definition, so a later llama-server greedy capture could differ on exotic Unicode. If that happens, the prompt tokens in the capture will show it.
