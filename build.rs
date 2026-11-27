@@ -25,6 +25,8 @@ fn main() {
     let st = Command::new(&nvcc)
         .args(["-fatbin", "-O3", "-std=c++17"])
         .args(arch.split(',').map(|a| format!("-gencode=arch=compute_{a},code=sm_{a}")))
+        // A newer MSVC STL refuses an older nvcc; the kernels use no STL.
+        .args((env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")).then_some("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"))
         .arg("-o")
         .arg(&out)
         .arg(src)
