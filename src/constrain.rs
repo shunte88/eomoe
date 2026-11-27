@@ -135,7 +135,7 @@ impl P<'_> {
                     Ok(k) => k,
                     Err(State::Partial) => {
                         // A partial key must start one still allowed.
-                        let part = String::from_utf8_lossy(&self.s[start + 1..]).into_owned();
+                        let part = String::from_utf8_lossy(self.s.get(start + 1..).unwrap_or_default()).into_owned();
                         let fits = props.map_or(true, |p| p.keys().any(|k| k.starts_with(part.as_str()) && !seen.contains(k)));
                         return Err(if fits { State::Partial } else { State::Invalid });
                     }
@@ -299,7 +299,7 @@ mod tests {
         let s = json!({"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"},
                        "tags": {"type": "array", "items": {"enum": ["a", "b"]}}}, "required": ["name", "age"]});
         for (t, want) in [
-            ("{\"na", Partial), ("{\"nb", Invalid), ("{\"name\": 3", Invalid), ("{\"name\": \"x\", \"age\": 4.5", Invalid),
+            ("{", Partial), ("{\"name\": \"x\", ", Partial), ("{\"na", Partial), ("{\"nb", Invalid), ("{\"name\": 3", Invalid), ("{\"name\": \"x\", \"age\": 4.5", Invalid),
             ("{\"name\": \"x\"}", Invalid), ("{\"age\": 4, \"name\": \"x\"}", Done), ("{\"name\": \"x\", \"age\": 4, \"tags\": [\"a\", \"c", Invalid),
             ("{\"name\": \"x\", \"age\": 4, \"tags\": [\"b\"]}", Done), ("{\"name\": \"x\", \"name\": \"y\"", Invalid),
             ("{\"name\": \"x\", \"age\": 4, \"zip\": 1}", Invalid), ("[", Invalid),

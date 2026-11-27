@@ -545,6 +545,33 @@ Implementation, in `src/server.rs`:
 - The test server helpers moved to `tests/common`.
 - Regression gates: lib 20/20, phase5, phase8.
 
+## Phase 11c done: constrained JSON output (2026-11-27)
+
+**Gate:** `tests/phase11c_json.rs` `response_format_yields_valid_json`, run on the GPU against `eomoe serve`:
+- `response_format: {"type": "json_object"}`: the reply parses as JSON and finishes with `stop`. Output: `3.14159`. llama-server does the same here: a json_object without a schema becomes schema `{}`, which is any value (`server-common.cpp:1529`), not OpenAI's object-only rule.
+- `json_schema` with three required properties (string, integer, and an enum string): the reply parses, has exactly those keys and types, the enum value is one listed, and it finishes with `stop`. Output: `{"name": "Alex Chen", "age": 28, "lang": "rust"}`, pretty-printed.
+
+Result: pass. The gate is red-capable: before the fix below, the schema case returned 500.
+
+**Gate revision, flagged:** the plan said "outputs match llama-server where it supports the same schema". There is no oracle capture, because both CPU-oracle launches locked the machine (see the dev gotchas). The gate checks what llama-server guarantees instead: the output parses and validates.
+
+Implementation:
+- `src/constrain.rs` is a prefix checker for JSON plus a schema subset: `type`, `properties`/`required` (no extra keys, any order, no duplicates), `additionalProperties`, `items`, `enum`, `const`.
+  - No leading whitespace, and whitespace runs are capped at 16, so the model cannot pad to the length limit.
+  - Digit runs are capped at 16, as in llama.cpp's grammar.
+- `Batcher::emit` takes the 64 highest-logit tokens that keep the output a valid prefix and masks the rest. It ends with `stop` once the value is complete.
+- `server.rs` reads `response_format` (json_object, json_schema, either wrapper), the Responses API `text.format`, and native `json_schema`.
+- Found by the gate and fixed: when the output ended right before a key's opening quote, the checker sliced past the end and the panic killed the model thread. Unit test added.
+- ponytail: every candidate token re-parses the output from the start (O(len)). Add an incremental parser state if long structured outputs get slow.
+- Regression gates after the change (driver restored 2026-11-27): lib 24/24, and phase 3, 4, 5, 6, 7, 8 and 11 all pass.
+
+## Phase 11b coded, gate not yet run: RAM KV snapshots
+
+- `Engine::kv_save`/`kv_restore` copy a sequence's GPU KV pages to and from host RAM.
+- `Batcher::ram_swap`/`ram_save` follow llama-server's prompt-cache rules (`update_cache`, `alloc`, `find_better`, `load`).
+- `--cache-ram` / `cache_ram:` in MiB.
+- **Default is 0 (off)**; llama-server defaults to 8192. It stays off until `tests/phase11b_kvcache.rs` runs. That test waits for the 32 GB RAM upgrade and the user's OK, after two machine lockups.
+
 ## Plan: Phase 11, agent-serving extras from koboldcpp (2026-11-26)
 
 koboldcpp was reviewed for features that suit a single-model, coding-agent server. The rule was to take only what scales and that agents or editors actually use.
