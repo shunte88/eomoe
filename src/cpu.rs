@@ -25,6 +25,9 @@ pub fn rmsnorm(x: &mut [f32], w: &[f32], eps: f32) {
 impl CpuModel {
     pub fn new(g: Gguf) -> Result<Self, String> {
         let w = Weights::load(g)?;
+        if w.hp.oai {
+            return Err("gpt-oss: use gptoss::CpuModel".into());
+        }
         Ok(Self { kv: (0..w.hp.n_layer).map(|_| (vec![], vec![])).collect(), w, n_past: 0 })
     }
 
@@ -87,7 +90,7 @@ impl Engine for CpuModel {
             let mut q = self.mm(&l.wq, &h);
             let mut k = self.mm(&l.wk, &h);
             let v = self.mm(&l.wv, &h);
-            let (qn, kn) = (g.f32s(&l.q_norm), g.f32s(&l.k_norm));
+            let (qn, kn) = (g.f32s(l.q_norm.as_ref().unwrap()), g.f32s(l.k_norm.as_ref().unwrap()));
             for (ti, (qr, kr)) in q.chunks_exact_mut(nh * hd).zip(k.chunks_exact_mut(nkv * hd)).enumerate() {
                 let pos = self.n_past + ti;
                 for hv in qr.chunks_exact_mut(hd) {
@@ -152,7 +155,7 @@ impl Engine for CpuModel {
                 }
                 let xin: Vec<f32> = toks.iter().flat_map(|&(ti, _)| h[ti * e..(ti + 1) * e].iter().copied()).collect();
                 let n = toks.len();
-                let [gb, ub, db] = self.w.expert(l, ex);
+                let [gb, ub, db] = self.w.expert(l, ex)[..] else { unreachable!() };
                 let mut g_ = vec![0f32; n * ff];
                 let mut u_ = vec![0f32; n * ff];
                 matmul(l.gate.ty, gb, e, &xin, &mut g_);

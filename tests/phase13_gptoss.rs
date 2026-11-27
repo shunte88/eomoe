@@ -7,12 +7,14 @@
 //! (c) CPU reference forward (provisional until the llama.cpp greedy oracle is captured): greedy
 //!     decoding through the real tokenizer + template answers a short question, and recalls a
 //!     fact stated >128 tokens (one sliding window) before the question.
-//! `cargo test --release --test phase13_gptoss -- --include-ignored --nocapture`
+//! (d) CUDA engine: the oracle floor gate of (c), prefill (staged expert waves) and token by token
+//!     through a small expert cache (decode: cache fills, prefetch, hybrid CPU experts).
+//! `cargo test --release --test phase13_gptoss -- --include-ignored --nocapture --test-threads=1`
 
 mod common;
 use common::{golden, gptoss_path};
 use eomoe::qwen3moe::Engine;
-use eomoe::{gguf::Gguf, gptoss, template::ChatTemplate, tokenizer::Tokenizer};
+use eomoe::{gguf::Gguf, gptoss, gpu::GpuModel, template::ChatTemplate, tokenizer::Tokenizer};
 use serde_json::json;
 
 #[test]
@@ -48,10 +50,46 @@ fn template_matches_jinja() {
 #[test]
 #[ignore = "needs the gpt-oss-20b model file (CPU, minutes)"]
 fn cpu_reference_answers() {
-    let path = gptoss_path();
-    let g = Gguf::open(&path).unwrap();
+    answers(&mut gptoss::CpuModel::new(Gguf::open(gptoss_path()).unwrap()).unwrap());
+}
+
+#[test]
+#[ignore = "needs the gpt-oss-20b model file and a CUDA GPU"]
+fn gpu_decode_matches_oracle() {
+    // 1000 MiB holds ~3 of 32 experts per layer: decode misses, so cache fills and CPU experts run.
+    let m = GpuModel::with_cache(Gguf::open(gptoss_path()).unwrap(), 4096, 1000).unwrap();
+    common::greedy_floor_gate(&mut Decode(m), "greedy_gpt-oss.json", common::GPTOSS_TIE, common::GPTOSS_FLOOR_MEAN);
+}
+
+/// Runs `forward` one token at a time, so the floor gate checks the decode path.
+struct Decode<E>(E);
+impl<E: Engine> Engine for Decode<E> {
+    fn n_vocab(&self) -> usize {
+        self.0.n_vocab()
+    }
+    fn n_ctx(&self) -> usize {
+        self.0.n_ctx()
+    }
+    fn truncate(&mut self, n_past: usize) {
+        self.0.truncate(n_past)
+    }
+    fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
+        tokens.iter().flat_map(|&t| self.0.forward_last(&[t])).collect()
+    }
+}
+
+#[test]
+#[ignore = "needs the gpt-oss-20b model file and a CUDA GPU"]
+fn gpu_matches_oracle() {
+    let mut m = GpuModel::new(Gguf::open(gptoss_path()).unwrap(), 4096).unwrap();
+    common::greedy_floor_gate(&mut m, "greedy_gpt-oss.json", common::GPTOSS_TIE, common::GPTOSS_FLOOR_MEAN);
+}
+
+/// Greedy chat answers through the real tokenizer + template: a short question, and a fact stated
+/// more than one 128-token window before the question.
+fn answers(m: &mut impl Engine) {
+    let g = Gguf::open(gptoss_path()).unwrap();
     let (tok, tpl) = (Tokenizer::from_gguf(&g).unwrap(), ChatTemplate::from_gguf(&g).unwrap());
-    let mut m = gptoss::CpuModel::new(Gguf::open(&path).unwrap()).unwrap();
     let filler = "The weather that spring was mild, with long grey mornings that burned off into bright afternoons. \
         Farmers in the valley planted barley and beans, and the river ran high with snowmelt from the hills. \
         In the town, the bakery opened an hour earlier than usual, and the library extended its hours on Thursdays. \

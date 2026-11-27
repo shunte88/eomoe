@@ -1,4 +1,4 @@
-//! CUDA engine for qwen3moe. Same numerics as the CPU reference (f32 activations and KV
+//! CUDA engine for qwen3moe and gpt-oss (biases, sinks, sliding window, YaRN; `Hparams::oai`). Same numerics as the CPU reference (f32 activations and KV
 //! cache, weights dequantized on the fly), with the dense weights resident in VRAM and the
 //! experts in host RAM, cached in VRAM slots by `ExpertCache` (ubatches up to 32 tokens; larger
 //! ones read the cached experts and stream the rest through staging slots, as llama.cpp).
@@ -9,7 +9,7 @@
 use crate::expert_cache::ExpertCache;
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::quant::dequant_row;
-use crate::qwen3moe::{route, Engine, Weights};
+use crate::qwen3moe::{Engine, Weights};
 use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
 use rayon::prelude::*;
 use cudarc::nvrtc::Ptx;
@@ -96,6 +96,14 @@ struct Kernels {
     gemm_q6_k: CudaFunction,
     gemm_q4_k_ids: CudaFunction,
     gemm_q6_k_ids: CudaFunction,
+    mm_q8_0: CudaFunction,
+    mm_q8_0_t8: CudaFunction,
+    mm_q8_0_ids: CudaFunction,
+    mm_q8_0_ids_t8: CudaFunction,
+    mm_mxfp4: CudaFunction,
+    mm_mxfp4_t8: CudaFunction,
+    mm_mxfp4_ids: CudaFunction,
+    mm_mxfp4_ids_t8: CudaFunction,
     rmsnorm: CudaFunction,
     qk_norm_rope: CudaFunction,
     attention: CudaFunction,
@@ -106,6 +114,9 @@ struct Kernels {
     add_inplace: CudaFunction,
     gather_rows: CudaFunction,
     swiglu: CudaFunction,
+    swiglu_oai: CudaFunction,
+    add_bias: CudaFunction,
+    bias_ids: CudaFunction,
     moe_combine: CudaFunction,
 }
 
@@ -125,10 +136,15 @@ struct DLayer {
     wk: Mat,
     wv: Mat,
     wo: Mat,
+    /// 0: none (gpt-oss).
     q_norm: Ptr,
     k_norm: Ptr,
     ffn_norm: Ptr,
     router: Mat,
+    /// Biases of q, k, v, o, router (0: none), attention sinks (0: none), sliding window (0: none).
+    bias: [Ptr; 5],
+    sinks: Ptr,
+    window: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +174,11 @@ pub struct GpuModel {
     layers: Vec<DLayer>,
     out_norm: Ptr,
     output: Mat,
+    /// YaRN rope frequencies (0: base^(-2i/hd)) and cos/sin scale.
+    rope_freq: Ptr,
+    rope_mscale: f32,
+    /// Bytes from an expert slot's start to its gate | up bias, then down bias (gpt-oss).
+    bias_off: usize,
     /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16, in KV_PAGE pages that the
     /// sequences' page tables map their positions to.
     kv: Ptr,
@@ -247,6 +268,14 @@ impl GpuModel {
             gemm_q6_k: f("gemm_q6_k")?,
             gemm_q4_k_ids: f("gemm_q4_k_ids")?,
             gemm_q6_k_ids: f("gemm_q6_k_ids")?,
+            mm_q8_0: f("mm_q8_0")?,
+            mm_q8_0_t8: f("mm_q8_0_t8")?,
+            mm_q8_0_ids: f("mm_q8_0_ids")?,
+            mm_q8_0_ids_t8: f("mm_q8_0_ids_t8")?,
+            mm_mxfp4: f("mm_mxfp4")?,
+            mm_mxfp4_t8: f("mm_mxfp4_t8")?,
+            mm_mxfp4_ids: f("mm_mxfp4_ids")?,
+            mm_mxfp4_ids_t8: f("mm_mxfp4_ids_t8")?,
             rmsnorm: f("rmsnorm")?,
             qk_norm_rope: f("qk_norm_rope")?,
             attention: f("attention")?,
@@ -257,6 +286,9 @@ impl GpuModel {
             add_inplace: f("add_inplace")?,
             gather_rows: f("gather_rows")?,
             swiglu: f("swiglu")?,
+            swiglu_oai: f("swiglu_oai")?,
+            add_bias: f("add_bias")?,
+            bias_ids: f("bias_ids")?,
             moe_combine: f("moe_combine")?,
         };
 
@@ -279,20 +311,25 @@ impl GpuModel {
             Ok(Mat { p, ty: t.ty, row_bytes: t.row_bytes(), k: t.dims[0] as usize, n_rows: t.size / t.row_bytes() })
         };
         let mut layers = vec![];
-        for l in &w.layers {
+        for (li, l) in w.layers.iter().enumerate() {
+            let mut opt = |t: Option<&TensorInfo>| t.map_or(Ok(0), &mut upload);
+            let bias = [0, 1, 2, 3, 4].map(|i| l.bias.as_ref().map(|b| &b[i]));
             layers.push(DLayer {
+                q_norm: opt(l.q_norm.as_ref())?,
+                k_norm: opt(l.k_norm.as_ref())?,
+                bias: [opt(bias[0])?, opt(bias[1])?, opt(bias[2])?, opt(bias[3])?, opt(bias[4])?],
+                sinks: opt(l.sinks.as_ref())?,
+                window: if li % 2 == 0 { w.hp.swa as i32 } else { 0 },
                 attn_norm: upload(&l.attn_norm)?,
                 wq: mat(&l.wq, upload(&l.wq)?)?,
                 wk: mat(&l.wk, upload(&l.wk)?)?,
                 wv: mat(&l.wv, upload(&l.wv)?)?,
                 wo: mat(&l.wo, upload(&l.wo)?)?,
-                q_norm: upload(&l.q_norm)?,
-                k_norm: upload(&l.k_norm)?,
                 ffn_norm: upload(&l.ffn_norm)?,
                 router: mat(&l.router, upload(&l.router)?)?,
             });
             for t in [&l.gate, &l.up, &l.down] {
-                if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K) {
+                if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::MXFP4) {
                     return Err(format!("{}: {:?} experts have no CUDA kernel yet", t.name, t.ty));
                 }
             }
@@ -303,6 +340,14 @@ impl GpuModel {
         }
         let out_norm = upload(&w.out_norm)?;
         let output = mat(&w.output, upload(&w.output)?)?;
+        let rope_freq = match &w.hp.rope_yarn {
+            Some((f, _)) => {
+                let p = alloc(f.len() * F)?;
+                unsafe { result::memcpy_htod_sync(p, &f[..]) }.map_err(err)?;
+                p
+            }
+            None => 0,
+        };
         let dense = vram.get();
 
         let hp = &w.hp;
@@ -374,6 +419,7 @@ impl GpuModel {
             vram.get() >> 20
         );
         let ev = || ctx.new_event(None).map_err(err);
+        let bias_off = w.expert(&w.layers[0], 0)[..3].iter().map(|b| b.len()).sum();
         Ok(Self {
             copy: ctx.new_stream().map_err(err)?,
             ready: [ev()?, ev()?],
@@ -384,6 +430,9 @@ impl GpuModel {
             layers,
             out_norm,
             output,
+            rope_freq,
+            rope_mscale: w.hp.rope_yarn.as_ref().map_or(1.0, |y| y.1),
+            bias_off,
             kv,
             pt,
             seqs: vec![SeqKv::default()],
@@ -454,6 +503,11 @@ impl GpuModel {
             (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
             (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
             (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
+            // ponytail: no tensor-core GEMM for Q8_0 / MXFP4 yet; prefill runs the 8-token tiles.
+            (GgmlType::Q8_0, 1) => (&self.k.mm_q8_0, m.n_rows.div_ceil(4), 1),
+            (GgmlType::MXFP4, 1) => (&self.k.mm_mxfp4, m.n_rows.div_ceil(4), 1),
+            (GgmlType::Q8_0, _) => (&self.k.mm_q8_0_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::MXFP4, _) => (&self.k.mm_mxfp4_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
             (t, _) => unreachable!("checked at load: {t:?}"),
         };
         launch!(self, f, (gx as u32, gy as u32, 1), 128, [p, rb, k, x, y, n, ti]);
@@ -472,10 +526,22 @@ impl GpuModel {
             (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
             (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k_ids, n_rows.div_ceil(128), ntok.div_ceil(GEMM_TI)),
             (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k_ids, n_rows.div_ceil(128), ntok.div_ceil(GEMM_TI)),
+            (GgmlType::Q8_0, ..4) => (&self.k.mm_q8_0_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::MXFP4, ..4) => (&self.k.mm_mxfp4_ids, n_rows.div_ceil(4), ntok),
+            (GgmlType::Q8_0, _) => (&self.k.mm_q8_0_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::MXFP4, _) => (&self.k.mm_mxfp4_ids_t8, n_rows.div_ceil(4), ntok.div_ceil(8)),
             (t, _) => unreachable!("checked at load: {t:?}"),
         };
         let (rb, k, n, ti) = (row_bytes as u64, k as i32, n_rows as i32, ntok as i32);
         launch!(self, f, (gx as u32, gy as u32, 1), 128, [wp, off, rb, k, x, y, n, ti]);
+    }
+
+    /// y (ntok rows of n_cols) += bias b; no-op for b = 0.
+    fn bias(&self, b: Ptr, y: Ptr, n_cols: usize, ntok: usize) {
+        if b != 0 {
+            let (c, n) = (n_cols as i32, (n_cols * ntok) as i32);
+            launch!(self, self.k.add_bias, ((n_cols * ntok).div_ceil(256) as u32, 1, 1), 256, [y, b, c, n]);
+        }
     }
 
     fn htod<T>(&self, dst: Ptr, src: &[T]) {
@@ -505,24 +571,23 @@ impl GpuModel {
         let jobs: Vec<crate::cpu_moe::ExpertJob> = experts
             .iter()
             .map(|&ex| {
-                let parts = self.w.expert(wl, ex);
-                let w = match &self.host {
-                    Some(hx) => {
-                        let n: usize = parts.iter().map(|b| b.len()).sum();
-                        let all = &hx.buf.as_slice().expect("pinned")[hx.base[li] + ex * n..][..n];
-                        let (g, rest) = all.split_at(parts[0].len());
-                        let (u, d) = rest.split_at(parts[1].len());
-                        [g, u, d]
+                let mut parts = self.w.expert(wl, ex);
+                if let Some(hx) = &self.host {
+                    // The same parts, from the pinned copy (slot layout).
+                    let mut o = hx.base[li] + ex * parts.iter().map(|b| b.len()).sum::<usize>();
+                    let all = hx.buf.as_slice().expect("pinned");
+                    for p in &mut parts {
+                        (*p, o) = (&all[o..o + p.len()], o + p.len());
                     }
-                    None => parts,
-                };
-                crate::cpu_moe::ExpertJob { w, ty, rows: by_expert[ex].clone() }
+                }
+                let bias = (parts.len() == 6).then(|| [parts[3], parts[4], parts[5]]);
+                crate::cpu_moe::ExpertJob { w: [parts[0], parts[1], parts[2]], ty, bias, rows: by_expert[ex].clone() }
             })
             .collect();
         let mut buf = self.cpu_out.borrow_mut();
         let out = &mut buf.as_mut_slice().expect("pinned")[..t * e];
         out.fill(0.0);
-        crate::cpu_moe::moe(&jobs, h, e, hp.n_ff_exp, out);
+        crate::cpu_moe::moe(&jobs, h, e, hp.n_ff_exp, hp.oai, out);
         let (x, o, n) = (self.s.x, self.s.o, (t * e) as i32);
         unsafe { result::memcpy_htod_async(o, &*out, self.stream.cu_stream()) }.expect("htod async");
         launch!(self, self.k.add_inplace, ((t * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
@@ -542,7 +607,8 @@ impl GpuModel {
     /// Route each token to its top `n` experts (renormalized over those) instead of the model's
     /// own count; 1..=that count, since the expert buffers were sized for it.
     pub fn set_n_expert_used(&mut self, n: usize) -> Result<(), String> {
-        let max = self.w.g.u64("qwen3moe.expert_used_count").unwrap_or(0) as usize;
+        let arch = self.w.g.str("general.architecture").unwrap_or("");
+        let max = self.w.g.u64(&format!("{arch}.expert_used_count")).unwrap_or(0) as usize;
         if !(1..=max).contains(&n) {
             return Err(format!("--moeexperts must be 1..={max}"));
         }
@@ -631,14 +697,17 @@ impl GpuModel {
                 self.mm(&l.wq, h, s.q, tc);
                 self.mm(&l.wk, h, ks, tc);
                 self.mm(&l.wv, h, vs, tc);
+                self.bias(l.bias[0], s.q, nh * hd, tc);
+                self.bias(l.bias[1], ks, kvd, tc);
+                self.bias(l.bias[2], vs, kvd, tc);
                 for &(sq, r0, tc, pos) in ps {
                   let pages = &self.seqs[sq].pages;
                   let pt = pt_row(sq);
                   let (q, attn, ks, vs) = (at(s.q, r0, nh * hd), at(s.attn, r0, nh * hd), at(ks, r0, kvd), at(vs, r0, kvd));
                   let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
-                  let (qn, kn) = (l.q_norm, l.k_norm);
-                  launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base]);
-                  launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base]);
+                  let (qn, kn, fr, ms) = (l.q_norm, l.k_norm, self.rope_freq, self.rope_mscale);
+                  launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base, fr, ms]);
+                  launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base, fr, ms]);
                   // Store K and V, one launch per page the rows land in.
                   let mut p = pos;
                   while p < pos + tc {
@@ -653,7 +722,7 @@ impl GpuModel {
                       p += n;
                   }
                   let gq = nh / nkv;
-                  if hd == 128 && 8 % gq == 0 {
+                  if hd == 128 && 8 % gq == 0 && l.sinks == 0 && l.window == 0 {
                     // Decode (<= 4 tokens): attention_dec, one row per warp. Prefill: tensor-core
                     // attention_tc. Both split the positions when blocks are few, partials in s.gu
                     // (idle during attention).
@@ -671,16 +740,19 @@ impl GpuModel {
                         launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), 128, [part, attn, rows, ski]);
                     }
                   } else {
-                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, pt, attn, nhi, nkvi, hdi, pos0, scale]);
+                    let (sinks, win) = (l.sinks, l.window);
+                    launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, pt, attn, nhi, nkvi, hdi, pos0, scale, sinks, win]);
                   }
                 }
                 let attn = s.attn;
                 self.mm(&l.wo, attn, o, tc);
+                self.bias(l.bias[3], o, e, tc);
                 let n = (tc * e) as i32;
                 launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
                 let wn = l.ffn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
                 self.mm(&l.router, h, s.rl, tc);
+                self.bias(l.bias[4], s.rl, n_expert, tc);
                 // Decode: also predict layer li+1's experts, its router on this post-attention x
                 // (top-8 recall ~84%). Read back with the router logits; prefetched below.
                 let predict = t == 1 && li + 1 < self.layers.len();
@@ -688,8 +760,9 @@ impl GpuModel {
                     let (o, wn, rl2) = (s.o, self.layers[li + 1].ffn_norm, s.rl + (n_expert * F) as u64);
                     launch!(self, self.k.rmsnorm, (1, 1, 1), 256, [o, x, wn, ei, eps]);
                     self.mm(&self.layers[li + 1].router, o, rl2, 1);
+                    self.bias(self.layers[li + 1].bias[4], rl2, n_expert, 1);
                 }
-                let mut r = route(&self.dtoh(s.rl, (tc + predict as usize) * n_expert), n_expert, kk);
+                let mut r = self.w.route(&self.dtoh(s.rl, (tc + predict as usize) * n_expert));
                 if self.hybrid && t <= CACHE_MAX_BATCH {
                     hrows = self.dtoh(h, t * e); // the CPU experts' input (stream just synced)
                 }
@@ -837,9 +910,17 @@ impl GpuModel {
                     let wp = s.meta + (o + 4 * r + 4 * (t + 1) + 8 * r).next_multiple_of(8) as u64;
                     launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gidx, ei]);
                     self.mm_ids(wl.gate.ty, wp, 0, wl.gate.row_bytes(), e, xg, gu, 2 * ff, r, per_ex);
-                    let (ffi, ri) = (ff as i32, r as i32);
-                    launch!(self, self.k.swiglu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
+                    let (ffi, ri, oai) = (ff as i32, r as i32, hp.oai);
+                    let (bo, bdo, ff2, ei2) = (self.bias_off as u64, (self.bias_off + 2 * ff * F) as u64, 2 * ff as i32, e as i32);
+                    if oai {
+                        launch!(self, self.k.bias_ids, (r as u32, 1, 1), 256, [gu, wp, bo, ff2]);
+                    }
+                    let glu = if oai { &self.k.swiglu_oai } else { &self.k.swiglu };
+                    launch!(self, *glu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
                     self.mm_ids(wl.down.ty, wp, down_off, wl.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
+                    if oai {
+                        launch!(self, self.k.bias_ids, (r as u32, 1, 1), 256, [dbuf, wp, bdo, ei2]);
+                    }
                     launch!(self, self.k.moe_combine, (t as u32, 1, 1), 256, [x, dbuf, off, crow, cw, ei]);
                 }
                 if let Some(hf) = half[wi] {
@@ -927,7 +1008,7 @@ fn pin_experts(ctx: &Arc<CudaContext>, w: &Weights, total: usize) -> Option<Host
 
 fn check_ty(t: &TensorInfo) -> Result<(), String> {
     match t.ty {
-        GgmlType::F32 | GgmlType::Q4_K | GgmlType::Q6_K => Ok(()),
+        GgmlType::F32 | GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::MXFP4 => Ok(()),
         ty => Err(format!("{}: {ty:?} has no CUDA matmul kernel yet", t.name)),
     }
 }

@@ -7,7 +7,7 @@
 use crate::cpu::rmsnorm;
 use crate::gguf::{Gguf, TensorInfo};
 use crate::quant::{dequant_row, dot, matmul};
-use crate::qwen3moe::Engine;
+use crate::qwen3moe::{glu, route_oai, Engine};
 use rayon::prelude::*;
 
 struct Layer {
@@ -46,6 +46,26 @@ pub struct CpuModel {
     n_past: usize,
 }
 
+/// YaRN (ggml rope_yarn with ext_factor 1): per rotated pair i, the angle per position
+/// (interpolated, angle / factor, below the correction range, extrapolated above, ramped in
+/// between), and the cos/sin scale 1 + 0.1 ln(factor) (llama.cpp's attn_factor cancels to 1).
+pub fn yarn(g: &Gguf) -> Result<(Vec<f32>, f32), String> {
+    let u = |k: &str| g.u64(&format!("gpt-oss.{k}")).map(|v| v as usize).ok_or(format!("missing gpt-oss.{k}"));
+    let f = |k: &str| g.f64(&format!("gpt-oss.{k}")).map(|v| v as f32).ok_or(format!("missing gpt-oss.{k}"));
+    let (head_dim, base, factor) = (u("attention.key_length")?, f("rope.freq_base")?, f("rope.scaling.factor")?);
+    let n_orig = u("rope.scaling.original_context_length")? as f32;
+    let corr = |beta: f32| head_dim as f32 * (n_orig / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+    let lo = corr(f("rope.scaling.yarn_beta_fast")?).floor().max(0.0);
+    let hi = corr(f("rope.scaling.yarn_beta_slow")?).ceil().min(head_dim as f32 - 1.0);
+    let freq = (0..head_dim / 2)
+        .map(|i| {
+            let ramp = 1.0 - ((i as f32 - lo) / (hi - lo).max(0.001)).clamp(0.0, 1.0);
+            base.powf(-2.0 * i as f32 / head_dim as f32) * (ramp + (1.0 - ramp) / factor)
+        })
+        .collect();
+    Ok((freq, 1.0 + 0.1 * factor.ln()))
+}
+
 impl CpuModel {
     pub fn new(g: Gguf) -> Result<Self, String> {
         let arch = g.str("general.architecture").unwrap_or("");
@@ -56,22 +76,8 @@ impl CpuModel {
         let f = |k: &str| g.f64(&format!("gpt-oss.{k}")).map(|v| v as f32).ok_or(format!("missing gpt-oss.{k}"));
         let t = |n: &str| g.tensor(n).cloned().ok_or(format!("missing tensor {n}"));
         let head_dim = u("attention.key_length")?;
-        let base = f("rope.freq_base")?;
 
-        // YaRN (ggml rope_yarn with ext_factor 1): pair i interpolates (angle / factor) below the
-        // correction range, extrapolates (plain angle) above it, ramps in between; cos/sin carry
-        // mscale = 1 + 0.1 ln(factor) (llama.cpp's attn_factor cancels to 1 for gpt-oss).
-        let factor = f("rope.scaling.factor")?;
-        let n_orig = u("rope.scaling.original_context_length")? as f32;
-        let corr = |beta: f32| head_dim as f32 * (n_orig / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
-        let lo = corr(f("rope.scaling.yarn_beta_fast")?).floor().max(0.0);
-        let hi = corr(f("rope.scaling.yarn_beta_slow")?).ceil().min(head_dim as f32 - 1.0);
-        let rope_freq = (0..head_dim / 2)
-            .map(|i| {
-                let ramp = 1.0 - ((i as f32 - lo) / (hi - lo).max(0.001)).clamp(0.0, 1.0);
-                base.powf(-2.0 * i as f32 / head_dim as f32) * (ramp + (1.0 - ramp) / factor)
-            })
-            .collect();
+        let (rope_freq, rope_mscale) = yarn(&g)?;
 
         let n_layer = u("block_count")?;
         let layers = (0..n_layer)
@@ -107,7 +113,7 @@ impl CpuModel {
             eps: f("attention.layer_norm_rms_epsilon")?,
             swa: u("attention.sliding_window")?,
             rope_freq,
-            rope_mscale: 1.0 + 0.1 * factor.ln(),
+            rope_mscale,
             kv: (0..n_layer).map(|_| (vec![], vec![])).collect(),
             layers,
             n_past: 0,
@@ -218,27 +224,15 @@ impl Engine for CpuModel {
             h.chunks_exact_mut(e).for_each(|r| rmsnorm(r, g.f32s(&l.post_norm), self.eps));
             let logits = self.linear(&l.router, 0..self.n_expert, &h);
             let mut assign: Vec<Vec<(usize, f32)>> = vec![vec![]; self.n_expert];
-            for (ti, lr) in logits.chunks_exact(self.n_expert).enumerate() {
-                let mut idx: Vec<usize> = (0..self.n_expert).collect();
-                idx.sort_by(|a, b| lr[*b].total_cmp(&lr[*a]));
-                let top = &idx[..self.n_expert_used];
-                let m = lr[top[0]];
-                let s: f32 = top.iter().map(|&i| (lr[i] - m).exp()).sum();
-                top.iter().for_each(|&i| assign[i].push((ti, (lr[i] - m).exp() / s)));
+            for (ti, sel) in route_oai(&logits, self.n_expert, self.n_expert_used).into_iter().enumerate() {
+                sel.into_iter().for_each(|(i, w)| assign[i].push((ti, w)));
             }
             let mut moe = vec![0f32; t_n * e];
             for (ex, toks) in assign.iter().enumerate().filter(|(_, t)| !t.is_empty()) {
                 let xin: Vec<f32> = toks.iter().flat_map(|&(ti, _)| h[ti * e..][..e].iter().copied()).collect();
                 let gate = self.linear(&l.gate, ex * ff..(ex + 1) * ff, &xin);
                 let up = self.linear(&l.up, ex * ff..(ex + 1) * ff, &xin);
-                let act: Vec<f32> = gate
-                    .iter()
-                    .zip(&up)
-                    .map(|(&g, &u)| {
-                        let (g, u) = (g.min(7.0), u.clamp(-7.0, 7.0));
-                        g / (1.0 + (-1.702 * g).exp()) * (u + 1.0)
-                    })
-                    .collect();
+                let act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| glu(true, g, u)).collect();
                 let down = self.linear(&l.down, ex * e..(ex + 1) * e, &act);
                 for (j, &(ti, wgt)) in toks.iter().enumerate() {
                     moe[ti * e..][..e].iter_mut().zip(&down[j * e..][..e]).for_each(|(a, b)| *a += wgt * b);

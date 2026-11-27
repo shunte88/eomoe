@@ -862,3 +862,41 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - Revised gate: `top1 fails 0/160, mean |dlogprob| 0.2342 (floor 0.2588)`, `test result: ok. 4 passed` (phase13 total).
   - It stays red-capable: the no-mscale and no-YaRN-frequency variants exceed the floor.
 - **Regressions:** phase2 still `ok. 2 passed` with the new signature. Clippy clean.
+
+### Phase 13d: gpt-oss on the CUDA engine (2026-11-27), oracle-verified
+
+- **Design:** `GpuModel` was generalised rather than duplicated. gpt-oss needs the same expert cache, staging waves and hybrid CPU experts to fit ~10 GiB of MXFP4 experts on 8 GB. That makes two adapters for one seam, so the seam is now real:
+  - `qwen3moe::Weights` loads both archs. `Hparams::oai`, `swa` and `rope_yarn` are new, plus optional `q_norm`/`k_norm`, `bias` (8 tensors) and `sinks` per layer.
+  - Routing goes through `Weights::route` (`route_oai`). `glu` and `gptoss::yarn` are shared with the CPU reference, which now uses them too.
+  - Expert slots carry their biases: gate | up | down | gate_b | up_b | down_b. A bias moves with its expert through the pinned host copy, the cache, staging and the CPU experts. `bias_ids` adds it from `wp[j] + bias_off`.
+- **Kernels (kernels/eomoe.cu):**
+  - `dot_q8_0` / `dot_mxfp4` through `MM_QUANT` (plain, _t8, _ids, _ids_t8).
+  - `qk_norm_rope`: the norm is optional (null w), and it takes a YaRN frequency table and mscale.
+  - `attention`: sinks and sliding window. hd 64, so the general kernel; dec/tc stay qwen-only.
+  - `swiglu_oai`, `add_bias`, `bias_ids`.
+  - `cpu_moe::moe`: takes biases and `oai`.
+- **Gates (tests/phase13_gptoss.rs), red first** (`unsupported architecture "gpt-oss"`):
+  - `gpu_matches_oracle` (prefill: staged expert waves): `top1 fails 0/160, mean |dlogprob| 0.2324 (floor 0.2588), max 5.5740`.
+  - `gpu_decode_matches_oracle`: the same floor gate, fed token by token through a 1000 MiB cache (79 slots). Decode cache fills, prefetch and hybrid CPU experts all run: 1236 misses in 8160 lookups and 173 CPU-expert calls. Result: `top1 fails 0/160, mean |dlogprob| 0.2341 (floor 0.2588)`.
+  - **GATE REVISION (flagged):** `gpu_answers` (greedy chat text) was dropped for `gpu_decode_matches_oracle`. Its text survived a wrong activation in the hybrid CPU experts; the decode floor gate catches it.
+- **Mutation checks (all red):**
+
+  | Mutation | Top-1 misses | Mean \|dlogprob\| |
+  |---|---|---|
+  | Hybrid CPU experts with plain SwiGLU (decode gate) | 2 | 0.5666 |
+  | No down bias | 21 | 2.76 |
+  | No sinks | 81 | 5.78 |
+  | No sliding window | 40 | 1.72 |
+  | mscale 1 | 2 | 0.4908 |
+
+- **Regressions:** every gate except 11b (not run, per the standing rule) passes:
+  - lib: 30 passed;
+  - phase1–8, 11, 11c, 11d, 12 (formats, limits, moeexperts): all `ok`;
+  - phase13: 6 passed.
+
+  `cargo clippy --release --all-targets` is clean.
+- **Not yet tuned:**
+  - Prefill is ~100 tok/s because Q8_0/MXFP4 have no tensor-core GEMM (8-token tiles).
+  - Decode is 13 tok/s with the 1000 MiB test cache; the default cache was not benchmarked.
+  - The CPU experts dequantize MXFP4 per row, with no AVX2 dot.
+  - Serving (arch-selected engine, Harmony tool calls / analysis channel) is 13e.

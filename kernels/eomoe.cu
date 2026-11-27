@@ -125,6 +125,46 @@ __device__ __forceinline__ void dot_q6_k(const uint8_t* row, const float* xt, in
     for (int j = 0; j < TT; j++) out[j] = warp_sum(acc[j]);
 }
 
+// Q8_0: 34 bytes: d f16, qs[32] i8. Lane l takes element l of every block.
+template <int TT>
+__device__ __forceinline__ void dot_q8_0(const uint8_t* row, const float* xt, int k, int l, int n, float* out) {
+    float acc[TT];
+#pragma unroll
+    for (int j = 0; j < TT; j++) acc[j] = 0.0f;
+    for (int b = 0; b < k / 32; b++) {
+        const uint8_t* blk = row + b * 34;
+        const float w = ld_f16(blk) * (float)(int8_t)blk[2 + l];
+#pragma unroll
+        for (int j = 0; j < TT; j++)
+            if (j < n) acc[j] += w * xt[(size_t)j * k + b * 32 + l];
+    }
+#pragma unroll
+    for (int j = 0; j < TT; j++) out[j] = warp_sum(acc[j]);
+}
+
+// MXFP4: 17 bytes: e8m0 scale, qs[16] e2m1 nibbles (low: elements 0..15, high: 16..31). Lane l
+// takes element l of every block. Values are doubled e2m1 (0 1 2 3 4 6 8 12, sign bit 3) times
+// half the e8m0 scale, 2^(e - 128), as ggml.
+template <int TT>
+__device__ __forceinline__ void dot_mxfp4(const uint8_t* row, const float* xt, int k, int l, int n, float* out) {
+    float acc[TT];
+#pragma unroll
+    for (int j = 0; j < TT; j++) acc[j] = 0.0f;
+    for (int b = 0; b < k / 32; b++) {
+        const uint8_t* blk = row + b * 17;
+        const unsigned e = blk[0];
+        const float d = __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+        const int q = l < 16 ? blk[1 + l] & 15 : blk[1 + l - 16] >> 4, m = q & 7;
+        const float v = (float)(m < 4 ? m : m < 6 ? 2 * m - 4 : 4 * m - 16);
+        const float w = d * (q & 8 ? -v : v);
+#pragma unroll
+        for (int j = 0; j < TT; j++)
+            if (j < n) acc[j] += w * xt[(size_t)j * k + b * 32 + l];
+    }
+#pragma unroll
+    for (int j = 0; j < TT; j++) out[j] = warp_sum(acc[j]);
+}
+
 // mm_X: y[t][r] = W[r] . x[t], one weight matrix. grid (ceil(n_rows / MM_ROWS), ceil(T / TT)).
 // mm_X_ids: the weights of token t start at wp[t] + off (grouped experts: one launch per
 // projection for all the experts of a layer, each gathered row reading its own expert).
@@ -176,6 +216,10 @@ MM_QUANT(q4_k, 1, )
 MM_QUANT(q6_k, 1, )
 MM_QUANT(q4_k, 8, _t8)
 MM_QUANT(q6_k, 8, _t8)
+MM_QUANT(q8_0, 1, )
+MM_QUANT(q8_0, 8, _t8)
+MM_QUANT(mxfp4, 1, )
+MM_QUANT(mxfp4, 8, _t8)
 
 // ---- Prefill GEMM: y[t][r] = W[r] . x[t] for many tokens, on tensor cores (mma.sync m16n8k16,
 // f16 in, f32 accumulate), MMQ-style. Block: 128 rows x NT tokens (GB_T = 128 dense, GB_TI = 64
@@ -386,28 +430,31 @@ extern "C" __global__ void rmsnorm(float* y, const float* x, const float* w, int
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * s * w[i];
 }
 
-// Per-head RMSNorm (q_norm/k_norm) then NEOX rope in place. v is T x heads x hd,
-// grid T * heads, block hd. Pairs (i, i + hd/2), theta_i = base^(-2i/hd), pos = pos0 + t.
+// Per-head RMSNorm (q_norm/k_norm; none if w is null) then NEOX rope in place. v is
+// T x heads x hd, grid T * heads, block hd. Pairs (i, i + hd/2), pos = pos0 + t, theta_i =
+// pos * freq[i] (YaRN table) or pos * base^(-2i/hd) if freq is null; cos/sin times mscale.
 extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int hd, int pos0,
-                                        float eps, float base) {
+                                        float eps, float base, const float* freq, float mscale) {
     __shared__ float s[1024];
     float* hv = v + (size_t)blockIdx.x * hd;
     const int i = threadIdx.x;
     const float a = hv[i];
     const float sc = 1.0f / sqrtf(block_sum(a * a) / hd + eps);
-    s[i] = a * sc * w[i];
+    s[i] = w ? a * sc * w[i] : a;
     __syncthreads();
     const int half = hd / 2;
     const float pos = (float)(pos0 + blockIdx.x / heads);
     const int j = i < half ? i : i - half;
-    const float th = pos * powf(base, -2.0f * j / hd);
-    const float sn = sinf(th), cs = cosf(th);
+    const float th = pos * (freq ? freq[j] : powf(base, -2.0f * j / hd));
+    const float sn = sinf(th) * mscale, cs = cosf(th) * mscale;
     hv[i] = i < half ? s[i] * cs - s[i + half] * sn : s[i - half] * sn + s[i] * cs;
 }
 
 // Causal GQA attention with online softmax. q: T x nh x hd, caches: n_ctx x nkv x hd,
 // out: T x nh x hd. grid (nh, T), block 32 * ATT_WARPS; hd a multiple of 32, <= 256.
-// Token t sees positions [0, n_past + t]. Each warp takes positions w, w + nw, ... with its own
+// Token t sees positions [0, n_past + t], or the last `window` of them if window > 0. With
+// sinks (one logit per head, or null) the sink joins the softmax denominator, no value row.
+// Each warp takes positions w, w + nw, ... with its own
 // softmax state (lane owns dims lane + 32d), then the warps merge.
 // The caches are f16 (llama.cpp's default KV type), so 32K ctx costs what 16K did in f32.
 // ponytail: K/V re-read per query head (no GQA sharing); tile for long contexts.
@@ -419,16 +466,17 @@ __device__ __forceinline__ size_t kv_slot(const int* pt, int p) {
     return (size_t)pt[p / KV_PAGE] * KV_PAGE + p % KV_PAGE;
 }
 extern "C" __global__ void attention(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
-                                     int nh, int nkv, int hd, int n_past, float scale) {
+                                     int nh, int nkv, int hd, int n_past, float scale,
+                                     const float* sinks, int window) {
     __shared__ float sm[ATT_WARPS], sl[ATT_WARPS], sacc[ATT_WARPS][256];
     const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const int hk = h / (nh / nkv), nd = hd / 32;
     const float* qp = q + ((size_t)t * nh + h) * hd;
     float qv[8], acc[8];
     for (int d = 0; d < nd; d++) { qv[d] = qp[lane + 32 * d]; acc[d] = 0.0f; }
-    const int n_ctx = n_past + t + 1;
+    const int n_ctx = n_past + t + 1, p0 = window > 0 ? max(0, n_ctx - window) : 0;
     float m = -INFINITY, l = 0.0f;
-    for (int p = w; p < n_ctx; p += ATT_WARPS) {
+    for (int p = p0 + w; p < n_ctx; p += ATT_WARPS) {
         const size_t off = (kv_slot(pt, p) * nkv + hk) * hd;
         float s = 0.0f;
         for (int d = 0; d < nd; d++) s += qv[d] * __half2float(kc[off + lane + 32 * d]);
@@ -443,9 +491,9 @@ extern "C" __global__ void attention(const float* q, const __half* kc, const __h
     for (int d = 0; d < nd; d++) sacc[w][lane + 32 * d] = acc[d];
     __syncthreads();
     if (w != 0) return;
-    float M = sm[0];
-    for (int i = 1; i < ATT_WARPS; i++) M = fmaxf(M, sm[i]);
-    float L = 0.0f;
+    float M = sinks ? sinks[h] : -INFINITY;
+    for (int i = 0; i < ATT_WARPS; i++) M = fmaxf(M, sm[i]);
+    float L = sinks ? expf(sinks[h] - M) : 0.0f;
     for (int i = 0; i < ATT_WARPS; i++) L += sl[i] * expf(sm[i] - M);
     for (int d = 0; d < nd; d++) {
         float o = 0.0f;
@@ -708,6 +756,30 @@ extern "C" __global__ void swiglu(float* out, const float* gu, int ff, int n) {
     const int j = i / ff, c = i % ff;
     const float g = gu[(size_t)j * 2 * ff + c], u = gu[(size_t)j * 2 * ff + ff + c];
     out[i] = g / (1.0f + expf(-g)) * u;
+}
+
+// gpt-oss clamped SwiGLU: g = min(g, 7), u = clamp(u, -7, 7), out = g * sigmoid(1.702 g) * (u + 1).
+extern "C" __global__ void swiglu_oai(float* out, const float* gu, int ff, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * ff) return;
+    const int j = i / ff, c = i % ff;
+    const float g = fminf(gu[(size_t)j * 2 * ff + c], 7.0f);
+    const float u = fminf(fmaxf(gu[(size_t)j * 2 * ff + ff + c], -7.0f), 7.0f);
+    out[i] = g / (1.0f + expf(-1.702f * g)) * (u + 1.0f);
+}
+
+// y[i] += b[i % n_cols] for n elements (rows of n_cols).
+extern "C" __global__ void add_bias(float* y, const float* b, int n_cols, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += b[i % n_cols];
+}
+
+// Gathered expert rows: y[j][c] += the n_cols f32 at wp[j] + off (the bias in the expert's slot).
+// grid rows.
+extern "C" __global__ void bias_ids(float* y, const unsigned long long* wp, unsigned long long off, int n_cols) {
+    const float* b = (const float*)(wp[blockIdx.x] + off);
+    float* yr = y + (size_t)blockIdx.x * n_cols;
+    for (int c = threadIdx.x; c < n_cols; c += blockDim.x) yr[c] += b[c];
 }
 
 // x[t] += sum_{j in off[t]..off[t+1]} w[j] * d[rows[j]]: one token per block (CSR lists, in

@@ -12,6 +12,8 @@ use rayon::prelude::*;
 pub struct ExpertJob<'a> {
     pub w: [&'a [u8]; 3],
     pub ty: [GgmlType; 3],
+    /// gpt-oss: f32 biases of gate, up, down (raw bytes).
+    pub bias: Option<[&'a [u8]; 3]>,
     /// (row of `h`, routing weight)
     pub rows: Vec<(usize, f32)>,
 }
@@ -19,11 +21,17 @@ pub struct ExpertJob<'a> {
 /// Rows of matvec work per rayon task.
 const ROWS_PER_TASK: usize = 64;
 
-/// out[r] += sum over jobs routed to row r of weight * down(silu(gate h[r]) * up h[r]).
+/// out[r] += sum over jobs routed to row r of weight * down(glu(gate h[r], up h[r])), biases
+/// added after each matvec when the job has them (`qwen3moe::glu`, `oai` for gpt-oss).
 /// `h` and `out` are rows of `e`; experts have hidden size `ff`. Contributions are summed in
 /// job order, so the result does not depend on threading.
-pub fn moe(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, out: &mut [f32]) {
-    pool().install(|| moe_in_pool(jobs, h, e, ff, out))
+pub fn moe(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, oai: bool, out: &mut [f32]) {
+    pool().install(|| moe_in_pool(jobs, h, e, ff, oai, out))
+}
+
+/// f32 `i` of raw little-endian bias bytes, 0 without a bias.
+fn bias(b: Option<&[u8]>, i: usize) -> f32 {
+    b.map_or(0.0, |b| f32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
 }
 
 /// Physical cores only: the work streams weights from RAM, and SMT siblings just contend
@@ -37,7 +45,7 @@ fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-fn moe_in_pool(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, out: &mut [f32]) {
+fn moe_in_pool(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, oai: bool, out: &mut [f32]) {
     // gate | up | SwiGLU fused per (job, block of ROWS_PER_TASK hidden units): act^T [unit][token].
     let mut act_t: Vec<Vec<f32>> = jobs.iter().map(|j| vec![0f32; j.rows.len() * ff]).collect();
     let tasks: Vec<(usize, usize, &mut [f32])> = act_t
@@ -57,8 +65,9 @@ fn moe_in_pool(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, out: &mut [f3
             let (gr, ur) = (&j.w[0][i * rg..(i + 1) * rg], &j.w[1][i * ru..(i + 1) * ru]);
             for (t, v) in ov.iter_mut().enumerate() {
                 let x = &h[j.rows[t].0 * e..(j.rows[t].0 + 1) * e];
-                let (g, u) = (dot(j.ty[0], gr, x), dot(j.ty[1], ur, x));
-                *v = g / (1.0 + (-g).exp()) * u;
+                let g = dot(j.ty[0], gr, x) + bias(j.bias.map(|b| b[0]), i);
+                let u = dot(j.ty[1], ur, x) + bias(j.bias.map(|b| b[1]), i);
+                *v = crate::qwen3moe::glu(oai, g, u);
             }
         }
     });
@@ -94,7 +103,7 @@ fn moe_in_pool(jobs: &[ExpertJob], h: &[f32], e: usize, ff: usize, out: &mut [f3
         for (i, ov) in o.chunks_mut(n).enumerate() {
             let row = &j.w[2][(r0 + i) * rb..(r0 + i + 1) * rb];
             for (t, v) in ov.iter_mut().enumerate() {
-                *v = dot(j.ty[2], row, &acts[ji][t * ff..(t + 1) * ff]);
+                *v = dot(j.ty[2], row, &acts[ji][t * ff..(t + 1) * ff]) + bias(j.bias.map(|b| b[2]), r0 + i);
             }
         }
     });
@@ -255,9 +264,9 @@ mod tests {
         let uw = blocks(GgmlType::Q4_K, ff, 2);
         let dw = blocks(GgmlType::Q6_K, e * 2, 3);
         let h: Vec<f32> = (0..3 * e).map(|i| ((i * 13 % 29) as f32 - 14.0) / 14.0).collect();
-        let job = ExpertJob { w: [&gw, &uw, &dw], ty: [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K], rows: vec![(0, 0.5), (2, 0.25)] };
+        let job = ExpertJob { w: [&gw, &uw, &dw], ty: [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K], bias: None, rows: vec![(0, 0.5), (2, 0.25)] };
         let mut out = vec![1f32; 3 * e];
-        moe(&[job], &h, e, ff, &mut out);
+        moe(&[job], &h, e, ff, false, &mut out);
         // Reference: dequantize everything, plain f64 loops.
         let deq = |ty, w: &[u8], rows: usize, k: usize| {
             let mut m = vec![0f32; rows * k];
@@ -297,10 +306,10 @@ mod tests {
                 let jobs: Vec<ExpertJob> = (0..per)
                     .map(|j| {
                         let w = &ws[(it * per + j) % n_ex];
-                        ExpertJob { w: [&w[0], &w[1], &w[2]], ty: [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K], rows: (0..rows).map(|r| ((j + r) % 4, 0.1)).collect() }
+                        ExpertJob { w: [&w[0], &w[1], &w[2]], ty: [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K], bias: None, rows: (0..rows).map(|r| ((j + r) % 4, 0.1)).collect() }
                     })
                     .collect();
-                moe(&jobs, &h, e, ff, &mut out);
+                moe(&jobs, &h, e, ff, false, &mut out);
             }
             let us = t0.elapsed().as_micros() as f64 / iters as f64;
             let bytes: usize = ws[0].iter().map(|b| b.len()).sum::<usize>() * per;
