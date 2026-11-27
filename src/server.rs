@@ -315,7 +315,18 @@ fn sampling(body: &Value) -> Sampling {
         top_k: body["top_k"].as_u64().map_or(d.top_k, |k| k as usize),
         seed: body["seed"].as_u64().unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 | 1),
         schema: schema(body),
+        logit_bias: logit_bias(&body["logit_bias"]),
     }
+}
+
+/// OpenAI `{"<id>": bias}` or llama.cpp `[[id, bias]]`; bias `false` bans the token.
+fn logit_bias(v: &Value) -> Vec<(u32, f32)> {
+    let pairs: Vec<(Option<u64>, &Value)> = match v {
+        Value::Object(o) => o.iter().map(|(k, b)| (k.parse().ok(), b)).collect(),
+        Value::Array(a) => a.iter().map(|p| (p[0].as_u64(), &p[1])).collect(),
+        _ => vec![],
+    };
+    pairs.into_iter().filter_map(|(id, b)| Some((id? as u32, if *b == false { f32::NEG_INFINITY } else { b.as_f64()? as f32 }))).collect()
 }
 
 /// The JSON schema a request constrains its output to: OpenAI `response_format` (json_object,

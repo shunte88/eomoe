@@ -46,7 +46,7 @@ The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/ph
 
 `/chat/completions`, `/responses` and `/models` are also served without the `/v1` prefix, and `/v1/responses/input_tokens` counts tokens for Codex.
 
-Structured output: `response_format` with `json_object` or `json_schema` (also Responses `text.format`) constrains sampling to valid JSON. The supported schema subset is `type`, `properties`, `required`, `additionalProperties`, `items`, `enum` and `const`.
+Structured output: `response_format` with `json_object` or `json_schema` (also Responses `text.format`) constrains sampling to valid JSON. The supported schema subset is `type`, `properties`, `required`, `additionalProperties`, `items`, `enum` and `const`. `logit_bias` (`{"<id>": bias}` or `[[id, bias]]`, `false` bans) is honoured too.
 
 ```python
 from openai import OpenAI

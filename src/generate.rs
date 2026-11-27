@@ -14,12 +14,14 @@ pub struct Sampling {
     pub seed: u64,
     /// Constrain the output to JSON matching this schema (`{}`: any JSON); see `constrain`.
     pub schema: Option<serde_json::Value>,
+    /// Added to these tokens' logits before sampling (OpenAI `logit_bias`; -inf bans).
+    pub logit_bias: Vec<(u32, f32)>,
 }
 
 impl Default for Sampling {
     /// llama.cpp's defaults (common/common.h).
     fn default() -> Self {
-        Self { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05, seed: 0x5eed, schema: None }
+        Self { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05, seed: 0x5eed, schema: None, logit_bias: vec![] }
     }
 }
 
@@ -203,6 +205,11 @@ impl<E: Engine> Batcher<E> {
         job.pending = None;
         if job.n_out >= job.req.max_tokens {
             return self.finish(si, Finish::Length);
+        }
+        for &(t, b) in &job.req.sampling.logit_bias {
+            if let Some(l) = logits.get_mut(t as usize) {
+                *l += b;
+            }
         }
         if let Some(sch) = &job.req.sampling.schema {
             if !allow_json(logits, sch, &job.text, &self.token_bytes, &self.eog) {
@@ -629,8 +636,20 @@ mod tests {
     }
 
     #[test]
+    fn logit_bias_bans_and_forces_tokens() {
+        let mut b = Batcher::new(fake(1), vec![]);
+        assert_eq!(run_all(&mut b, vec![req(&[1], 3)])[0].0, [2, 3, 4]);
+        let (mut r, seen) = req(&[1], 3);
+        r.sampling.logit_bias = vec![(2, f32::NEG_INFINITY)];
+        assert_ne!(run_all(&mut b, vec![(r, seen)])[0].0[0], 2);
+        let (mut r, seen) = req(&[1], 3);
+        r.sampling.logit_bias = vec![(6, 100.0)];
+        assert_eq!(run_all(&mut b, vec![(r, seen)])[0].0, [6, 6, 6]);
+    }
+
+    #[test]
     fn sampling_respects_filters() {
-        let s = Sampling { temperature: 1.0, top_k: 2, top_p: 1.0, min_p: 0.0, seed: 1, schema: None };
+        let s = Sampling { temperature: 1.0, top_k: 2, top_p: 1.0, min_p: 0.0, seed: 1, schema: None, logit_bias: vec![] };
         let mut rng = 1;
         for _ in 0..200 {
             let t = sample(&mut [5.0, 0.0, 4.9, 4.8], &s, &mut rng);

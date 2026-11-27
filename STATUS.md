@@ -545,6 +545,22 @@ Implementation, in `src/server.rs`:
 - The test server helpers moved to `tests/common`.
 - Regression gates: lib 20/20, phase5, phase8.
 
+## Phase 11 extra: `logit_bias` (2026-11-27)
+
+`logit_bias` on every OpenAI and llama.cpp route, in either OpenAI form `{"<id>": bias}` or llama.cpp form `[[id, bias]]`. A bias of `false` bans the token. The bias is added to the logits before the JSON mask and sampling (`Batcher::emit`).
+
+Gate (`tests/phase11c_json.rs::logit_bias_bans_and_forces`, GPU):
+- The greedy first reply token is id 785 "The".
+- Banning it with -100 or `false` gives " The".
+- A +100 bias on it gives "TheTheThe".
+- Red-capable: with the bias line mutated out, the gate fails (`"The" == "The"`). Unit test: `logit_bias_bans_and_forces_tokens`.
+
+Gate revision: there is no oracle capture, because CPU-oracle runs locked the machine. The check is the behaviour llama-server documents.
+- Skipped: llama.cpp's string keys (token text). Add them when a client needs them.
+- Skipped: an Ollama equivalent, since Ollama's API has none.
+
+Regressions all pass: lib 26/26, phase 5, 7, 8, 11, 11c and 11d.
+
 ## Phase 11d done: Ollama adapter (2026-11-27)
 
 **Gate:** `tests/phase11d_ollama.rs` `ollama_api_matches_oracle` replays `tests/golden/ollama.json` against `eomoe serve`. The golden was captured by `tools/capture_ollama_golden.py` from Ollama 0.33.1 serving qwen3:0.6b, a 0.5 GB model chosen to stay well clear of the RAM load behind the lockups; it was unloaded afterwards. 22 cases:

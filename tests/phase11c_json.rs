@@ -5,6 +5,8 @@
 //! Gate revision: no oracle capture (CPU-oracle runs locked the machine, see STATUS); the
 //! check is that the output parses and validates, which is what llama-server guarantees.
 //!
+//! Also `logit_bias`: banning the greedy token changes the reply, a +100 bias forces a token.
+//!
 //! Needs the GPU and the model: cargo test --release --test phase11c_json -- --ignored
 
 mod common;
@@ -42,4 +44,35 @@ fn response_format_yields_valid_json() {
     assert_eq!(keys, ["age", "lang", "name"], "{text}");
     assert!(o["name"].is_string() && o["age"].is_i64(), "{text}");
     assert!(["rust", "python", "go"].contains(&o["lang"].as_str().unwrap()), "{text}");
+}
+
+fn complete(path: &str, prompt: &str, max: u32, bias: Value) -> String {
+    let mut body = json!({"max_tokens": max, "temperature": 0, "logit_bias": bias});
+    if path == "/v1/completions" {
+        body["prompt"] = prompt.into();
+    } else {
+        body["messages"] = json!([{"role": "user", "content": prompt}]);
+    }
+    let (st, b) = common::http(PORT, "POST", path, Some(&body));
+    assert_eq!(st, 200, "{b}");
+    let c = &serde_json::from_str::<Value>(&b).unwrap()["choices"][0];
+    c["text"].as_str().or(c["message"]["content"].as_str()).unwrap().to_owned()
+}
+
+#[test]
+#[ignore]
+fn logit_bias_bans_and_forces() {
+    let _s = common::start(PORT);
+    let (p, chat) = ("What is the capital of France?", "/v1/chat/completions");
+    // The greedy first reply token's id: the last id of Ollama's `context` (prompt + output).
+    let (_, b) = common::http(PORT, "POST", "/api/generate", Some(&json!({"model": "local-code", "prompt": p, "stream": false, "options": {"temperature": 0, "num_predict": 1}})));
+    let id = serde_json::from_str::<Value>(&b).unwrap()["context"].as_array().unwrap().last().unwrap().as_u64().unwrap();
+    let greedy = complete(chat, p, 1, Value::Null);
+    let banned = complete(chat, p, 1, json!({id.to_string(): -100}));
+    let banned_llama = complete(chat, p, 1, json!([[id, false]]));
+    let forced = complete("/v1/completions", "Hello", 3, json!({id.to_string(): 100}));
+    eprintln!("id {id}: greedy {greedy:?} banned {banned:?} {banned_llama:?} forced {forced:?}");
+    assert_ne!(banned, greedy);
+    assert_ne!(banned_llama, greedy);
+    assert_eq!(forced, greedy.repeat(3));
 }
