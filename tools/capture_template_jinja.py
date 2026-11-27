@@ -7,7 +7,7 @@ placeholder "<DATE:fmt>" the gate fills with today's date.
 
 Usage: python3 tools/capture_template_jinja.py <model.gguf>   (needs jinja2)
 """
-import json, struct, sys, copy
+import json, re, struct, sys, copy
 from pathlib import Path
 import jinja2, jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -42,7 +42,10 @@ env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extens
 env.filters["tojson"] = lambda x, ensure_ascii=False, indent=None, separators=None, sort_keys=False: json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 env.globals["raise_exception"] = raise_exception
 env.globals["strftime_now"] = lambda fmt: f"<DATE:{fmt}>"
-tpl = env.from_string(kv["tokenizer.chat_template"])
+# transformers' {% generation %} marks assistant text for training masks and renders its body;
+# llama.cpp parses it as a no-op tag. An always-true block trims whitespace the same way.
+src = re.sub(r"(\{%-?\s*)(end)?generation(\s*-?%\})", lambda m: m[1] + ("endif" if m[2] else "if true") + m[3], kv["tokenizer.chat_template"])
+tpl = env.from_string(src)
 
 root = Path(__file__).resolve().parent.parent / "tests" / "golden"
 reqs = [c["request"] for c in json.load(open(root / "template.json"))]

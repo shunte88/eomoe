@@ -1072,3 +1072,18 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
     - `set_n_expert_used` re-reads the GGUF.
 
     Refactor these when a fourth architecture lands (Phase 15).
+
+### Phase 15a/15b: Qwen3.6-35B-A3B tokenizer and chat template (2026-11-27), gated
+
+- Model: `ggml-org/Qwen3.6-35B-A3B-GGUF` Q4_K_M (20.5 GB). Arch `qwen35moe`: 40 layers, 30 Gated DeltaNet and every 4th one gated full attention (head size 256, 16 q / 2 kv heads, 64 of 256 dims roped as IMRoPE [11,11,10,0]). MoE has 256 experts with top-8 (ff 512), plus a sigmoid-gated shared expert. Vocab 248320.
+- **15a tokenizer:**
+  - `qwen35` pre-tokenizer: llama.cpp's regex, which is qwen2 with `\p{M}` kept inside words.
+  - The GGUF sets `normalizer.nfc`, but llama.cpp applies NFC only in its UGM tokenizer, never BPE, so eomoe does not either. Every golden text is already NFC.
+  - Gate `phase15_qwen36::tokenize_matches_hf`: 33 cases from HF `tokenizers` on `Qwen/Qwen3.6-35B-A3B` (`tools/capture_tokenize_hf.py`). The new cases cover Devanagari, Bengali, Tamil and Thai combining marks, and the Qwen3.6 tool-call/think tokens.
+  - Mutation: the qwen2 regex in place of qwen35 → red (the combining-marks case).
+- **15b template:**
+  - The template uses transformers' `{% generation %}…{% endgeneration %}`, which llama.cpp parses as a no-op. eomoe and the capture tool both rewrite it to `{% if true %}…{% endif %}` before compiling, so whitespace control is unchanged.
+  - The template also calls `str.startswith`/`endswith`, now in the unknown-method callback.
+  - Gate `template_matches_jinja`: 10 cases from jinja2 (`tools/capture_template_jinja.py`) → tests/golden/template_qwen35moe.json.
+  - Without the rewrite the template fails to parse (red). Deleting the tags instead of mapping them is an equivalent mutant on this template (all of them sit between `{%-` blocks), so it is not counted.
+  - Regression: phase1, phase13 and phase14 tokenizer and template gates, lib 33. Clippy is clean.

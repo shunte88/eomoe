@@ -10,6 +10,9 @@ const QWEN2_PRE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[d
 /// o200k (gpt-oss), the original regex from its tokenizer.json, as HF `tokenizers` runs it.
 const GPT4O_PRE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35 (Qwen3.5/3.6): qwen2 with combining marks kept in words.
+const QWEN35_PRE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// glm4 (GLM-4.x), the regex from its tokenizer.json, as HF `tokenizers` runs it.
 const GLM4_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
@@ -61,9 +64,10 @@ impl Tokenizer {
         // ignore_merges (llama-vocab.cpp): a pre-token that is itself in the vocab is one token.
         let (pre_re, ignore_merges) = match (model, pre) {
             ("gpt2", "qwen2") => (QWEN2_PRE, false),
+            ("gpt2", "qwen35") => (QWEN35_PRE, false),
             ("gpt2", "gpt-4o") => (GPT4O_PRE, false),
             ("gpt2", "glm4") => (GLM4_PRE, true),
-            _ => return Err(format!("unsupported tokenizer {model}/{pre} (gpt2 with qwen2, gpt-4o or glm4)")),
+            _ => return Err(format!("unsupported tokenizer {model}/{pre} (gpt2 with qwen2, qwen35, gpt-4o or glm4)")),
         };
         let strs = |k: &str| -> Result<Vec<String>, String> {
             g.arr(k)

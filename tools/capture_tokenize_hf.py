@@ -4,7 +4,7 @@
 splits added tokens).
 
 Usage: uv run --with tokenizers python tools/capture_tokenize_hf.py openai/gpt-oss-20b gpt-oss
-       (also zai-org/GLM-4.7-Flash glm)
+       (also zai-org/GLM-4.7-Flash glm, Qwen/Qwen3.6-35B-A3B qwen36)
 """
 import json, sys
 from pathlib import Path
@@ -23,6 +23,8 @@ texts += [
     "[gMASK]<sop><|system|>sys<|user|>hi<|assistant|><think>x</think><tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call><|observation|>",
     "Hello!  How's it going? 你好世界 12345678 don't", "根据 参考资料, 演员 王 而 者 据",  # glm4 ignore_merges words
     "    \n\t  nbsp em-space", "x" * 300 + " " + "9" * 31,
+    "नमस्ते दुनिया ক্ষমা தமிழ் ภาษาไทย",  # \p{M} combining marks (qwen35 pre-tokenizer)
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=f>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call><|im_end|>",
 ]
 out = []
 for t in dict.fromkeys(texts):

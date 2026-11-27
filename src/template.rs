@@ -17,6 +17,10 @@ impl ChatTemplate {
     }
 
     pub fn new(src: String) -> Result<Self, String> {
+        // transformers' {% generation %} (Qwen3.6) only marks assistant text for training masks;
+        // llama.cpp parses it as a no-op tag. An always-true block trims whitespace the same way.
+        let tag = |src: &str, from: &str, to: &str| fancy_regex::Regex::new(&format!(r"(\{{%-?\s*){from}(\s*-?%\}})")).unwrap().replace_all(src, format!("${{1}}{to}${{2}}")).into_owned();
+        let src = tag(&tag(&src, "endgeneration", "endif"), "generation", "if true");
         let mut env = Environment::new();
         env.set_syntax(
             minijinja::syntax::SyntaxConfig::builder()
@@ -36,7 +40,8 @@ impl ChatTemplate {
             Ok(Value::from_safe_string(to_json(&v)))
         });
         env.add_function("strftime_now", |f: String| strftime_now(&f));
-        // Python's dict.items() (gpt-oss) and str strip/lstrip/rstrip/split (GLM); other unknown
+        // Python's dict.items() (gpt-oss), str strip/lstrip/rstrip/split (GLM) and startswith/endswith
+        // (Qwen3.6); other unknown
         // methods stay errors.
         env.set_unknown_method_callback(|_state, v, method, args| match (method, v.kind(), args) {
             ("items", ValueKind::Map, []) => {
@@ -54,6 +59,10 @@ impl ChatTemplate {
             }
             ("split", ValueKind::String, [sep]) if sep.as_str().is_some_and(|x| !x.is_empty()) => {
                 Ok(Value::from(v.as_str().unwrap_or("").split(sep.as_str().unwrap()).map(Value::from).collect::<Vec<_>>()))
+            }
+            ("startswith" | "endswith", ValueKind::String, [p]) if p.as_str().is_some() => {
+                let (s, p) = (v.as_str().unwrap_or(""), p.as_str().unwrap());
+                Ok(Value::from(if method == "startswith" { s.starts_with(p) } else { s.ends_with(p) }))
             }
             ("split", ValueKind::String, []) => Ok(Value::from(v.as_str().unwrap_or("").split_whitespace().map(Value::from).collect::<Vec<_>>())),
             _ => Err(Error::new(ErrorKind::UnknownMethod, format!("{} has no method named {method}", v.kind()))),

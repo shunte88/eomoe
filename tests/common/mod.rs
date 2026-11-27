@@ -25,6 +25,10 @@ pub fn glm_path() -> String {
     std::env::var("EOMOE_TEST_GLM").unwrap_or_else(|_| format!("{}/.local/share/eomoe/models/GLM-4.7-Flash-Q4_K.gguf", std::env::var("HOME").unwrap()))
 }
 
+pub fn qwen36_path() -> String {
+    std::env::var("EOMOE_TEST_QWEN36").unwrap_or_else(|_| format!("{}/.local/share/eomoe/models/Qwen3.6-35B-A3B-Q4_K_M.gguf", std::env::var("HOME").unwrap()))
+}
+
 pub fn golden(name: &str) -> serde_json::Value {
     let p = format!("{}/tests/golden/{name}", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
