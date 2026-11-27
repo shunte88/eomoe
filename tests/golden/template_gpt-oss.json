@@ -1,0 +1,304 @@
+[
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Hi<|end|><|start|>assistant"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful coding assistant."
+    },
+    {
+     "role": "user",
+     "content": "Write hello world in Rust."
+    },
+    {
+     "role": "assistant",
+     "content": "fn main() { println!(\"Hello, world!\"); }"
+    },
+    {
+     "role": "user",
+     "content": "Now in C."
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful coding assistant.\n\n<|end|><|start|>user<|message|>Write hello world in Rust.<|end|><|start|>assistant<|channel|>final<|message|>fn main() { println!(\"Hello, world!\"); }<|end|><|start|>user<|message|>Now in C.<|end|><|start|>assistant"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Show me src/main.rs"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "File path"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Read a file from disk\ntype read_file = (_: {\n// File path\npath: string,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Show me src/main.rs<|end|><|start|>assistant"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Show me src/main.rs"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"src/main.rs\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "fn main() {}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "File path"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Read a file from disk\ntype read_file = (_: {\n// File path\npath: string,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Show me src/main.rs<|end|><|start|>assistant to=functions.read_file<|channel|>commentary json<|message|>{\"path\": \"src/main.rs\"}<|call|><|start|>functions.read_file to=assistant<|channel|>commentary<|message|>\"fn main() {}\"<|end|><|start|>assistant"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be terse."
+    },
+    {
+     "role": "user",
+     "content": "Find TODOs"
+    },
+    {
+     "role": "assistant",
+     "content": "  Searching now.  ",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "search",
+        "arguments": "{\"query\": \"TODO\", \"limit\": 10, \"case\": true, \"ratio\": 0.5, \"paths\": [\"src/*.rs\", \"it's\"], \"opts\": {\"depth\": 2, \"x\": null}}"
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": "{\"path\": \"a.rs\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "src/a.rs:1: TODO"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": "// TODO"
+    },
+    {
+     "role": "assistant",
+     "content": "One TODO in a.rs."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "  Search code for a <pattern> & report matches.\n",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "Regex, e.g. a<b"
+        },
+        "mode": {
+         "type": "string",
+         "enum": [
+          "fast",
+          "full",
+          "it's"
+         ],
+         "default": "fast"
+        },
+        "limit": {
+         "type": "integer",
+         "enum": [
+          10,
+          50
+         ],
+         "minimum": 1,
+         "default": 10
+        },
+        "ratio": {
+         "type": "number",
+         "default": 2.5
+        },
+        "case": {
+         "type": "boolean",
+         "default": false
+        },
+        "paths": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "Globs"
+        },
+        "opts": {
+         "type": [
+          "object",
+          "null"
+         ],
+         "properties": {
+          "depth": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "depth"
+         ]
+        }
+       },
+       "required": [
+        "query",
+        "mode"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a file from disk",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "File path"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "error": "TypeError: can only concatenate str (not \"int\") to str"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "thinking": "Easy: 4.",
+     "content": "4"
+    },
+    {
+     "role": "user",
+     "content": "And 3+3?"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>2+2?<|end|><|start|>assistant<|channel|>final<|message|>4<|end|><|start|>user<|message|>And 3+3?<|end|><|start|>assistant"
+ },
+ {
+  "request": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "prompt": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: <DATE:%Y-%m-%d>\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer in French.\n\n<|end|><|start|>user<|message|>Hi<|end|>"
+ }
+]

@@ -378,6 +378,7 @@ dependencies = [
  "fancy-regex",
  "futures-util",
  "half",
+ "libc",
  "log",
  "memmap2",
  "minijinja",

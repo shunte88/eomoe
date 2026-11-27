@@ -30,6 +30,16 @@ impl ChatTemplate {
         });
         env.add_filter("string", |v: Value| py_str(&v));
         env.add_filter("tojson", |v: Value| Value::from_safe_string(to_json(&v)));
+        env.add_function("strftime_now", |f: String| strftime_now(&f));
+        // Python's dict.items() (gpt-oss's template); other unknown methods stay errors.
+        env.set_unknown_method_callback(|_state, v, method, args| match (method, v.kind(), args) {
+            ("items", ValueKind::Map, []) => {
+                let pairs: Result<Vec<Value>, Error> = v.try_iter()?.map(|k| Ok(Value::from(vec![k.clone(), v.get_item(&k)?]))).collect();
+                Ok(Value::from(pairs?))
+            }
+            _ => Err(Error::new(ErrorKind::UnknownMethod, format!("{} has no method named {method}", v.kind()))),
+        });
+        env.add_function("raise_exception", |m: String| -> Result<String, Error> { Err(Error::new(ErrorKind::InvalidOperation, m)) });
         env.add_template_owned("chat", src).map_err(|e| e.to_string())?;
         Ok(Self { env })
     }
@@ -62,6 +72,20 @@ impl ChatTemplate {
         let tpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
         tpl.render(Value::from(minijinja::value::Serde(&ctx))).map_err(|e| format!("{e:#}"))
     }
+}
+
+/// llama.cpp's `strftime_now`: the local time through C strftime (gpt-oss's "Current date").
+pub fn strftime_now(fmt: &str) -> String {
+    let Ok(f) = std::ffi::CString::new(fmt) else { return String::new() };
+    let mut buf = [0u8; 256];
+    // SAFETY: tm is filled by localtime_r before use; strftime writes at most buf.len() bytes.
+    let n = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        libc::strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm)
+    };
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 /// llama.cpp `as_string()`: Python str() semantics.
@@ -187,6 +211,12 @@ mod tests {
     use super::*;
 
     // Expected strings are what Python str()/json.dumps produce (llama.cpp follows them).
+    #[test]
+    fn strftime_now_is_local_date() {
+        let out = std::process::Command::new("date").arg("+%Y-%m-%d %a").output().unwrap();
+        assert_eq!(strftime_now("%Y-%m-%d %a"), String::from_utf8(out.stdout).unwrap().trim());
+    }
+
     #[test]
     fn python_style_conversions() {
         let v = Value::from(minijinja::value::Serde(serde_json::json!({"a": [1, true, null, "x", "it's", 2.5], "b": {"<": "é"}})));

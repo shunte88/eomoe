@@ -803,3 +803,17 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - A mutation run with the qwen2 regex gave 7 mismatches.
   - Phase 1 is unchanged.
 - **Note (flagged):** llama.cpp runs a hand-rewritten form of this regex, `[^a-z]` lookaheads for its own regex engine. eomoe follows the model's own definition, so a later llama-server greedy capture could differ on exotic Unicode. If that happens, the prompt tokens in the capture will show it.
+
+## Phase 13b: Harmony chat template, gpt-oss-20b (2026-11-27)
+
+- **What changed:** the template environment gained three things:
+  - `strftime_now(fmt)`, matching llama.cpp: local time through C strftime. libc is now a direct dependency; it was already in the tree.
+  - `raise_exception(msg)`, which makes the render fail with that message.
+  - Python's `dict.items()`, through minijinja's unknown-method callback. The gpt-oss template calls no other Python method.
+- **Gate:** `tests/phase13_gptoss.rs::template_matches_jinja`. 7 cases: the phase1 requests, an assistant turn with `thinking`, and a developer message with no generation prompt.
+  - The oracle is Python jinja2 configured like HF transformers' apply_chat_template (`tools/capture_template_jinja.py`, template read from the GGUF). Tool-call arguments are handed over parsed, as llama.cpp does.
+  - `<DATE:fmt>` in the golden is filled with `strftime_now(fmt)`. A lib test checks that against `date`.
+  - Red first: `strftime_now` did not exist. Then `map has no method named items`.
+  - Green: `test result: ok. 2 passed` (tokenizer + template).
+  - Phase 1 and phase 11 are unchanged.
+- **Note (flagged):** phase1 case 5 has an integer `default` on an enum parameter, and the gpt-oss template itself fails on it (`str + int`), in jinja2 as in HF transformers. The golden records the error, and eomoe must fail too. Serving will report such a request as a template error.

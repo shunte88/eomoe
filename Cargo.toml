@@ -21,6 +21,7 @@ fancy-regex = "0.20.2"
 minijinja = { version = "3.1.0", features = ["preserve_order", "loop_controls", "json", "serde"] }
 futures-util = { version = "0.3", default-features = false }
 half = "2.7.1"
+libc = "0.2"
 rayon = "1.12.0"
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cuda-13020", "fallback-dynamic-loading"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
