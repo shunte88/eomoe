@@ -58,24 +58,7 @@ fn cpu_reference_answers() {
 fn gpu_decode_matches_oracle() {
     // 1000 MiB holds ~3 of 32 experts per layer: decode misses, so cache fills and CPU experts run.
     let m = GpuModel::with_cache(Gguf::open(gptoss_path()).unwrap(), 4096, 1000).unwrap();
-    common::greedy_floor_gate(&mut Decode(m), "greedy_gpt-oss.json", common::GPTOSS_TIE, common::GPTOSS_FLOOR_MEAN);
-}
-
-/// Runs `forward` one token at a time, so the floor gate checks the decode path.
-struct Decode<E>(E);
-impl<E: Engine> Engine for Decode<E> {
-    fn n_vocab(&self) -> usize {
-        self.0.n_vocab()
-    }
-    fn n_ctx(&self) -> usize {
-        self.0.n_ctx()
-    }
-    fn truncate(&mut self, n_past: usize) {
-        self.0.truncate(n_past)
-    }
-    fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
-        tokens.iter().flat_map(|&t| self.0.forward_last(&[t])).collect()
-    }
+    common::greedy_floor_gate(&mut common::Decode(m), "greedy_gpt-oss.json", common::GPTOSS_TIE, common::GPTOSS_FLOOR_MEAN);
 }
 
 #[test]

@@ -176,3 +176,20 @@ pub fn events(body: &str) -> Vec<(Option<String>, Value)> {
     out
 }
 
+
+/// Runs `forward` one token at a time, so the floor gate checks the decode path.
+pub struct Decode<E>(pub E);
+impl<E: Engine> Engine for Decode<E> {
+    fn n_vocab(&self) -> usize {
+        self.0.n_vocab()
+    }
+    fn n_ctx(&self) -> usize {
+        self.0.n_ctx()
+    }
+    fn truncate(&mut self, n_past: usize) {
+        self.0.truncate(n_past)
+    }
+    fn forward(&mut self, tokens: &[u32]) -> Vec<f32> {
+        tokens.iter().flat_map(|&t| self.0.forward_last(&[t])).collect()
+    }
+}

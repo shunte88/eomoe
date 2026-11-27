@@ -3,12 +3,15 @@
 //!     model's own tokenizer.json (tests/golden/tokenize_glm.json, tools/capture_tokenize_hf.py).
 //! (b) Chat template: the GGUF's template renders as Python jinja2 configured like HF transformers
 //!     (tests/golden/template_deepseek2.json, tools/capture_template_jinja.py).
+//! (c) CPU reference forward vs llama.cpp's greedy oracle (tests/golden/greedy_glm.json), within
+//!     llama.cpp's own -fa off floor; plus greedy chat answers through tokenizer + template.
+//! (d) CUDA engine: the same floor gate, prefill and token by token through a small expert cache.
 //! `cargo test --release --test phase14_glm -- --include-ignored --nocapture --test-threads=1`
 
 mod common;
 use common::{glm_path, golden};
 use eomoe::qwen3moe::Engine;
-use eomoe::{glm, gguf::Gguf, template::ChatTemplate, tokenizer::Tokenizer};
+use eomoe::{glm, gguf::Gguf, gpu::GpuModel, template::ChatTemplate, tokenizer::Tokenizer};
 use serde_json::json;
 
 #[test]
@@ -89,4 +92,21 @@ fn cpu_reference_answers() {
 fn cpu_reference_matches_oracle() {
     let mut m = glm::CpuModel::new(Gguf::open(glm_path()).unwrap()).unwrap();
     common::greedy_floor_gate(&mut m, "greedy_glm.json", common::GLM_TIE, common::GLM_FLOOR_MEAN);
+}
+
+/// (d) CUDA engine, prefill (staged expert waves).
+#[test]
+#[ignore = "needs the GLM-4.7-Flash model file and a CUDA GPU"]
+fn gpu_matches_oracle() {
+    let mut m = GpuModel::new(Gguf::open(glm_path()).unwrap(), 4096).unwrap();
+    common::greedy_floor_gate(&mut m, "greedy_glm.json", common::GLM_TIE, common::GLM_FLOOR_MEAN);
+}
+
+/// (d) CUDA engine token by token through a small expert cache (cache fills, prefetch, hybrid
+/// CPU experts).
+#[test]
+#[ignore = "needs the GLM-4.7-Flash model file and a CUDA GPU"]
+fn gpu_decode_matches_oracle() {
+    let m = GpuModel::with_cache(Gguf::open(glm_path()).unwrap(), 4096, 1000).unwrap();
+    common::greedy_floor_gate(&mut common::Decode(m), "greedy_glm.json", common::GLM_TIE, common::GLM_FLOOR_MEAN);
 }

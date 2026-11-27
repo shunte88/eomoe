@@ -1,6 +1,8 @@
 //! qwen3moe weight map and routing, shared by the CPU reference and the CUDA engine
 //! (mirrors llama.cpp src/models/qwen3moe.cpp). The CUDA engine also loads gpt-oss through it
-//! (`Hparams::oai`): biases, sinks, sliding window, YaRN rope, see src/gptoss.rs.
+//! (`Hparams::oai`): biases, sinks, sliding window, YaRN rope, see src/gptoss.rs; and
+//! GLM-4.7-Flash (`Hparams::glm`): MLA attention, a dense first layer, sigmoid routing with
+//! exp_probs_b and a shared expert, see src/glm.rs.
 
 use crate::gguf::{Gguf, TensorInfo};
 
@@ -70,13 +72,42 @@ pub struct Hparams {
     pub swa: usize,
     /// YaRN per-pair rope frequencies and cos/sin scale (None: base^(-2i/hd), scale 1).
     pub rope_yarn: Option<(Vec<f32>, f32)>,
+    /// GLM-4.7-Flash (deepseek2). head_dim is then the absorbed MLA cache row (lat + rope) and
+    /// n_head_kv 1: every head attends over one shared latent row per position.
+    pub glm: Option<Glm>,
+}
+
+/// MLA widths and the routed experts' weight scale of GLM-4.7-Flash.
+pub struct Glm {
+    /// kv_lora_rank (the latent, also V), qk_nope and qk_rope head dims, v head dim.
+    pub lat: usize,
+    pub nope: usize,
+    pub rope: usize,
+    pub vd: usize,
+    pub w_scale: f32,
+}
+
+/// Grouped-query attention (qwen3moe, gpt-oss) or absorbed MLA (GLM, src/glm.rs).
+#[allow(clippy::large_enum_variant)] // one per layer
+pub enum Attn {
+    Gqa { wq: TensorInfo, wk: TensorInfo, wv: TensorInfo },
+    Mla { q_a: TensorInfo, q_a_norm: TensorInfo, q_b: TensorInfo, kv_a: TensorInfo, kv_a_norm: TensorInfo, k_b: TensorInfo, v_b: TensorInfo },
+}
+
+/// A layer's routed experts (3-D gate/up/down tensors).
+pub struct Moe {
+    pub router: TensorInfo,
+    pub gate: TensorInfo,
+    pub up: TensorInfo,
+    pub down: TensorInfo,
+    /// GLM: selection bias (exp_probs_b) and the shared expert's gate, up, down.
+    pub sel_bias: Option<TensorInfo>,
+    pub shared: Option<[TensorInfo; 3]>,
 }
 
 pub struct Layer {
     pub attn_norm: TensorInfo,
-    pub wq: TensorInfo,
-    pub wk: TensorInfo,
-    pub wv: TensorInfo,
+    pub attn: Attn,
     pub wo: TensorInfo,
     /// qwen3moe only.
     pub q_norm: Option<TensorInfo>,
@@ -86,10 +117,9 @@ pub struct Layer {
     /// gpt-oss only: biases of q, k, v, o, router, gate/up/down experts; attention sinks.
     pub bias: Option<[TensorInfo; 8]>,
     pub sinks: Option<TensorInfo>,
-    pub router: TensorInfo,
-    pub gate: TensorInfo,
-    pub up: TensorInfo,
-    pub down: TensorInfo,
+    /// None: a dense SwiGLU layer (GLM's first), `dense` holds its gate, up, down.
+    pub moe: Option<Moe>,
+    pub dense: Option<[TensorInfo; 3]>,
 }
 
 pub struct Weights {
@@ -104,11 +134,29 @@ pub struct Weights {
 impl Weights {
     pub fn load(g: Gguf) -> Result<Self, String> {
         let arch = g.str("general.architecture").unwrap_or("").to_string();
-        if arch != "qwen3moe" && arch != "gpt-oss" {
+        if !["qwen3moe", "gpt-oss", "deepseek2"].contains(&arch.as_str()) {
             return Err(format!("unsupported architecture {arch:?}"));
         }
         let oai = arch == "gpt-oss";
         let u = |k: &str| g.u64(&format!("{arch}.{k}")).map(|v| v as usize).ok_or(format!("missing {arch}.{k}"));
+        let glm = if arch == "deepseek2" {
+            // ponytail: GLM-4.7-Flash only (sigmoid gating, the llama.cpp default for this shape
+            // when the GGUF has no expert_gating_func; one expert group; no YaRN).
+            if g.u64("deepseek2.expert_gating_func").is_some_and(|v| v != 2) || u("expert_group_count").unwrap_or(1) != 1 || g.f64("deepseek2.rope.scaling.factor").is_some() {
+                return Err("deepseek2: only the GLM-4.7-Flash variant is supported".into());
+            }
+            let rope = u("rope.dimension_count")?;
+            Some(Glm {
+                lat: u("attention.kv_lora_rank")?,
+                nope: u("attention.key_length_mla")? - rope,
+                rope,
+                vd: u("attention.value_length_mla")?,
+                w_scale: g.f64("deepseek2.expert_weights_scale").unwrap_or(1.0) as f32,
+            })
+        } else {
+            None
+        };
+        let n_dense = if glm.is_some() { u("leading_dense_block_count").unwrap_or(0) } else { 0 };
         let n_embd = u("embedding_length")?;
         let n_head = u("attention.head_count")?;
         let t = |n: String| g.tensor(&n).cloned().ok_or(format!("missing tensor {n}"));
@@ -117,8 +165,8 @@ impl Weights {
             n_layer: u("block_count")?,
             n_embd,
             n_head,
-            n_head_kv: u("attention.head_count_kv")?,
-            head_dim: u("attention.key_length").unwrap_or(n_embd / n_head),
+            n_head_kv: if glm.is_some() { 1 } else { u("attention.head_count_kv")? },
+            head_dim: glm.as_ref().map_or_else(|| u("attention.key_length").unwrap_or(n_embd / n_head), |m| m.lat + m.rope),
             n_expert: u("expert_count")?,
             n_expert_used: u("expert_used_count")?,
             n_ff_exp: u("expert_feed_forward_length")?,
@@ -128,17 +176,21 @@ impl Weights {
             oai,
             swa: if oai { u("attention.sliding_window")? } else { 0 },
             rope_yarn: if oai { Some(crate::gptoss::yarn(&g)?) } else { None },
+            glm,
         };
         let layers = (0..hp.n_layer)
             .map(|i| {
                 let b = |s: &str| t(format!("blk.{i}.{s}.weight"));
                 let bias = |s: &str| t(format!("blk.{i}.{s}.bias"));
-                let qwen = |s: &str| if oai { Ok(None) } else { b(s).map(Some) };
+                let qwen = |s: &str| if oai || hp.glm.is_some() { Ok(None) } else { b(s).map(Some) };
+                let is_glm = hp.glm.is_some();
                 Ok(Layer {
                     attn_norm: b("attn_norm")?,
-                    wq: b("attn_q")?,
-                    wk: b("attn_k")?,
-                    wv: b("attn_v")?,
+                    attn: if is_glm {
+                        Attn::Mla { q_a: b("attn_q_a")?, q_a_norm: b("attn_q_a_norm")?, q_b: b("attn_q_b")?, kv_a: b("attn_kv_a_mqa")?, kv_a_norm: b("attn_kv_a_norm")?, k_b: b("attn_k_b")?, v_b: b("attn_v_b")? }
+                    } else {
+                        Attn::Gqa { wq: b("attn_q")?, wk: b("attn_k")?, wv: b("attn_v")? }
+                    },
                     wo: b("attn_output")?,
                     q_norm: qwen("attn_q_norm")?,
                     k_norm: qwen("attn_k_norm")?,
@@ -150,10 +202,19 @@ impl Weights {
                         None
                     },
                     sinks: if oai { Some(b("attn_sinks")?) } else { None },
-                    router: b("ffn_gate_inp")?,
-                    gate: b("ffn_gate_exps")?,
-                    up: b("ffn_up_exps")?,
-                    down: b("ffn_down_exps")?,
+                    moe: if i < n_dense {
+                        None
+                    } else {
+                        Some(Moe {
+                            router: b("ffn_gate_inp")?,
+                            gate: b("ffn_gate_exps")?,
+                            up: b("ffn_up_exps")?,
+                            down: b("ffn_down_exps")?,
+                            sel_bias: if is_glm { Some(bias("exp_probs_b")?) } else { None },
+                            shared: if is_glm { Some([b("ffn_gate_shexp")?, b("ffn_up_shexp")?, b("ffn_down_shexp")?]) } else { None },
+                        })
+                    },
+                    dense: if i < n_dense { Some([b("ffn_gate")?, b("ffn_up")?, b("ffn_down")?]) } else { None },
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -174,12 +235,14 @@ impl Weights {
     }
 
     /// Raw bytes of expert `ex` in layer `l`: gate, up, down, then (gpt-oss) their f32 biases.
+    /// Empty for a dense layer.
     pub fn expert(&self, l: &Layer, ex: usize) -> Vec<&[u8]> {
         let (e, ff) = (self.hp.n_embd, self.hp.n_ff_exp);
+        let Some(m) = &l.moe else { return vec![] };
         let mut v = vec![
-            self.rows(&l.gate, ex * ff, (ex + 1) * ff),
-            self.rows(&l.up, ex * ff, (ex + 1) * ff),
-            self.rows(&l.down, ex * e, (ex + 1) * e),
+            self.rows(&m.gate, ex * ff, (ex + 1) * ff),
+            self.rows(&m.up, ex * ff, (ex + 1) * ff),
+            self.rows(&m.down, ex * e, (ex + 1) * e),
         ];
         if let Some(b) = &l.bias {
             v.extend(b[5..].iter().map(|t| self.rows(t, ex, ex + 1)));
@@ -187,10 +250,14 @@ impl Weights {
         v
     }
 
-    /// Router logits -> per token (expert, weight) pairs, as this architecture routes.
-    pub fn route(&self, logits: &[f32]) -> Vec<Vec<(usize, f32)>> {
+    /// Layer `li`'s router logits -> per token (expert, weight) pairs, as this architecture routes.
+    pub fn route(&self, li: usize, logits: &[f32]) -> Vec<Vec<(usize, f32)>> {
         let (n, k) = (self.hp.n_expert, self.hp.n_expert_used);
-        if self.hp.oai { route_oai(logits, n, k) } else { route(logits, n, k) }
+        match (&self.hp.glm, self.layers[li].moe.as_ref().and_then(|m| m.sel_bias.as_ref())) {
+            (Some(glm), Some(b)) => route_sigmoid(logits, self.g.f32s(b), k, glm.w_scale),
+            _ if self.hp.oai => route_oai(logits, n, k),
+            _ => route(logits, n, k),
+        }
     }
 }
 
@@ -208,6 +275,22 @@ pub fn route(logits: &[f32], n_expert: usize, k: usize) -> Vec<Vec<(usize, f32)>
             let top = &idx[..k];
             let wsum: f32 = top.iter().map(|&i| p[i] / s).sum::<f32>().max(6.103_515_6e-5);
             top.iter().map(|&i| (i, p[i] / s / wsum)).collect()
+        })
+        .collect()
+}
+
+/// GLM routing (llama.cpp build_moe_ffn: SIGMOID, exp_probs_b, norm_w, scale): top-k by
+/// sigmoid + selection bias; weights the plain sigmoids, renormalised over the k, times `scale`.
+pub fn route_sigmoid(logits: &[f32], bias: &[f32], k: usize, scale: f32) -> Vec<Vec<(usize, f32)>> {
+    logits
+        .chunks_exact(bias.len())
+        .map(|lr| {
+            let p: Vec<f32> = lr.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
+            let mut idx: Vec<usize> = (0..p.len()).collect();
+            idx.sort_by(|&a, &b| (p[b] + bias[b]).total_cmp(&(p[a] + bias[a])));
+            let top = &idx[..k];
+            let sum = top.iter().map(|&i| p[i]).sum::<f32>().max(6.103_515_6e-5);
+            top.iter().map(|&i| (i, p[i] / sum * scale)).collect()
         })
         .collect()
 }

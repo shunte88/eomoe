@@ -4,7 +4,7 @@
 
 use crate::gguf::{Gguf, TensorInfo};
 use crate::quant::{dequant_row, dot, matmul};
-use crate::qwen3moe::{route, Engine, Weights};
+use crate::qwen3moe::{route, Attn, Engine, Weights};
 use rayon::prelude::*;
 
 pub struct CpuModel {
@@ -27,6 +27,9 @@ impl CpuModel {
         let w = Weights::load(g)?;
         if w.hp.oai {
             return Err("gpt-oss: use gptoss::CpuModel".into());
+        }
+        if w.hp.glm.is_some() {
+            return Err("GLM: use glm::CpuModel".into());
         }
         Ok(Self { kv: (0..w.hp.n_layer).map(|_| (vec![], vec![])).collect(), w, n_past: 0 })
     }
@@ -87,9 +90,8 @@ impl Engine for CpuModel {
             let mut h = x.clone();
             let w = g.f32s(&l.attn_norm);
             h.chunks_exact_mut(e).for_each(|r| rmsnorm(r, w, hp.eps));
-            let mut q = self.mm(&l.wq, &h);
-            let mut k = self.mm(&l.wk, &h);
-            let v = self.mm(&l.wv, &h);
+            let Attn::Gqa { wq, wk, wv } = &l.attn else { unreachable!("qwen3moe only") };
+            let (mut q, mut k, v) = (self.mm(wq, &h), self.mm(wk, &h), self.mm(wv, &h));
             let (qn, kn) = (g.f32s(l.q_norm.as_ref().unwrap()), g.f32s(l.k_norm.as_ref().unwrap()));
             for (ti, (qr, kr)) in q.chunks_exact_mut(nh * hd).zip(k.chunks_exact_mut(nkv * hd)).enumerate() {
                 let pos = self.n_past + ti;
@@ -140,7 +142,8 @@ impl Engine for CpuModel {
             let mut h = x.clone();
             let w = g.f32s(&l.ffn_norm);
             h.chunks_exact_mut(e).for_each(|r| rmsnorm(r, w, hp.eps));
-            let logits = self.mm(&l.router, &h); // T x n_expert
+            let m = l.moe.as_ref().expect("qwen3moe: every layer is MoE");
+            let logits = self.mm(&m.router, &h); // T x n_expert
             let mut assign: Vec<Vec<(usize, f32)>> = vec![vec![]; hp.n_expert]; // expert -> (token, weight)
             for (ti, sel) in route(&logits, hp.n_expert, hp.n_expert_used).into_iter().enumerate() {
                 for (ex, wgt) in sel {
@@ -158,13 +161,13 @@ impl Engine for CpuModel {
                 let [gb, ub, db] = self.w.expert(l, ex)[..] else { unreachable!() };
                 let mut g_ = vec![0f32; n * ff];
                 let mut u_ = vec![0f32; n * ff];
-                matmul(l.gate.ty, gb, e, &xin, &mut g_);
-                matmul(l.up.ty, ub, e, &xin, &mut u_);
+                matmul(m.gate.ty, gb, e, &xin, &mut g_);
+                matmul(m.up.ty, ub, e, &xin, &mut u_);
                 for (gv, uv) in g_.iter_mut().zip(&u_) {
                     *gv = *gv / (1.0 + (-*gv).exp()) * uv; // silu(gate) * up
                 }
                 let mut d_ = vec![0f32; n * e];
-                matmul(l.down.ty, db, ff, &g_, &mut d_);
+                matmul(m.down.ty, db, ff, &g_, &mut d_);
                 for (j, &(ti, wgt)) in toks.iter().enumerate() {
                     for (a, b) in moe[ti * e..(ti + 1) * e].iter_mut().zip(&d_[j * e..(j + 1) * e]) {
                         *a += wgt * b;

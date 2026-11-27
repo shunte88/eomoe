@@ -968,3 +968,42 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   | No kv_a_norm | 95 | 7.66 |
   | kq_scale 1/sqrt(576) | 10 | 0.86 |
   | NEOX rope | 53 | 2.81 |
+
+### Phase 14d: GLM-4.7-Flash on the CUDA engine (2026-11-27), gated
+
+- **Shared weight map (src/qwen3moe.rs):** `Weights` now loads deepseek2 too.
+  - `Layer.attn` is `Attn::Gqa` or `Attn::Mla`.
+  - Routed experts live in `Option<Moe>` (None for the dense layer 0), which also carries GLM's `sel_bias` (exp_probs_b) and shared expert.
+  - `Weights::route(li, ..)` dispatches to softmax, oai or the new shared `route_sigmoid`. src/glm.rs uses it as well.
+- **Kernels (kernels/eomoe.cu):**
+  - `attention_mla`: one warp per head. All heads read one staged tile of 576-wide f16 latent rows, and V is the first 512 of each row. Decode splits the positions across blocks (split-K).
+  - `attn_merge` is generalised to any head width (block = hd).
+  - Also new: `mm_heads_{q4_k,q6_k,q8_0}` (per-head k_b / v_b), `rope_norm` (NORM pairs, strided, in place or copying) and `rmsnorm_strided`.
+- **src/gpu.rs:**
+  - `DAttn::Mla` with `mla_attention`. The latent cache is one array per layer (`kv_arrays`), and `kv_save`/`kv_restore` follow it.
+  - The dense FFN and the shared expert run as one concatenated [gate | up] matrix plus down, straight into the residual.
+  - Dense layers skip routing and the MoE pass, and are excluded from expert groups and the pin.
+  - Decode prediction runs only when the next layer has a router.
+- **Gates (5 cases, 102 steps, GLM_TIE 0.1 / GLM_FLOOR_MEAN 0.1795 from 14c):**
+  - `phase14_glm::gpu_matches_oracle` (prefill): PASS. 0/102 top-1 failures, mean |dlogprob| 0.1178, max 1.40, 22.6 s.
+  - `gpu_decode_matches_oracle` (token by token, 1000 MiB cache): PASS. 0/102, mean 0.1189, max 1.94. Split-K and merge run on case 4.
+- **Mutations, all red:**
+
+  | Mutation | Gate | Top-1 failures | Mean \|dlogprob\| |
+  |---|---|---|---|
+  | kq_scale 1/sqrt(576) | prefill | 10 | 0.86 |
+  | No shared expert | prefill | 96 | 7.55 |
+  | rope_norm position per head wrong (r % rows_per_tok) | prefill | 87 | 5.87 |
+  | No kv_a_norm | prefill | 95 | 7.66 |
+  | attn_merge drops the last split | decode | 13 | 1.36 |
+
+  An `attn_merge` max taken over only the first split stayed green. That is correct: the merged result does not depend on M. It is not counted as a check.
+- **Regression (everything except 11b, which was not run by the user's rule):** all pass, and clippy is clean.
+  - lib 33, phase1 4, phase2 2, phase3 4, phase4 2, phase5 2, phase6 5, phase7 2, phase8 1, phase11 2, 11c 2, 11d 1, phase12 3, phase13 6, phase14 6.
+- **Speed (test harness, not a tuned measurement):**
+  - Prefill: 165 tok/s on the 343-token case.
+  - Decode: about 14.5 tok/s with a 1000 MiB expert cache.
+- **ponytail notes:**
+  - `attention_mla` uses CUDA cores and walks the positions one at a time per warp. A 19K prefill wants a tensor-core tile.
+  - `mm_heads` handles one token per warp, with no token tiling.
+  - The expert pin (~17 GB) has no MemAvailable guard beyond the existing pageable fallback when pinning fails.

@@ -12,7 +12,7 @@
 use crate::cpu::rmsnorm;
 use crate::gguf::{Gguf, TensorInfo};
 use crate::quant::{dequant_row, dot, matmul};
-use crate::qwen3moe::{glu, Engine};
+use crate::qwen3moe::{glu, route_sigmoid, Engine};
 use rayon::prelude::*;
 
 struct Moe {
@@ -162,21 +162,6 @@ impl CpuModel {
         let act: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| glu(false, g, u)).collect();
         self.mm(down, out, &act)
     }
-
-    /// Sigmoid routing (llama.cpp build_moe_ffn, SIGMOID + exp_probs_b + norm_w + scale).
-    fn route(&self, logits: &[f32], bias: &[f32]) -> Vec<Vec<(usize, f32)>> {
-        logits
-            .chunks_exact(self.n_expert)
-            .map(|lr| {
-                let p: Vec<f32> = lr.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
-                let mut idx: Vec<usize> = (0..self.n_expert).collect();
-                idx.sort_by(|&a, &b| (p[b] + bias[b]).total_cmp(&(p[a] + bias[a])));
-                let top = &idx[..self.n_expert_used];
-                let sum = top.iter().map(|&i| p[i]).sum::<f32>().max(6.103_515_6e-5);
-                top.iter().map(|&i| (i, p[i] / sum * self.w_scale)).collect()
-            })
-            .collect()
-    }
 }
 
 impl Engine for CpuModel {
@@ -278,7 +263,7 @@ impl Engine for CpuModel {
                 let mut out = self.swiglu([&m.shared[0], &m.shared[1], &m.shared[2]], 0..ff, 0..e, &h);
                 let logits = self.mm_all(&m.router, &h);
                 let mut assign: Vec<Vec<(usize, f32)>> = vec![vec![]; self.n_expert];
-                for (ti, sel) in self.route(&logits, g.f32s(&m.bias)).into_iter().enumerate() {
+                for (ti, sel) in route_sigmoid(&logits, g.f32s(&m.bias), self.n_expert_used, self.w_scale).into_iter().enumerate() {
                     sel.into_iter().for_each(|(i, w)| assign[i].push((ti, w)));
                 }
                 for (ex, toks) in assign.iter().enumerate().filter(|(_, t)| !t.is_empty()) {

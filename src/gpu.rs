@@ -1,4 +1,5 @@
-//! CUDA engine for qwen3moe and gpt-oss (biases, sinks, sliding window, YaRN; `Hparams::oai`). Same numerics as the CPU reference (f32 activations and KV
+//! CUDA engine for qwen3moe, gpt-oss (biases, sinks, sliding window, YaRN; `Hparams::oai`) and
+//! GLM-4.7-Flash (absorbed MLA over a shared latent cache, dense / shared-expert FFNs). Same numerics as the CPU reference (f32 activations and KV
 //! cache, weights dequantized on the fly), with the dense weights resident in VRAM and the
 //! experts in host RAM, cached in VRAM slots by `ExpertCache` (ubatches up to 32 tokens; larger
 //! ones read the cached experts and stream the rest through staging slots, as llama.cpp).
@@ -9,7 +10,7 @@
 use crate::expert_cache::ExpertCache;
 use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::quant::dequant_row;
-use crate::qwen3moe::{Engine, Weights};
+use crate::qwen3moe::{Attn, Engine, Hparams, Weights};
 use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice, PushKernelArg};
 use rayon::prelude::*;
 use cudarc::nvrtc::Ptx;
@@ -110,6 +111,12 @@ struct Kernels {
     attention_dec: CudaFunction,
     attention_tc: CudaFunction,
     attn_merge: CudaFunction,
+    attention_mla: CudaFunction,
+    rmsnorm_strided: CudaFunction,
+    rope_norm: CudaFunction,
+    mm_heads_q4_k: CudaFunction,
+    mm_heads_q6_k: CudaFunction,
+    mm_heads_q8_0: CudaFunction,
     store_f16: CudaFunction,
     add_inplace: CudaFunction,
     gather_rows: CudaFunction,
@@ -130,17 +137,24 @@ struct Mat {
     n_rows: usize,
 }
 
+enum DAttn {
+    Gqa { wq: Mat, wk: Mat, wv: Mat },
+    /// k_b and v_b are per-head stacks of lat (k_b) / vd (v_b) rows.
+    Mla { q_a: Mat, q_a_norm: Ptr, q_b: Mat, kv_a: Mat, kv_a_norm: Ptr, k_b: Mat, v_b: Mat },
+}
+
 struct DLayer {
     attn_norm: Ptr,
-    wq: Mat,
-    wk: Mat,
-    wv: Mat,
+    attn: DAttn,
     wo: Mat,
     /// 0: none (gpt-oss).
     q_norm: Ptr,
     k_norm: Ptr,
     ffn_norm: Ptr,
-    router: Mat,
+    /// None: a dense layer (GLM layer 0).
+    router: Option<Mat>,
+    /// Dense FFN or shared expert: [gate | up] (2 x ff rows), down.
+    ffn: Option<(Mat, Mat)>,
     /// Biases of q, k, v, o, router (0: none), attention sinks (0: none), sliding window (0: none).
     bias: [Ptr; 5],
     sinks: Ptr,
@@ -215,6 +229,8 @@ pub struct GpuModel {
     max_batch: usize,
     /// Tokens per layer-major pass (`forward_span`).
     span: usize,
+    /// Floats in s.gu (attention split partials live there).
+    gu_len: usize,
     /// Owns every device allocation the raw pointers above point into.
     _bufs: Vec<CudaSlice<u8>>,
     /// Bytes allocated on the device.
@@ -234,6 +250,11 @@ const F: usize = std::mem::size_of::<f32>();
 /// gate: top-2 24.3, 4 25.3, 5 25.4, 6 25.3, 8 24.0 tok/s).
 const PREFETCH_TOP: usize = 5;
 const H: usize = 2; // f16
+
+/// KV arrays per layer: K and V, or MLA's one shared latent row per position.
+fn kv_arrays(hp: &Hparams) -> usize {
+    if hp.glm.is_some() { 1 } else { 2 }
+}
 
 fn err(e: impl std::fmt::Debug) -> String {
     format!("CUDA: {e:?}")
@@ -282,6 +303,12 @@ impl GpuModel {
             attention_dec: f("attention_dec")?,
             attention_tc: f("attention_tc")?,
             attn_merge: f("attn_merge")?,
+            attention_mla: f("attention_mla")?,
+            rmsnorm_strided: f("rmsnorm_strided")?,
+            rope_norm: f("rope_norm")?,
+            mm_heads_q4_k: f("mm_heads_q4_k")?,
+            mm_heads_q6_k: f("mm_heads_q6_k")?,
+            mm_heads_q8_0: f("mm_heads_q8_0")?,
             store_f16: f("store_f16")?,
             add_inplace: f("add_inplace")?,
             gather_rows: f("gather_rows")?,
@@ -301,18 +328,39 @@ impl GpuModel {
             vram.set(vram.get() + bytes);
             Ok(p)
         };
-        let mut upload = |t: &TensorInfo| -> Result<Ptr, String> {
-            let p = alloc(t.size)?;
-            unsafe { result::memcpy_htod_sync(p, w.g.data(t)) }.map_err(err)?;
-            Ok(p)
-        };
-        let mat = |t: &TensorInfo, p: Ptr| -> Result<Mat, String> {
+        // Upload tensors back to back as one matrix (rows of the same type and length).
+        let mut up = |ts: &[&TensorInfo]| -> Result<Mat, String> {
+            let t = ts[0];
             check_ty(t)?;
-            Ok(Mat { p, ty: t.ty, row_bytes: t.row_bytes(), k: t.dims[0] as usize, n_rows: t.size / t.row_bytes() })
+            if ts.iter().any(|u| u.ty != t.ty || u.dims[0] != t.dims[0]) {
+                return Err(format!("{}: concatenated tensors differ in type or row length", t.name));
+            }
+            let n: usize = ts.iter().map(|u| u.size).sum();
+            let p = alloc(n)?;
+            let mut o = 0;
+            for u in ts {
+                unsafe { result::memcpy_htod_sync(p + o as u64, w.g.data(u)) }.map_err(err)?;
+                o += u.size;
+            }
+            Ok(Mat { p, ty: t.ty, row_bytes: t.row_bytes(), k: t.dims[0] as usize, n_rows: n / t.row_bytes() })
         };
         let mut layers = vec![];
         for (li, l) in w.layers.iter().enumerate() {
-            let mut opt = |t: Option<&TensorInfo>| t.map_or(Ok(0), &mut upload);
+            let attn = match &l.attn {
+                Attn::Gqa { wq, wk, wv } => DAttn::Gqa { wq: up(&[wq])?, wk: up(&[wk])?, wv: up(&[wv])? },
+                Attn::Mla { q_a, q_a_norm, q_b, kv_a, kv_a_norm, k_b, v_b } => {
+                    if let Some(t) = [k_b, v_b].into_iter().find(|t| !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_0)) {
+                        return Err(format!("{}: {:?} has no per-head CUDA kernel yet", t.name, t.ty));
+                    }
+                    DAttn::Mla { q_a: up(&[q_a])?, q_a_norm: up(&[q_a_norm])?.p, q_b: up(&[q_b])?, kv_a: up(&[kv_a])?, kv_a_norm: up(&[kv_a_norm])?.p, k_b: up(&[k_b])?, v_b: up(&[v_b])? }
+                }
+            };
+            let ffn = match (&l.dense, l.moe.as_ref().and_then(|m| m.shared.as_ref())) {
+                (Some([g, u, d]), _) | (None, Some([g, u, d])) => Some((up(&[g, u])?, up(&[d])?)),
+                _ => None,
+            };
+            let router = l.moe.as_ref().map(|m| up(&[&m.router])).transpose()?;
+            let mut opt = |t: Option<&TensorInfo>| t.map_or(Ok(0), |t| up(&[t]).map(|m| m.p));
             let bias = [0, 1, 2, 3, 4].map(|i| l.bias.as_ref().map(|b| &b[i]));
             layers.push(DLayer {
                 q_norm: opt(l.q_norm.as_ref())?,
@@ -320,26 +368,27 @@ impl GpuModel {
                 bias: [opt(bias[0])?, opt(bias[1])?, opt(bias[2])?, opt(bias[3])?, opt(bias[4])?],
                 sinks: opt(l.sinks.as_ref())?,
                 window: if li % 2 == 0 { w.hp.swa as i32 } else { 0 },
-                attn_norm: upload(&l.attn_norm)?,
-                wq: mat(&l.wq, upload(&l.wq)?)?,
-                wk: mat(&l.wk, upload(&l.wk)?)?,
-                wv: mat(&l.wv, upload(&l.wv)?)?,
-                wo: mat(&l.wo, upload(&l.wo)?)?,
-                ffn_norm: upload(&l.ffn_norm)?,
-                router: mat(&l.router, upload(&l.router)?)?,
+                attn_norm: up(&[&l.attn_norm])?.p,
+                attn,
+                wo: up(&[&l.wo])?,
+                ffn_norm: up(&[&l.ffn_norm])?.p,
+                router,
+                ffn,
             });
-            for t in [&l.gate, &l.up, &l.down] {
-                if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::MXFP4) {
-                    return Err(format!("{}: {:?} experts have no CUDA kernel yet", t.name, t.ty));
+            if let Some(m) = &l.moe {
+                for t in [&m.gate, &m.up, &m.down] {
+                    if !matches!(t.ty, GgmlType::Q4_K | GgmlType::Q6_K | GgmlType::Q8_0 | GgmlType::MXFP4) {
+                        return Err(format!("{}: {:?} experts have no CUDA kernel yet", t.name, t.ty));
+                    }
+                }
+                // gate and up are read as one [gate | up] matrix of each slot.
+                if m.gate.ty != m.up.ty || m.gate.dims != m.up.dims {
+                    return Err(format!("{}: gate and up experts differ in type or shape", m.gate.name));
                 }
             }
-            // gate and up are read as one [gate | up] matrix of each slot.
-            if l.gate.ty != l.up.ty || l.gate.dims != l.up.dims {
-                return Err(format!("{}: gate and up experts differ in type or shape", l.gate.name));
-            }
         }
-        let out_norm = upload(&w.out_norm)?;
-        let output = mat(&w.output, upload(&w.output)?)?;
+        let out_norm = up(&[&w.out_norm])?.p;
+        let output = up(&[&w.output])?;
         let rope_freq = match &w.hp.rope_yarn {
             Some((f, _)) => {
                 let p = alloc(f.len() * F)?;
@@ -351,34 +400,38 @@ impl GpuModel {
         let dense = vram.get();
 
         let hp = &w.hp;
-        if hp.head_dim % 32 != 0 || hp.head_dim > 256 {
+        if hp.glm.is_none() && (hp.head_dim % 32 != 0 || hp.head_dim > 256) {
             return Err(format!("head_dim {} unsupported by the attention kernel", hp.head_dim));
         }
         let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
         let n_ctx = n_ctx.next_multiple_of(KV_PAGE);
-        let kv = alloc(hp.n_layer * 2 * n_ctx * kvd * H)?;
+        let kv = alloc(hp.n_layer * kv_arrays(hp) * n_ctx * kvd * H)?;
         let pt = alloc(MAX_SEQ * (n_ctx / KV_PAGE) * 4)?;
         let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
-        let layout = |l: &crate::qwen3moe::Layer| (l.gate.ty, l.up.ty, l.down.ty, ebytes(l));
+        let layout = |m: &crate::qwen3moe::Moe, l| (m.gate.ty, m.up.ty, m.down.ty, ebytes(l));
         let mut layouts = vec![];
+        // Dense layers: no group (usize::MAX).
         let group_of: Vec<usize> = w
             .layers
             .iter()
-            .map(|l| layouts.iter().position(|x| *x == layout(l)).unwrap_or_else(|| {
-                layouts.push(layout(l));
+            .map(|l| l.moe.as_ref().map_or(usize::MAX, |m| layouts.iter().position(|x| *x == layout(m, l)).unwrap_or_else(|| {
+                layouts.push(layout(m, l));
                 layouts.len() - 1
-            }))
+            })))
             .collect();
         // Expert parts are packed back to back in cache slots; the GEMM's 16-byte Q4_K loads
         // need each part (and so each slot) to stay 16-aligned.
         if let Some(l) = w.layers.iter().find(|l| w.expert(l, 0).iter().any(|b| b.len() % 16 != 0)) {
-            return Err(format!("expert tensor sizes not 16-byte multiples ({:?})", layout(l)));
+            return Err(format!("expert tensor sizes not 16-byte multiples ({:?})", layout(l.moe.as_ref().unwrap(), l)));
         }
         let host_bytes: usize = w.layers.iter().map(|l| ebytes(l) * hp.n_expert).sum();
         let stage_bytes = layouts.iter().map(|l| l.3).max().unwrap_or(0);
         let host = pin_experts(&ctx, &w, host_bytes);
         let stage = alloc(STAGE * stage_bytes)?;
         let (b, span) = (n_ctx.min(512), n_ctx.min(SPAN));
+        // Per token FFN widths: the routed experts' or the widest dense / shared FFN.
+        let ff_tok = layers.iter().filter_map(|l| l.ffn.map(|f| f.0.n_rows / 2)).fold(kk * hp.n_ff_exp, usize::max);
+        let gu_len = b * 2 * ff_tok;
         let s = Scratch {
             x: alloc(span * e * F)?,
             h: alloc(span * e * F)?,
@@ -388,8 +441,8 @@ impl GpuModel {
             o: alloc(b * e * F)?,
             rl: alloc(b * hp.n_expert * F)?,
             xg: alloc(b * kk * e * F)?,
-            gu: alloc(b * kk * 2 * hp.n_ff_exp * F)?,
-            act: alloc(b * kk * hp.n_ff_exp * F)?,
+            gu: alloc(gu_len * F)?,
+            act: alloc(b * ff_tok * F)?,
             db: alloc(b * kk * e * F)?,
             logits: alloc(LOGIT_ROWS.min(b) * hp.n_vocab * F)?,
             meta: alloc(meta_bytes(span, b, kk, hp.n_expert))?,
@@ -419,7 +472,7 @@ impl GpuModel {
             vram.get() >> 20
         );
         let ev = || ctx.new_event(None).map_err(err);
-        let bias_off = w.expert(&w.layers[0], 0)[..3].iter().map(|b| b.len()).sum();
+        let bias_off = w.layers.iter().find(|l| l.moe.is_some()).map_or(0, |l| w.expert(l, 0)[..3].iter().map(|b| b.len()).sum());
         Ok(Self {
             copy: ctx.new_stream().map_err(err)?,
             ready: [ev()?, ev()?],
@@ -451,6 +504,7 @@ impl GpuModel {
             n_ctx,
             max_batch: b,
             span,
+            gu_len,
             _bufs: bufs,
             vram_bytes: vram.get(),
             w,
@@ -536,6 +590,73 @@ impl GpuModel {
         launch!(self, f, (gx as u32, gy as u32, 1), 128, [wp, off, rb, k, x, y, n, ti]);
     }
 
+    /// Per-head matvec: head h's n_rows rows of m (at h * n_rows) against the k floats at
+    /// x + t * x_ts + h * x_hs, into y[t * y_ts + h * y_hs + r].
+    #[allow(clippy::too_many_arguments)]
+    fn mm_heads(&self, m: &Mat, n_rows: usize, x: Ptr, x_ts: usize, x_hs: usize, y: Ptr, y_ts: usize, y_hs: usize, ntok: usize, heads: usize) {
+        let f = match m.ty {
+            GgmlType::Q4_K => &self.k.mm_heads_q4_k,
+            GgmlType::Q6_K => &self.k.mm_heads_q6_k,
+            GgmlType::Q8_0 => &self.k.mm_heads_q8_0,
+            t => unreachable!("checked at load: {t:?}"),
+        };
+        let (p, rb, hs, k, nr) = (m.p, m.row_bytes as u64, (n_rows * m.row_bytes) as u64, m.k as i32, n_rows as i32);
+        let (xt, xh, yt, yh) = (x_ts as i32, x_hs as i32, y_ts as i32, y_hs as i32);
+        launch!(self, f, (n_rows.div_ceil(4) as u32, ntok as u32, heads as u32), 128, [p, rb, hs, k, x, xt, xh, y, yt, yh, nr]);
+    }
+
+    /// GLM's absorbed MLA (src/glm.rs) for one ubatch: h (tc normed rows) -> s.q, tc x nh x vd,
+    /// the attn_output input. Stores the ubatch's latent cache rows into kc.
+    fn mla_attention(&self, a: &DAttn, h: Ptr, tc: usize, ps: &[(usize, usize, usize, usize)], kc: Ptr) -> Ptr {
+        let DAttn::Mla { q_a, q_a_norm, q_b, kv_a, kv_a_norm, k_b, v_b } = a else { unreachable!() };
+        let hp = &self.w.hp;
+        let g = hp.glm.as_ref().expect("MLA is GLM");
+        let (s, nh, eps, base) = (self.s, hp.n_head, hp.eps, hp.rope_base);
+        let (lat, kd, row, vd) = (g.lat, g.nope + g.rope, g.lat + g.rope, g.vd);
+        let at = |p: Ptr, floats: usize| p + (floats * F) as u64;
+        let tn = tc as u32;
+        self.mm(q_a, h, s.o, tc);
+        let (o, qn, qal) = (s.o, *q_a_norm, q_a.n_rows as i32);
+        launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [o, o, qn, qal, eps]);
+        self.mm(q_b, s.o, s.attn, tc); // tc x nh x [nope | rope]
+        self.mm(kv_a, h, s.kvs, tc); // tc x [latent | k_pe]
+        let (kvs, kn, lati, rowi, kdi, nhi, rdi) = (s.kvs, *kv_a_norm, lat as i32, row as i32, kd as i32, nh as i32, g.rope as i32);
+        launch!(self, self.k.rmsnorm_strided, (tn, 1, 1), 256, [kvs, kvs, kn, lati, rowi, eps]);
+        // Absorbed q: [q_nope . k_b[h] (lat) | roped q_pe], row floats per head.
+        self.mm_heads(k_b, lat, s.attn, nh * kd, kd, s.q, nh * row, row, tc, nh);
+        // The pieces' roping and stores first: attention below overwrites s.attn.
+        for &(sq, r0, n, pos) in ps {
+            let (pos0, one, half) = (pos as i32, 1i32, (g.rope / 2) as u32);
+            let (src, dst) = (at(s.attn, r0 * nh * kd + g.nope), at(s.q, r0 * nh * row + lat));
+            launch!(self, self.k.rope_norm, ((n * nh) as u32, 1, 1), half, [dst, rowi, src, kdi, nhi, pos0, base, rdi]);
+            let kp = at(s.kvs, r0 * row + lat);
+            launch!(self, self.k.rope_norm, (n as u32, 1, 1), half, [kp, rowi, kp, rowi, one, pos0, base, rdi]);
+            let pages = &self.seqs[sq].pages;
+            let mut p = pos;
+            while p < pos + n {
+                let m = (KV_PAGE - p % KV_PAGE).min(pos + n - p);
+                let slot = pages[p / KV_PAGE] as usize * KV_PAGE + p % KV_PAGE;
+                let (kd16, src, cnt) = (kc + (slot * row * H) as u64, at(s.kvs, (r0 + p - pos) * row), (m * row) as i32);
+                launch!(self, self.k.store_f16, ((m * row).div_ceil(256) as u32, 1, 1), 256, [kd16, src, cnt]);
+                p += m;
+            }
+        }
+        let scale = 1.0 / (kd as f32).sqrt();
+        for &(sq, r0, n, pos) in ps {
+            let pt = self.pt + (sq * (self.n_ctx / KV_PAGE) * 4) as u64;
+            // Decode: split the positions (partials in s.gu, idle during attention).
+            let sk = if n <= 4 { (pos + n).div_ceil(ATT_SPLIT).min(self.gu_len / (n * nh * (lat + 2))).max(1) } else { 1 };
+            let (q, out, part) = (at(s.q, r0 * nh * row), at(s.attn, r0 * nh * lat), s.gu);
+            let (pos0, ni, per, ski, rows) = (pos as i32, n as i32, (pos + n).div_ceil(sk) as i32, sk as i32, (n * nh) as i32);
+            launch!(self, self.k.attention_mla, (n as u32, sk as u32, 1), (32 * nh) as u32, [q, kc, pt, out, nhi, pos0, ni, scale, per, part]);
+            if sk > 1 {
+                launch!(self, self.k.attn_merge, ((n * nh) as u32, 1, 1), lat as u32, [part, out, rows, ski]);
+            }
+        }
+        self.mm_heads(v_b, vd, s.attn, nh * lat, lat, s.q, nh * vd, vd, tc, nh);
+        s.q
+    }
+
     /// y (ntok rows of n_cols) += bias b; no-op for b = 0.
     fn bias(&self, b: Ptr, y: Ptr, n_cols: usize, ntok: usize) {
         if b != 0 {
@@ -567,7 +688,8 @@ impl GpuModel {
         let hp = &self.w.hp;
         let (e, t) = (hp.n_embd, h.len() / hp.n_embd);
         let wl = &self.w.layers[li];
-        let ty = [wl.gate.ty, wl.up.ty, wl.down.ty];
+        let m = wl.moe.as_ref().expect("MoE layer");
+        let ty = [m.gate.ty, m.up.ty, m.down.ty];
         let jobs: Vec<crate::cpu_moe::ExpertJob> = experts
             .iter()
             .map(|&ex| {
@@ -681,7 +803,7 @@ impl GpuModel {
         let scale = 1.0 / (hd as f32).sqrt();
         let pt_row = |sq: usize| self.pt + (sq * (self.n_ctx / KV_PAGE) * 4) as u64;
         for (li, l) in self.layers.iter().enumerate() {
-            let kc = self.kv + (li * 2 * self.n_ctx * kvd * H) as u64;
+            let kc = self.kv + (li * kv_arrays(hp) * self.n_ctx * kvd * H) as u64;
             let vc = kc + (self.n_ctx * kvd * H) as u64;
             // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
             let mut sels = vec![];
@@ -694,9 +816,10 @@ impl GpuModel {
                 let (ks, vs) = (s.kvs, s.kvs + (tc * kvd * F) as u64);
                 let wn = l.attn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-                self.mm(&l.wq, h, s.q, tc);
-                self.mm(&l.wk, h, ks, tc);
-                self.mm(&l.wv, h, vs, tc);
+                let wo_in = if let DAttn::Gqa { wq, wk, wv } = &l.attn {
+                self.mm(wq, h, s.q, tc);
+                self.mm(wk, h, ks, tc);
+                self.mm(wv, h, vs, tc);
                 self.bias(l.bias[0], s.q, nh * hd, tc);
                 self.bias(l.bias[1], ks, kvd, tc);
                 self.bias(l.bias[2], vs, kvd, tc);
@@ -727,7 +850,7 @@ impl GpuModel {
                     // attention_tc. Both split the positions when blocks are few, partials in s.gu
                     // (idle during attention).
                     let small = tc <= 4;
-                    let cap = self.max_batch * hp.n_expert_used * 2 * hp.n_ff_exp / (tc * nh * 130);
+                    let cap = self.gu_len / (tc * nh * 130);
                     let (f, gy, bs) = if small { (&self.k.attention_dec, (tc * gq).div_ceil(8), 256) }
                         else { (&self.k.attention_tc, (tc * gq).div_ceil(64), 128) };
                     // Fill the GPU: split positions until ~240 blocks (decode: every ATT_SPLIT).
@@ -744,25 +867,42 @@ impl GpuModel {
                     launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, pt, attn, nhi, nkvi, hdi, pos0, scale, sinks, win]);
                   }
                 }
-                let attn = s.attn;
-                self.mm(&l.wo, attn, o, tc);
+                s.attn
+                } else {
+                    self.mla_attention(&l.attn, h, tc, ps, kc)
+                };
+                self.mm(&l.wo, wo_in, o, tc);
                 self.bias(l.bias[3], o, e, tc);
                 let n = (tc * e) as i32;
                 launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
                 let wn = l.ffn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-                self.mm(&l.router, h, s.rl, tc);
+                if let Some((gu, down)) = &l.ffn {
+                    // Dense FFN or shared expert, straight into the residual.
+                    let (sgu, act, ffi, ti) = (s.gu, s.act, (gu.n_rows / 2) as i32, tc as i32);
+                    self.mm(gu, h, sgu, tc);
+                    launch!(self, self.k.swiglu, ((tc * gu.n_rows / 2).div_ceil(256) as u32, 1, 1), 256, [act, sgu, ffi, ti]);
+                    self.mm(down, act, o, tc);
+                    launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
+                }
+                let Some(router) = &l.router else { continue };
+                self.mm(router, h, s.rl, tc);
                 self.bias(l.bias[4], s.rl, n_expert, tc);
                 // Decode: also predict layer li+1's experts, its router on this post-attention x
                 // (top-8 recall ~84%). Read back with the router logits; prefetched below.
-                let predict = t == 1 && li + 1 < self.layers.len();
-                if predict {
-                    let (o, wn, rl2) = (s.o, self.layers[li + 1].ffn_norm, s.rl + (n_expert * F) as u64);
+                let next = self.layers.get(li + 1).and_then(|n| n.router.as_ref().map(|r| (n, r)));
+                let predict = t == 1 && next.is_some();
+                if let (true, Some((nl, nr))) = (predict, next) {
+                    let (o, wn, rl2) = (s.o, nl.ffn_norm, s.rl + (n_expert * F) as u64);
                     launch!(self, self.k.rmsnorm, (1, 1, 1), 256, [o, x, wn, ei, eps]);
-                    self.mm(&self.layers[li + 1].router, o, rl2, 1);
-                    self.bias(self.layers[li + 1].bias[4], rl2, n_expert, 1);
+                    self.mm(nr, o, rl2, 1);
+                    self.bias(nl.bias[4], rl2, n_expert, 1);
                 }
-                let mut r = self.w.route(&self.dtoh(s.rl, (tc + predict as usize) * n_expert));
+                let rl = self.dtoh(s.rl, (tc + predict as usize) * n_expert);
+                let mut r = self.w.route(li, &rl[..tc * n_expert]);
+                if predict {
+                    r.extend(self.w.route(li + 1, &rl[tc * n_expert..]));
+                }
                 if self.hybrid && t <= CACHE_MAX_BATCH {
                     hrows = self.dtoh(h, t * e); // the CPU experts' input (stream just synced)
                 }
@@ -772,6 +912,9 @@ impl GpuModel {
                 sels.push(r);
             }
 
+            if l.router.is_none() {
+                continue;
+            }
             // --- MoE: experts in waves; each wave runs over every ubatch ---
             let mut by_expert: Vec<Vec<(usize, f32)>> = vec![vec![]; n_expert]; // (span token, weight)
             for (ti, ts) in sels.iter().flatten().enumerate() {
@@ -884,6 +1027,7 @@ impl GpuModel {
                 unsafe { result::memcpy_htod_async(s.meta, &m[..blob.len()], self.stream.cu_stream()) }.expect("htod async");
             }
             let wl = &self.w.layers[li];
+            let wm = wl.moe.as_ref().unwrap();
             let down_off = (self.w.expert(wl, 0)[0].len() * 2) as u64;
             let (xg, gu, act, dbuf) = (s.xg, s.gu, s.act, s.db);
             // Copy stream: wave k's misses into its half once the half's last reader is done.
@@ -909,7 +1053,7 @@ impl GpuModel {
                     let (crow, cw) = (off + (4 * (t + 1)) as u64, off + (4 * (t + 1) + 4 * r) as u64);
                     let wp = s.meta + (o + 4 * r + 4 * (t + 1) + 8 * r).next_multiple_of(8) as u64;
                     launch!(self, self.k.gather_rows, (r as u32, 1, 1), 256, [xg, h, gidx, ei]);
-                    self.mm_ids(wl.gate.ty, wp, 0, wl.gate.row_bytes(), e, xg, gu, 2 * ff, r, per_ex);
+                    self.mm_ids(wm.gate.ty, wp, 0, wm.gate.row_bytes(), e, xg, gu, 2 * ff, r, per_ex);
                     let (ffi, ri, oai) = (ff as i32, r as i32, hp.oai);
                     let (bo, bdo, ff2, ei2) = (self.bias_off as u64, (self.bias_off + 2 * ff * F) as u64, 2 * ff as i32, e as i32);
                     if oai {
@@ -917,7 +1061,7 @@ impl GpuModel {
                     }
                     let glu = if oai { &self.k.swiglu_oai } else { &self.k.swiglu };
                     launch!(self, *glu, ((r * ff).div_ceil(256) as u32, 1, 1), 256, [act, gu, ffi, ri]);
-                    self.mm_ids(wl.down.ty, wp, down_off, wl.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
+                    self.mm_ids(wm.down.ty, wp, down_off, wm.down.row_bytes(), ff, act, dbuf, e, r, per_ex);
                     if oai {
                         launch!(self, self.k.bias_ids, (r as u32, 1, 1), 256, [dbuf, wp, bdo, ei2]);
                     }
@@ -1036,7 +1180,7 @@ impl Engine for GpuModel {
         let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
         let pb = KV_PAGE * kvd * H;
         self.stream.synchronize().expect("sync");
-        let mut out = vec![0u8; nl * 2 * pages.len() * pb];
+        let mut out = vec![0u8; nl * kv_arrays(&self.w.hp) * pages.len() * pb];
         for (i, dst) in out.chunks_mut(pb).enumerate() {
             let src = self.kv + ((i / pages.len()) * self.n_ctx * kvd * H + pages[i % pages.len()] as usize * pb) as u64;
             unsafe { result::memcpy_dtoh_sync(dst, src) }.expect("kv dtoh");
@@ -1047,11 +1191,12 @@ impl Engine for GpuModel {
     fn kv_restore(&mut self, data: &[u8], n: usize) {
         let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
         let pb = KV_PAGE * kvd * H;
-        let np_img = data.len() / (nl * 2 * pb);
+        let nl = nl * kv_arrays(&self.w.hp);
+        let np_img = data.len() / (nl * pb);
         assert!(self.seqs[self.cur].n_past == 0 && n <= np_img * KV_PAGE, "kv_restore into a used sequence or past the image");
         self.grow(self.cur, n);
         let pages = self.seqs[self.cur].pages.clone();
-        for lh in 0..nl * 2 {
+        for lh in 0..nl {
             for (j, &p) in pages.iter().enumerate() {
                 let dst = self.kv + (lh * self.n_ctx * kvd * H + p as usize * pb) as u64;
                 self.htod(dst, &data[(lh * np_img + j) * pb..][..pb]);

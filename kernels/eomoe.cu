@@ -221,6 +221,30 @@ MM_QUANT(q8_0, 8, _t8)
 MM_QUANT(mxfp4, 1, )
 MM_QUANT(mxfp4, 8, _t8)
 
+// Per-head matvec (MLA: q_nope through attn_k_b, the latent output through attn_v_b): head h's
+// weights are the n_rows rows at w + h * w_hs; y[t * y_ts + h * y_hs + r] = W_h[r] . (the k
+// floats at x + t * x_ts + h * x_hs). grid (ceil(n_rows / MM_ROWS), T, heads), block 32 * MM_ROWS.
+// ponytail: one token per warp; tile tokens (strided x) if MLA prefill shows up in profiles.
+template <void (*DOT)(const uint8_t*, const float*, int, int, int, float*)>
+__device__ __forceinline__ void mm_heads_tile(const uint8_t* w, unsigned long long row_bytes, unsigned long long w_hs,
+                                              int k, const float* x, int x_ts, int x_hs, float* y, int y_ts,
+                                              int y_hs, int n_rows) {
+    const int r = blockIdx.x * MM_ROWS + (threadIdx.x >> 5), t = blockIdx.y, h = blockIdx.z;
+    if (r >= n_rows) return;
+    float acc;
+    DOT(w + h * w_hs + (size_t)r * row_bytes, x + (size_t)t * x_ts + (size_t)h * x_hs, k, threadIdx.x & 31, 1, &acc);
+    if ((threadIdx.x & 31) == 0) y[(size_t)t * y_ts + (size_t)h * y_hs + r] = acc;
+}
+#define MM_HEADS(name)                                                                              \
+    extern "C" __global__ void mm_heads_##name(const uint8_t* w, unsigned long long row_bytes,     \
+                                               unsigned long long w_hs, int k, const float* x, int x_ts, \
+                                               int x_hs, float* y, int y_ts, int y_hs, int n_rows) { \
+        mm_heads_tile<dot_##name<1>>(w, row_bytes, w_hs, k, x, x_ts, x_hs, y, y_ts, y_hs, n_rows);  \
+    }
+MM_HEADS(q4_k)
+MM_HEADS(q6_k)
+MM_HEADS(q8_0)
+
 // ---- Prefill GEMM: y[t][r] = W[r] . x[t] for many tokens, on tensor cores (mma.sync m16n8k16,
 // f16 in, f32 accumulate), MMQ-style. Block: 128 rows x NT tokens (GB_T = 128 dense, GB_TI = 64
 // experts), 4 warps; warp w owns rows 32w..32w+31 x all NT tokens (2 x NT/8 mma tiles). K advances one 32-element sub-block per
@@ -421,13 +445,32 @@ GEMM_QUANT(q4_k, true)
 GEMM_QUANT(q6_k, false)
 
 // Row-wise RMSNorm, y may alias x. grid rows.
-extern "C" __global__ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
-    const float* xr = x + (size_t)blockIdx.x * n;
-    float* yr = y + (size_t)blockIdx.x * n;
+__device__ __forceinline__ void rmsnorm_row(float* yr, const float* xr, const float* w, int n, float eps) {
     float ss = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     const float s = 1.0f / sqrtf(block_sum(ss) / n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * s * w[i];
+}
+extern "C" __global__ void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
+    rmsnorm_row(y + (size_t)blockIdx.x * n, x + (size_t)blockIdx.x * n, w, n, eps);
+}
+// The first n of rows `stride` apart (MLA: the latent half of each kv_a row).
+extern "C" __global__ void rmsnorm_strided(float* y, const float* x, const float* w, int n, int stride, float eps) {
+    rmsnorm_row(y + (size_t)blockIdx.x * stride, x + (size_t)blockIdx.x * stride, w, n, eps);
+}
+
+// NORM rope (adjacent pairs (2i, 2i+1), theta_i = pos * base^(-2i/d)) of d-wide row pieces: row r
+// reads src + r * s_stride, writes dst + r * d_stride (may alias); pos = pos0 + r / rows_per_tok.
+// grid rows, block d / 2.
+extern "C" __global__ void rope_norm(float* dst, int d_stride, const float* src, int s_stride,
+                                     int rows_per_tok, int pos0, float base, int d) {
+    const int r = blockIdx.x, i = threadIdx.x;
+    const float* sp = src + (size_t)r * s_stride;
+    float* dp = dst + (size_t)r * d_stride;
+    const float th = (float)(pos0 + r / rows_per_tok) * powf(base, -2.0f * i / d);
+    const float sn = sinf(th), cs = cosf(th), a = sp[2 * i], b = sp[2 * i + 1];
+    dp[2 * i] = a * cs - b * sn;
+    dp[2 * i + 1] = a * sn + b * cs;
 }
 
 // Per-head RMSNorm (q_norm/k_norm; none if w is null) then NEOX rope in place. v is
@@ -715,20 +758,75 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
     }
 }
 
-// Combine split-K partials of attention_dec / attention_tc. grid T * nh, block 128 (= hd).
+// Combine split-K partials (m, l, acc[hd]) of attention_dec / attention_tc / attention_mla.
+// grid T * nh, block hd.
 extern "C" __global__ void attn_merge(const float* part, float* out, int rows, int S) {
-    const int r = blockIdx.x, d = threadIdx.x;
+    const int r = blockIdx.x, d = threadIdx.x, hd = blockDim.x;
     float M = -INFINITY;
-    for (int z = 0; z < S; z++) M = fmaxf(M, part[((size_t)z * rows + r) * 130]);
+    for (int z = 0; z < S; z++) M = fmaxf(M, part[((size_t)z * rows + r) * (hd + 2)]);
     float L = 0.0f, o = 0.0f;
     for (int z = 0; z < S; z++) {
-        const float* pp = part + ((size_t)z * rows + r) * 130;
+        const float* pp = part + ((size_t)z * rows + r) * (hd + 2);
         if (pp[1] == 0.0f) continue;  // split saw no visible position
         const float c = expf(pp[0] - M);
         L += pp[1] * c;
         o += pp[2 + d] * c;
     }
-    out[(size_t)r * 128 + d] = o / L;
+    out[(size_t)r * hd + d] = o / L;
+}
+
+// MLA attention (GLM, src/glm.rs) over the shared latent cache: one f16 row of MLA_ROW per
+// position (latent | k_pe); V is its first MLA_LAT. q: T x nh x MLA_ROW (absorbed q_nope | roped
+// q_pe), out: T x nh x MLA_LAT. grid (T, S), block 32 * nh: warp h is head h, every head reads the
+// same staged tile of MLA_KT cache rows. Lane owns dims lane + 32d. Split z covers positions
+// [z * per, (z + 1) * per) of the n_past + t + 1 visible; with S > 1 it writes (m, l, acc) to
+// part[((z * T + t) * nh + h) * (MLA_LAT + 2)] for attn_merge.
+// ponytail: CUDA cores, one position at a time per warp; a long prefill wants a tensor-core tile.
+#define MLA_ROW 576
+#define MLA_LAT 512
+#define MLA_KT 16
+extern "C" __global__ void attention_mla(const float* q, const __half* kc, const int* pt, float* out,
+                                         int nh, int n_past, int T, float scale, int per, float* part) {
+    __shared__ __align__(16) __half ks[MLA_KT][MLA_ROW];
+    const int t = blockIdx.x, z = blockIdx.y, h = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int p0 = z * per, p1 = min(n_past + t + 1, p0 + per);
+    const float* qp = q + ((size_t)t * nh + h) * MLA_ROW;
+    float qv[MLA_ROW / 32], acc[MLA_LAT / 32];
+#pragma unroll
+    for (int d = 0; d < MLA_ROW / 32; d++) qv[d] = qp[lane + 32 * d];
+#pragma unroll
+    for (int d = 0; d < MLA_LAT / 32; d++) acc[d] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (int b = p0; b < p1; b += MLA_KT) {
+        const int n = min(MLA_KT, p1 - b);
+        __syncthreads();
+        for (int i = threadIdx.x; i < n * (MLA_ROW / 8); i += blockDim.x) {
+            const int j = i / (MLA_ROW / 8), c = i % (MLA_ROW / 8);
+            ((uint4*)ks[j])[c] = ((const uint4*)(kc + kv_slot(pt, b + j) * MLA_ROW))[c];
+        }
+        __syncthreads();
+        for (int j = 0; j < n; j++) {
+            float s = 0.0f;
+#pragma unroll
+            for (int d = 0; d < MLA_ROW / 32; d++) s += qv[d] * __half2float(ks[j][lane + 32 * d]);
+            s = warp_sum(s) * scale;
+            const float mn = fmaxf(m, s), c = expf(m - mn), e = expf(s - mn);
+            l = l * c + e;
+#pragma unroll
+            for (int d = 0; d < MLA_LAT / 32; d++) acc[d] = acc[d] * c + e * __half2float(ks[j][lane + 32 * d]);
+            m = mn;
+        }
+    }
+    const size_t row = (size_t)t * nh + h;
+    if (gridDim.y == 1) {
+#pragma unroll
+        for (int d = 0; d < MLA_LAT / 32; d++) out[row * MLA_LAT + lane + 32 * d] = acc[d] / l;
+    } else {
+        float* pp = part + ((size_t)z * T * nh + row) * (MLA_LAT + 2);
+        if (lane == 0) { pp[0] = m; pp[1] = l; }
+#pragma unroll
+        for (int d = 0; d < MLA_LAT / 32; d++) pp[2 + lane + 32 * d] = acc[d];
+    }
 }
 
 // KV cache store: dst[i] = (f16) src[i].
