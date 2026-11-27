@@ -736,3 +736,24 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
 - **Context shift / smart context.** These silently drop the middle of an agent's context, which corrupts agent sessions.
 - **Image, video, music and TTS generation, Whisper, vision, Horde worker, story saves, GUI launcher, model switching.** They are outside a single coding-model server, and the user asked for no kitchen sink.
 - **DRY, XTC, mirostat and anti-slop samplers.** These are creative-writing tools; coding agents run near-greedy. `logit_bias` is cheap and OpenAI-standard, so it rides along with Phase 11 if a client sends it.
+
+## Phase 12a: `--moeexperts N` (2026-11-27)
+
+- **What it does:** routes each token to its top N experts, renormalized over those N, instead of the model's `expert_used_count` (8 for Qwen3-Coder-30B). It matches llama.cpp's `--override-kv qwen3moe.expert_used_count=int:N` and koboldcpp's `--moeexperts`.
+  - Set it with `--moeexperts`, `MOE_EXPERTS` or config `model.moe_experts`.
+  - Allowed range is 1..=8, because the expert buffers are sized for the model's count. Other values fail at startup: `eomoe: --moeexperts must be 1..=8`.
+- **Gate:** `tests/phase12_moeexperts.rs`, GPU. Red first: it did not compile without `GpuModel::set_n_expert_used`.
+- **Gate output** (teacher-forced greedy.json, 176 positions; decode tok/s over 64 steps on the warm cache):
+  ```
+  moeexperts 6: top-1 agreement 163/176 = 0.926; decode 83.9 tok/s (8 experts: 60.7)
+  moeexperts 4: top-1 agreement 141/176 = 0.801; decode 95.5 tok/s (8 experts: 60.7)
+  test result: ok. 1 passed; 0 failed
+  ```
+  - N=8 gives bit-identical logits.
+  - N outside 1..=8 is refused.
+  - Fewer experts must change the logits and keep top-1 agreement at or above 0.6.
+- **Gate revision (flagged):** the plan said "the default is bit-identical on the existing goldens".
+  - That holds because the default never calls the setter. The existing gates still pass; phase11 was re-run.
+  - The new gate's bit-identical check compares back-to-back passes. GPU logits depend on which experts are already in the VRAM cache: a streamed expert and a cached one sum in a different order. The first, cold pass differs from warm passes by up to 1.0 at a routing near-tie (the same effect as the phase3_golden note), and so does a pass after unrelated decoding. Repeated passes are bit-identical.
+  - Each N is therefore compared against a fresh warm baseline at N=8.
+  - A mutation run, with a setter that ignores N, went red: "N=6 changed nothing".

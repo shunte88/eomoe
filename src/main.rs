@@ -30,17 +30,20 @@ fn run() -> Result<(), String> {
         Command::Claude(a) => cli::claude(a),
         Command::Serve(a) => {
             let s = config.resolve_serve(a)?;
-            log::info!("model={} ctx={} cache={:?} MiB parallel={} cache_ram={}MiB api_keys={} https={}", s.model.display(), s.ctx_size, s.cache_mib, s.parallel, s.cache_ram >> 20, s.api_keys.len(), s.tls.is_some());
+            log::info!("model={} ctx={} cache={:?} MiB moeexperts={:?} parallel={} cache_ram={}MiB api_keys={} https={}", s.model.display(), s.ctx_size, s.cache_mib, s.moe_experts, s.parallel, s.cache_ram >> 20, s.api_keys.len(), s.tls.is_some());
             if !(1..=eomoe::gpu::MAX_SEQ).contains(&s.parallel) {
                 return Err(format!("--parallel must be 1..={}", eomoe::gpu::MAX_SEQ));
             }
             let g = Gguf::open(&s.model)?;
             let (tok, tpl) = (Tokenizer::from_gguf(&g)?, ChatTemplate::from_gguf(&g)?);
-            let (path, ctx, cache, par) = (s.model.clone(), s.ctx_size, s.cache_mib.unwrap_or(usize::MAX >> 20), s.parallel);
+            let (path, ctx, cache, par, moe) = (s.model.clone(), s.ctx_size, s.cache_mib.unwrap_or(usize::MAX >> 20), s.parallel, s.moe_experts);
             // The engine is built on, and stays on, the server's model thread.
             let app = server::App::new(tok, tpl, s.alias.clone(), server::ollama::describe(&g, &s.model), s.cache_ram, move || {
                 let mut m = GpuModel::with_cache(Gguf::open(&path)?, ctx, cache)?;
                 m.set_n_seq(par);
+                if let Some(n) = moe {
+                    m.set_n_expert_used(n)?;
+                }
                 Ok(m)
             })?;
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;

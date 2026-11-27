@@ -23,6 +23,7 @@ pub struct ModelSection {
     pub path: Option<PathBuf>,
     pub ctx_size: Option<usize>,
     pub cache_mib: Option<usize>,
+    pub moe_experts: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,6 +53,8 @@ pub struct ServeSettings {
     pub ctx_size: usize,
     /// None: all free VRAM.
     pub cache_mib: Option<usize>,
+    /// None: the model's own experts per token.
+    pub moe_experts: Option<usize>,
     pub host: String,
     pub port: u16,
     pub alias: String,
@@ -87,6 +90,7 @@ impl EomoeConfig {
             model: cli.model.clone().or_else(|| m.path.clone()).unwrap_or_else(crate::cli::default_model),
             ctx_size: cli.ctx_size.or(m.ctx_size).unwrap_or(DEFAULT_CTX),
             cache_mib: cli.cache_mib.or(m.cache_mib),
+            moe_experts: cli.moe_experts.or(m.moe_experts),
             host: cli.host.clone().or_else(|| s.host.clone()).unwrap_or_else(|| "127.0.0.1".into()),
             port: cli.port.or(s.port).unwrap_or(8080),
             alias: cli.alias.clone().or_else(|| s.alias.clone()).unwrap_or_else(|| "local-code".into()),
@@ -108,7 +112,7 @@ mod tests {
     #[test]
     fn cli_overrides_config_overrides_defaults() {
         let cfg: EomoeConfig = serde_yaml::from_str("model:\n  path: /cfg/model.gguf\n  cache_mib: 2000\nserver:\n  host: 0.0.0.0\n  port: 9000\n").unwrap();
-        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, parallel: None, cache_ram: None, alias: None, api_key: None, api_key_file: None, ssl_key_file: None, ssl_cert_file: None };
+        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, moe_experts: None, parallel: None, cache_ram: None, alias: None, api_key: None, api_key_file: None, ssl_key_file: None, ssl_cert_file: None };
         let s = cfg.resolve_serve(&cli).unwrap();
         assert_eq!(s.model, PathBuf::from("/cfg/model.gguf")); // config
         assert_eq!(s.cache_mib, Some(2000)); // config
@@ -123,7 +127,7 @@ mod tests {
     fn api_keys_from_flag_and_file() {
         let f = std::env::temp_dir().join(format!("eomoe-keys-{}", std::process::id()));
         std::fs::write(&f, "# team keys\nk3\n\nk4\n").unwrap();
-        let cli = ServeArgs { model: None, host: None, port: None, ctx_size: None, cache_mib: None, parallel: None, cache_ram: None, alias: None, api_key: Some("k1,,k2".into()), api_key_file: Some(f.clone()), ssl_key_file: None, ssl_cert_file: Some("c.pem".into()) };
+        let cli = ServeArgs { model: None, host: None, port: None, ctx_size: None, cache_mib: None, moe_experts: None, parallel: None, cache_ram: None, alias: None, api_key: Some("k1,,k2".into()), api_key_file: Some(f.clone()), ssl_key_file: None, ssl_cert_file: Some("c.pem".into()) };
         let cfg = EomoeConfig::default();
         assert!(cfg.resolve_serve(&cli).is_err(), "cert without key");
         let cli = ServeArgs { ssl_cert_file: None, ..cli };

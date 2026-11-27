@@ -539,6 +539,17 @@ impl GpuModel {
         self.cur = 0;
     }
 
+    /// Route each token to its top `n` experts (renormalized over those) instead of the model's
+    /// own count; 1..=that count, since the expert buffers were sized for it.
+    pub fn set_n_expert_used(&mut self, n: usize) -> Result<(), String> {
+        let max = self.w.g.u64("qwen3moe.expert_used_count").unwrap_or(0) as usize;
+        if !(1..=max).contains(&n) {
+            return Err(format!("--moeexperts must be 1..={max}"));
+        }
+        self.w.hp.n_expert_used = n;
+        Ok(())
+    }
+
     /// Give sequence `seq` pages for `n` more positions and upload its page table.
     /// Panics if its context or the shared pool would overflow.
     fn grow(&mut self, seq: usize, n: usize) {

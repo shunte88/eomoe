@@ -67,6 +67,7 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | `--port` | `PORT` | 8080 |
 | `--ctx-size` | `CTX_SIZE` | 32768 |
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
+| `--moeexperts` | `MOE_EXPERTS` | the model's (8): fewer experts per token is faster at some quality cost; 4 decodes ~1.6x faster and keeps 80% of greedy choices |
 | `--parallel` | `PARALLEL` | 4 (requests served at once; they share the KV pool, 1..=16) |
 | `--alias` | | `local-code` |
 | `--api-key` | `LLAMA_API_KEY` | none (comma-separated keys; requests then need `Authorization: Bearer KEY` or `x-api-key: KEY`) |

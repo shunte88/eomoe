@@ -54,6 +54,9 @@ pub struct ServeArgs {
     /// VRAM expert cache in MiB [config: model.cache_mib, default: all free VRAM]
     #[clap(long, env = "MOE_CACHE_MIB")]
     pub cache_mib: Option<usize>,
+    /// Experts per token, fewer than the model's for speed at some quality cost [config: model.moe_experts, default: the model's]
+    #[clap(long = "moeexperts", env = "MOE_EXPERTS")]
+    pub moe_experts: Option<usize>,
     /// Requests served at once; they share the context's KV pool [config: server.parallel, default: 4]
     #[clap(long, env = "PARALLEL")]
     pub parallel: Option<usize>,
