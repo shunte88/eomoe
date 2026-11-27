@@ -1,0 +1,154 @@
+name: Release
+
+# A v* tag builds and publishes: binaries for every CUDA platform and the Docker image, in
+# parallel, both after CI passes. workflow_dispatch is a dry run: it builds everything and
+# publishes nothing (binaries stay as workflow artifacts).
+# macOS is not a target: there is no CUDA on macOS.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Every SM the kernels support (the mma tiles need sm_80+), one fatbin.
+  EOMOE_CUDA_ARCH: 80,86,89,90,100,120
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  binaries:
+    name: binary (${{ matrix.name }})
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, container: 'nvidia/cuda:13.3.1-devel-ubuntu24.04' }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, container: 'nvidia/cuda:13.3.1-devel-ubuntu24.04' }
+          - { name: windows-x86_64, os: windows-latest, container: '' }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Build tools (Linux)
+        if: runner.os == 'Linux'
+        run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git
+      - name: CUDA toolkit (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "13.3"
+          Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/13.3.1/network_installers/cuda_13.3.1_windows_network.exe" -OutFile cuda.exe
+          Start-Process -Wait -FilePath .\cuda.exe -ArgumentList "-s","nvcc_$v","cudart_$v","crt_$v","nvvm_$v","nvfatbin_$v"
+          $nvcc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$v\bin\nvcc.exe"
+          if (-not (Test-Path $nvcc)) { throw "nvcc not installed at $nvcc" }
+          "NVCC=$nvcc" >> $env:GITHUB_ENV
+      - name: MSVC on PATH (nvcc needs cl.exe)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          ver=${GITHUB_REF_NAME}; [ "$PUBLISH" = true ] || ver=dev-${GITHUB_SHA::7}
+          pkg=eomoe-$ver-${{ matrix.name }}
+          mkdir -p dist "$pkg"
+          cp README.md LICENSE config.example.yaml "$pkg/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/eomoe.exe "$pkg/"
+            7z a -tzip "dist/$pkg.zip" "$pkg" >/dev/null
+          else
+            cp target/release/eomoe "$pkg/"
+            "$pkg/eomoe" --version
+            tar czf "dist/$pkg.tar.gz" "$pkg"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eomoe-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  image:
+    name: image (${{ matrix.arch }})
+    needs: ci
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          docker buildx build --load --build-arg EOMOE_CUDA_ARCH \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:sha-$GITHUB_SHA-${{ matrix.arch }}" .
+      - name: Verify the image runs
+        run: docker run --rm "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}" ./eomoe --version
+      - name: Publish
+        if: env.PUBLISH == 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}" "$IMAGE:$GITHUB_REF_NAME-${{ matrix.arch }}"
+          docker push "$IMAGE:$GITHUB_REF_NAME-${{ matrix.arch }}"
+
+  manifest:
+    name: image manifest
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest" \
+            "$IMAGE:$GITHUB_REF_NAME-amd64" "$IMAGE:$GITHUB_REF_NAME-arm64"
+
+  release:
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - run: |
+          mkdir dist && find staged -type f -exec cp {} dist/ \;
+          cd dist && sha256sum * > SHA256SUMS && sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

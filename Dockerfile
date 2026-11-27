@@ -13,7 +13,10 @@ COPY build.rs ./
 COPY kernels/ kernels/
 COPY src/ src/
 COPY config.example.yaml ./
-RUN cargo build --release
+# SMs to build kernels for, comma-separated (build.rs); releases pass every supported one.
+ARG EOMOE_CUDA_ARCH=120
+ENV EOMOE_CUDA_ARCH=$EOMOE_CUDA_ARCH
+RUN cargo build --release --locked
 
 # Runtime image ships libcudart + cuBLAS; libcuda comes from the host driver via nvidia-container-toolkit.
 FROM nvidia/cuda:13.3.1-runtime-ubuntu24.04

@@ -1,0 +1,36 @@
+name: CI
+
+# What a hosted runner can check: no GPU and no 17 GB model files, so clippy, the build (nvcc
+# compiles the kernels) and the model-free tests. The GPU gates run in soak.yml on media2026.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - run: apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential git
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release --locked --all-targets -- -D warnings
+      # Model-free tests only: everything needing a model or the GPU is #[ignore]d.
+      - run: cargo test --release --locked

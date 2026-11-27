@@ -105,10 +105,21 @@ pub fn strftime_now(fmt: &str) -> String {
     let n = unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
+        #[cfg(unix)]
         libc::localtime_r(&t, &mut tm);
-        libc::strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm)
+        #[cfg(windows)]
+        libc::localtime_s(&mut tm, &t);
+        strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm)
     };
     String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+#[cfg(unix)]
+use libc::strftime;
+#[cfg(windows)]
+extern "C" {
+    // The UCRT has it; the libc crate does not bind it on Windows.
+    fn strftime(s: *mut libc::c_char, max: usize, format: *const libc::c_char, tm: *const libc::tm) -> usize;
 }
 
 /// llama.cpp `as_string()`: Python str() semantics.

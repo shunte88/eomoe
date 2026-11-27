@@ -125,7 +125,7 @@ pub fn home() -> PathBuf {
 fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_default()).join(".local/share"))
 }
 
 /// `rel` under eomoe's home, else under the reference install if it exists there.
@@ -256,10 +256,18 @@ pub fn claude(a: &ClientArgs) -> Result<(), String> {
     exec(c.args(["--model", "local-code"]).args(&a.args))
 }
 
+#[cfg(unix)]
 fn exec(c: &mut Proc) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let e = c.exec();
     Err(format!("{:?}: {e}", c.get_program()))
+}
+
+/// No exec on Windows: run the client and exit with its code.
+#[cfg(not(unix))]
+fn exec(c: &mut Proc) -> Result<(), String> {
+    let st = c.status().map_err(|e| format!("{:?}: {e}", c.get_program()))?;
+    std::process::exit(st.code().unwrap_or(1))
 }
 
 /// `eomoe about`: third-party components and their licenses.

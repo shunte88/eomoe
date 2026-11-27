@@ -1,6 +1,7 @@
 // Compiles kernels/eomoe.cu to a fatbin (SASS, so no driver PTX JIT is needed) that
 // src/gpu.rs embeds and loads by kernel name.
-// NVCC overrides the compiler path, EOMOE_CUDA_ARCH the SM (default 120 = Blackwell consumer).
+// NVCC overrides the compiler path, EOMOE_CUDA_ARCH the SMs, comma-separated (default 120 = Blackwell
+// consumer; releases build 80,86,89,90,100,120: the mma kernels need sm_80+).
 // Also stamps the build time for `eomoe --version` (EOMOE_BUILT), so it reruns on src/ changes
 // and skips nvcc when the fatbin is current.
 use std::{env, fs, path::PathBuf, process::Command};
@@ -23,7 +24,7 @@ fn main() {
     }
     let st = Command::new(&nvcc)
         .args(["-fatbin", "-O3", "-std=c++17"])
-        .arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .args(arch.split(',').map(|a| format!("-gencode=arch=compute_{a},code=sm_{a}")))
         .arg("-o")
         .arg(&out)
         .arg(src)
