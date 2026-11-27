@@ -21,6 +21,7 @@ fn run() -> Result<(), String> {
 
     match &args.command {
         Command::Install => cli::install(),
+        Command::About => Ok(print!("{}", cli::ABOUT)),
         Command::Check(a) => cli::check(a),
         Command::Codex(a) => cli::codex(a),
         Command::Claude(a) => cli::claude(a),

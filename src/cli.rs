@@ -33,6 +33,8 @@ pub enum Command {
     Codex(ClientArgs),
     /// Launch Claude Code on the local Messages endpoint
     Claude(ClientArgs),
+    /// List third-party components and their licenses
+    About,
 }
 
 #[derive(Args)]
@@ -245,4 +247,23 @@ fn exec(c: &mut Proc) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let e = c.exec();
     Err(format!("{:?}: {e}", c.get_program()))
+}
+
+/// `eomoe about`: third-party components and their licenses.
+pub const ABOUT: &str = include_str!("about.txt");
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn about_lists_every_dependency() {
+        // Stale after a dependency change? Regenerate: sh tools/gen_about.sh
+        let toml = include_str!("../Cargo.toml");
+        let deps = toml.split("[dependencies]").nth(1).unwrap().split("\n[").next().unwrap();
+        for name in deps.lines().filter_map(|l| l.split_once(" = ")).map(|(n, _)| n.trim()) {
+            assert!(super::ABOUT.lines().any(|l| l.starts_with(&format!("{name} v"))), "{name} missing from src/about.txt");
+        }
+        for c in ["ggml", "Qwen3-Coder", "Apache-2.0"] {
+            assert!(super::ABOUT.contains(c), "{c}");
+        }
+    }
 }

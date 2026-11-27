@@ -124,7 +124,7 @@ A phase is done only when its gate passes against the oracle and the evidence is
 
 ## License and support
 
-eomoe's own source is [MIT licensed](LICENSE). Distributed binaries may also include third-party components, see eomoe --about dialog for component information.
+eomoe's own source is [MIT licensed](LICENSE). Distributed binaries may also include third-party components, run `eomoe about` for the components and their licenses.
 
 MIT already covers commercial use, so building eomoe into a product needs no permission from me. If you want more than the license gives you - support, an integration, or an OEM arrangement - [open an issue](https://github.com/shunte88/eomoe/issues) and say what you need.
 
