@@ -1,6 +1,6 @@
 [package]
 name = "eomoe"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Expert One-Way Context Mixture of Experts LLM"
 authors = ["S. Hunter","Claude Code"]
