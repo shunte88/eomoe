@@ -16,6 +16,11 @@ pub fn model_path() -> String {
     })
 }
 
+/// gpt-oss-20b MXFP4 (ggml-org/gpt-oss-20b-GGUF rev 41e8a94d, sha256 27cd6c43...).
+pub fn gptoss_path() -> String {
+    std::env::var("EOMOE_TEST_GPTOSS").unwrap_or_else(|_| format!("{}/.local/share/eomoe/models/gpt-oss-20b-MXFP4.gguf", std::env::var("HOME").unwrap()))
+}
+
 pub fn golden(name: &str) -> serde_json::Value {
     let p = format!("{}/tests/golden/{name}", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()

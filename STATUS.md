@@ -775,3 +775,17 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   ```
   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.19s
   ```
+
+## Phase 12d: MXFP4 (CPU) and the plan revision for 12c/12d (2026-11-27)
+
+- **Done:** `GgmlType::MXFP4` (ggml type 39; 32-element blocks of 17 bytes) and its CPU dequant.
+  - Q8_0's CPU dequant already existed but had no gate. It is gated now.
+- **Gate:** `tests/phase12_formats.rs` checks rows of gpt-oss-20b against llama.cpp's gguf-py (`tools/capture_dequant.py`, now chosen by architecture → `tests/golden/dequant_gpt-oss.json`). Rows covered: Q8_0 token_embd 0 and 200002, Q8_0 attn_q 0 and 4095, MXFP4 expert rows including the last one. Tolerance: rel 1e-6.
+  - Red first: `blk.0.ffn_down_exps.weight: unsupported ggml type 39`.
+  - Green: `test result: ok. 1 passed`.
+  - A mutation run with the nibble halves swapped went red: `[0]: 0.0078125 vs -0.0234375`.
+  - Phase 2 is unchanged.
+- **Plan revision (flagged):**
+  - **12c (architecture seam):** folded into 13c. One adapter makes a hypothetical seam; the gpt-oss CPU reference is the second adapter, and it shapes the seam.
+  - **CUDA Q8_0 and MXFP4 kernels:** move to 13d. They are gated end to end there, gpt-oss GPU against the CPU reference, the way phase3 gated the Q4_K/Q6_K kernels.
+  - **Q5_K:** dropped until a model file needs it. Neither Qwen3-Coder Q4_K_M nor gpt-oss MXFP4 uses it.

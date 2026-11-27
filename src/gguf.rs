@@ -25,6 +25,7 @@ pub enum GgmlType {
     Q5_K,
     Q6_K,
     BF16,
+    MXFP4,
 }
 
 impl GgmlType {
@@ -37,6 +38,7 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             30 => Self::BF16,
+            39 => Self::MXFP4,
             _ => return None,
         })
     }
@@ -49,6 +51,7 @@ impl GgmlType {
             Self::Q4_K => (256, 144),
             Self::Q5_K => (256, 176),
             Self::Q6_K => (256, 210),
+            Self::MXFP4 => (32, 17),
         }
     }
 }

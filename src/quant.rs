@@ -47,6 +47,18 @@ pub fn dequant_row(ty: GgmlType, x: &[u8], y: &mut [f32]) {
                 }
             }
         }
+        // MXFP4: e8m0 scale byte, then 16 bytes of e2m1 nibbles (low: elements 0..16, high: 16..32).
+        GgmlType::MXFP4 => {
+            const KV: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]; // doubled e2m1
+            for (yb, b) in y.as_chunks_mut::<32>().0.iter_mut().zip(x.as_chunks::<17>().0) {
+                // 2^(e - 128): half the e8m0 scale, since KV is doubled (ggml_e8m0_to_fp32_half).
+                let d = f32::from_bits(if b[0] < 2 { 0x0020_0000 << b[0] } else { (b[0] as u32 - 1) << 23 });
+                for j in 0..16 {
+                    yb[j] = d * KV[(b[1 + j] & 15) as usize] as f32;
+                    yb[j + 16] = d * KV[(b[1 + j] >> 4) as usize] as f32;
+                }
+            }
+        }
         GgmlType::Q4_K => {
             for (yb, b) in y.as_chunks_mut::<QK_K>().0.iter_mut().zip(x.as_chunks::<144>().0) {
                 let (d, min) = (h(b, 0), h(b, 2));
