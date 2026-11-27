@@ -545,6 +545,62 @@ Implementation, in `src/server.rs`:
 - The test server helpers moved to `tests/common`.
 - Regression gates: lib 20/20, phase5, phase8.
 
+## Plan: Phases 12–17, more MoE models (2026-11-27)
+
+**Goal:** eomoe runs four more MoE families alongside Qwen3-Coder-30B, each gated against llama.cpp the way Qwen3 was, and picks up the cheap and medium koboldcpp extras along the way. The order was agreed with the user after the koboldcpp review: gpt-oss-20b first, and Qwen3-Coder-Next in the end game.
+
+**Reference capture (oracle) policy:**
+- **(a)** After the RAM upgrade: GPU llama-server with experts kept in RAM (`-ot exps=CPU`), with the user's OK for each run and free RAM watched.
+- **(b)** Another machine, for small models.
+- Never a CPU-only llama-server (it hard-locked this PC twice).
+- Tokenizer and template goldens come from model-free references (HF `tokenizers`, Python `jinja2`) wherever possible.
+
+**Phase 12: cheap extras and generalization. All gated by the existing Qwen3 gates; no new oracle needed.**
+- **12a `--moeexperts N`:** override the number of active experts.
+  - Gate: the default N is bit-identical to today's goldens.
+  - Smaller N: report tok/s and top-1 agreement with the greedy golden.
+- **12b request limits:** `--max-request-mb`, `--req-timeout`, `--queue-limit`.
+  - Gate: an oversize body gets 413; a timeout ends with a length or timeout finish; queue overflow gets 503 with the server still answering.
+- **12c architecture seam:** `qwen3moe::Weights`/`Hparams` become an architecture description read from GGUF.
+  - It covers attention kind per layer, router kind (softmax top-k, softmax-weight, sigmoid + bias + scale), shared expert, dense leading layers, biases and head size.
+  - Qwen3 is expressed through it. This is a pure refactor: all phase 1–11 gates pass unchanged.
+- **12d weight formats:** Q5_K, Q8_0 and MXFP4.
+  - CPU dequant is ported from ggml-quants.c, with unit tests on hand-built blocks.
+  - CUDA mm/gemm(+ids) kernels are gated against CPU dequant matmul on the GPU.
+
+**Phase 13: gpt-oss-20b** (`ggml-org/gpt-oss-20b-GGUF` MXFP4, 12.1 GB, 21B with 3.6B active).
+- **13a o200k BPE tokenizer** (`gpt-4o` pre). Gate: HF `tokenizers` golden, no model load.
+- **13b Harmony chat template and parser** (analysis/final/commentary channels, tool calls, `reasoning_effort`). Gate: the template golden from jinja2, plus parser unit tests on captured Harmony text.
+- **13c CPU reference forward:**
+  - sliding window of 128 on alternating layers, learned attention sinks, head size 64, QKV/output biases;
+  - clamped SwiGLU, softmax-weight routing over top-4 of 32, YaRN RoPE.
+  - Gate: logits against an oracle capture via (a) or (b).
+- **13d GPU path:** SWA + sinks attention kernels for head size 64, and the MXFP4 expert cache. Gate: oracle greedy match plus speed against llama.cpp on the same box.
+- **13e serving:** API gates with Harmony tools, Claude Code and Codex smoke tests, and a model switch via `--model`. Then eomoe man gets his stripe.
+
+**Phase 14: GLM-4.7-Flash** (deepseek2, 30B with 3B active, 18 GB).
+- MLA (absorbed) attention with a latent KV cache.
+- Sigmoid router with bias and scaling, a shared expert, a dense first layer.
+- glm4 tokenizer and the GLM tool format.
+
+**Phase 15: Qwen3.6-35B-A3B, then Qwen3-Coder-Next** (80B with 3B active, 48.5 GB; needs 64 GB).
+- Gated DeltaNet linear attention with a recurrent state per sequence. This interacts with the paged KV cache, prefix reuse and snapshots.
+- Gated full attention every 4th layer with head size 256, a shared expert with a sigmoid gate, M-RoPE.
+- Tokenizer and tool format are the same family as today.
+
+**Phase 16: gemma-4-26B-A4B.** A dense MLP in parallel with the MoE, interleaved SWA, per-layer KV head counts, head sizes 256 and 512, logit softcap, and its own tokenizer.
+
+**Phase 17 (cross-cutting medium extras):**
+- 8-bit KV cache, gated on quality and long context;
+- thinking controls (`reasoning_effort`, `enable_thinking`, budget), arriving with Phase 13;
+- speculative decoding / MTP, with Phase 15 and measured first, since experts per step grow with MoE;
+- model hot-swap, once two or more models work.
+
+**Rules carried forward:**
+- tdd red-first;
+- code review and clean clippy before any release;
+- `tests/phase11b_kvcache.rs` only after the RAM upgrade and the user's OK.
+
 ## Phase 11 code review fixes, v0.1.3 (2026-11-27)
 
 The two-axis review (Standards and Spec, `aa3b023..HEAD`) ran after v0.1.2 shipped. I fixed:
