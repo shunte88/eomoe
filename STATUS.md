@@ -545,6 +545,44 @@ Implementation, in `src/server.rs`:
 - The test server helpers moved to `tests/common`.
 - Regression gates: lib 20/20, phase5, phase8.
 
+## Phase 11d done: Ollama adapter (2026-11-27)
+
+**Gate:** `tests/phase11d_ollama.rs` `ollama_api_matches_oracle` replays `tests/golden/ollama.json` against `eomoe serve`. The golden was captured by `tools/capture_ollama_golden.py` from Ollama 0.33.1 serving qwen3:0.6b, a 0.5 GB model chosen to stay well clear of the RAM load behind the lockups; it was unloaded afterwards. 22 cases:
+- `/api/chat`: non-streamed, streamed, `num_predict` limit, tools (streamed and not), a tool-result turn, `format: "json"`, `format: <schema>`, empty messages (load).
+- `/api/generate`: non-streamed, streamed, `raw`, `system`, empty prompt (load).
+- Errors: no model, unknown model, malformed JSON.
+- `/api/tags`, `/api/show` (by `model` and by `name`), `/api/ps`, `/api/version`.
+
+Compared per case:
+- status and media type;
+- NDJSON line structure, with every non-final line shaped like the oracle's;
+- key sets at the top level, in `message`, tool call, function, details and model entries;
+- `done`; `done_reason` where the model cannot change it (`length` at `num_predict` 3, `load`);
+- error strings, except Go's JSON parser message.
+
+The oracle model differs from ours, so text is not compared. Instead: tool cases must call `get_weather` with a string `city`, the tool-result turn must use the result, json/schema outputs must parse and validate, and generate's `context` must be token ids.
+
+Result: 22/22. The gate is red-capable: dropping the tool call `id` and renaming `done_reason` "load" each fail it (4 mismatches).
+
+**Real client:** the `ollama` 0.33.1 CLI with `OLLAMA_HOST=127.0.0.1:8093` runs `list`, `ps`, `show local-code` and `run local-code "..."` (plus `--verbose` timings) against eomoe. `show` found a bug: the CLI sends `"model": ""` with `"name"`. The fix is to fall back to `name`, and that case is now in the gate.
+
+Gate revisions, flagged:
+- `GET /` stays eomoe's chat page, not "Ollama is running". `HEAD /`, which the CLI's heartbeat sends, returns 200 either way.
+- `/api/version` reports the Ollama API version matched (0.33.1), not eomoe's.
+- `digest` hashes path, size and mtime, not the file's sha256 (that would be an 18 GB read at startup).
+- `size_vram` is 0, so `ollama ps` shows "100% CPU". Experts live in pinned host RAM; the true split is about 21% GPU.
+- `load_duration` is 0, because the model is always loaded.
+- generate's `context` re-encodes the response text instead of the sampled ids.
+- The template in `show` is the GGUF's Jinja, not a Go template.
+
+Implementation:
+- `src/server/ollama.rs` is a child module of `server.rs`. Requests are converted to the internal chat form and run through the same pipeline as the OpenAI endpoints.
+- `Format` gained `ndjson()` (NDJSON streaming: no SSE keep-alive comments) and `err()` (Ollama's `{"error": "..."}`).
+- `options` maps to: `temperature`, `top_k`, `top_p`, `min_p`, `seed`, `stop`, and `num_predict` (-1 and -2 mean no limit).
+- `format` maps `"json"` to an object, as Ollama's grammar does, and a schema to constrained output (11c).
+- Generate with `suffix` uses the Qwen-coder FIM form. `context` is prepended to the prompt.
+- Regression gates: lib 25/25, and phase 5, 7, 8, 11 and 11c pass.
+
 ## Phase 11c done: constrained JSON output (2026-11-27)
 
 **Gate:** `tests/phase11c_json.rs` `response_format_yields_valid_json`, run on the GPU against `eomoe serve`:

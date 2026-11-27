@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
             let (tok, tpl) = (Tokenizer::from_gguf(&g)?, ChatTemplate::from_gguf(&g)?);
             let (path, ctx, cache, par) = (s.model.clone(), s.ctx_size, s.cache_mib.unwrap_or(usize::MAX >> 20), s.parallel);
             // The engine is built on, and stays on, the server's model thread.
-            let app = server::App::new(tok, tpl, s.alias.clone(), s.cache_ram, move || {
+            let app = server::App::new(tok, tpl, s.alias.clone(), server::ollama::describe(&g, &s.model), s.cache_ram, move || {
                 let mut m = GpuModel::with_cache(Gguf::open(&path)?, ctx, cache)?;
                 m.set_n_seq(par);
                 Ok(m)

@@ -40,6 +40,7 @@ The API is wire-compatible with llama-server (`e6443bd`). The gates in `tests/ph
 | `POST /v1/messages`, `/v1/messages/count_tokens` | Anthropic Messages (Claude Code) |
 | `POST /v1/completions` | OpenAI text completions: raw prompt (string or token ids), streaming |
 | `POST /completion`, `/infill` | llama.cpp native completion and fill-in-the-middle (`input_prefix`, `input_suffix`, `input_extra`), for llama.vim / llama.vscode |
+| `POST /api/chat`, `/api/generate`; `GET /api/tags`, `/api/ps`, `/api/version`; `POST /api/show` | Ollama API, for tools that only speak Ollama (`OLLAMA_HOST=127.0.0.1:8080 ollama run local-code`) |
 | `GET /v1/models`, `/health` | |
 | `GET /` | Minimal web chat page |
 

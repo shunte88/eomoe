@@ -2,7 +2,7 @@
 //! clients use: POST /v1/messages (Anthropic), /v1/responses (OpenAI Responses),
 //! /v1/chat/completions (OpenAI chat), /v1/messages/count_tokens; raw prompts on
 //! /v1/completions (OpenAI text) and /completion, /infill (llama.cpp native, FIM);
-//! GET /v1/models, /health. Event sequences and JSON shapes follow llama-server
+//! GET /v1/models, /health; the Ollama API (/api/chat, /api/generate, ...) in `ollama`. Event sequences and JSON shapes follow llama-server
 //! (tools/server/server-task.cpp); tests/golden/api.json holds captured oracle traffic.
 //!
 //! Every API is converted to OpenAI chat messages, rendered with the GGUF chat template and run
@@ -24,12 +24,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use tokio::sync::mpsc as tmpsc;
 
+pub mod ollama;
+
 pub struct App {
     tok: Tokenizer,
     tpl: ChatTemplate,
     jobs: mpsc::Sender<Request>,
     alias: String,
     n_ctx: usize,
+    /// The model as the Ollama API describes it (`ollama::describe`).
+    ollama: Value,
 }
 
 impl App {
@@ -38,6 +42,7 @@ impl App {
         tok: Tokenizer,
         tpl: ChatTemplate,
         alias: String,
+        ollama: Value,
         ram_cache: usize,
         load: impl FnOnce() -> Result<E, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
@@ -79,7 +84,7 @@ impl App {
             })
             .map_err(|e| e.to_string())?;
         let n_ctx = ready.recv().map_err(|_| "model thread died while loading".to_string())??;
-        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx }))
+        Ok(Arc::new(Self { tok, tpl, jobs, alias, n_ctx, ollama }))
     }
 }
 
@@ -500,6 +505,14 @@ fn sse(data: Value) -> String {
 trait Format: Send + 'static {
     fn on(&mut self, out: &Out) -> Vec<String>;
     fn body(&self) -> Value;
+    /// Streams as NDJSON (Ollama) instead of SSE.
+    fn ndjson(&self) -> bool {
+        false
+    }
+    /// The `error` member of an error body, from llama-server's error object.
+    fn err(&self, e: Value) -> Value {
+        e
+    }
 }
 
 #[derive(Default)]
@@ -908,18 +921,19 @@ impl Format for Native {
 async fn respond(rx: Result<tmpsc::UnboundedReceiver<Out>, ApiError>, mut f: impl Format, stream: bool) -> Response {
     let mut rx = match rx {
         Ok(rx) => rx,
-        Err(e) => return e.into_response(),
+        Err(ApiError(c, e)) => return ApiError(c, f.err(e)).into_response(),
     };
     if !stream {
         while let Some(o) = rx.recv().await {
             if let Out::Error(e) = o {
-                return ApiError(StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                return ApiError(StatusCode::INTERNAL_SERVER_ERROR, f.err(e)).into_response();
             }
             f.on(&o);
         }
         return Json(f.body()).into_response();
     }
     let (tx, srx) = tmpsc::unbounded_channel::<String>();
+    let ndjson = f.ndjson();
     tokio::spawn(async move {
         while let Some(o) = rx.recv().await {
             for e in f.on(&o) {
@@ -930,16 +944,19 @@ async fn respond(rx: Result<tmpsc::UnboundedReceiver<Out>, ApiError>, mut f: imp
         }
     });
     // llama-server sends an SSE comment after 30 s without data, so a long prefill does not trip
-    // client idle timeouts.
-    let body = futures_util::stream::unfold(srx, |mut r| async move {
-        let s = match tokio::time::timeout(std::time::Duration::from_secs(30), r.recv()).await {
-            Ok(s) => s?,
-            Err(_) => ":\n\n".to_owned(),
+    // client idle timeouts. NDJSON has no comments: it just waits.
+    let body = futures_util::stream::unfold(srx, move |mut r| async move {
+        let s = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), r.recv()).await {
+                Ok(s) => break s?,
+                Err(_) if !ndjson => break ":\n\n".to_owned(),
+                Err(_) => {}
+            }
         };
         Some((Ok::<_, std::convert::Infallible>(s), r))
     });
     Response::builder()
-        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CONTENT_TYPE, if ndjson { "application/x-ndjson" } else { "text/event-stream" })
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(body))
         .unwrap()
@@ -1066,6 +1083,12 @@ pub fn router(app: Arc<App>, keys: Vec<String>) -> Router {
         .route("/completion", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, false)))
         .route("/completions", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, false)))
         .route("/infill", post(|State(a): State<Arc<App>>, b: Bytes| native(a, b, true)))
+        .route("/api/chat", post(ollama::chat))
+        .route("/api/generate", post(ollama::generate))
+        .route("/api/tags", get(ollama::tags))
+        .route("/api/show", post(ollama::show))
+        .route("/api/ps", get(ollama::ps))
+        .route("/api/version", get(ollama::version))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found_error", "File Not Found") })
         .with_state(app)
         .layer(axum::middleware::from_fn_with_state(keys, check_key))

@@ -1,0 +1,1300 @@
+{
+ "ollama": "http://127.0.0.1:11434",
+ "model": "qwen3:0.6b",
+ "cases": [
+  {
+   "name": "chat",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Say hello in five words."
+     }
+    ],
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.227914482Z",
+     "message": {
+      "role": "assistant",
+      "content": "Hello! How can I assist you today?"
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 1505004713,
+     "load_duration": 1323829246,
+     "prompt_eval_count": 22,
+     "prompt_eval_duration": 31089000,
+     "eval_count": 10,
+     "eval_duration": 139153000
+    }
+   ]
+  },
+  {
+   "name": "chat_stream",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Say hello in five words."
+     }
+    ],
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/x-ndjson",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.247664146Z",
+     "message": {
+      "role": "assistant",
+      "content": "Hello"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.263044484Z",
+     "message": {
+      "role": "assistant",
+      "content": "!"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.278233484Z",
+     "message": {
+      "role": "assistant",
+      "content": " How"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.293652912Z",
+     "message": {
+      "role": "assistant",
+      "content": " can"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.308895111Z",
+     "message": {
+      "role": "assistant",
+      "content": " I"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.32419699Z",
+     "message": {
+      "role": "assistant",
+      "content": " assist"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.339338621Z",
+     "message": {
+      "role": "assistant",
+      "content": " you"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.354734729Z",
+     "message": {
+      "role": "assistant",
+      "content": " today"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.370053948Z",
+     "message": {
+      "role": "assistant",
+      "content": "?"
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.385467946Z",
+     "message": {
+      "role": "assistant",
+      "content": ""
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 156389673,
+     "load_duration": 1018912,
+     "prompt_eval_count": 22,
+     "prompt_eval_duration": 15699000,
+     "eval_count": 10,
+     "eval_duration": 137763000
+    }
+   ]
+  },
+  {
+   "name": "chat_length",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Say hello in five words."
+     }
+    ],
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 3
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.443192569Z",
+     "message": {
+      "role": "assistant",
+      "content": "Hello! How"
+     },
+     "done": true,
+     "done_reason": "length",
+     "total_duration": 57059149,
+     "load_duration": 9106448,
+     "prompt_eval_count": 22,
+     "prompt_eval_duration": 15581000,
+     "eval_count": 3,
+     "eval_duration": 30623000
+    }
+   ]
+  },
+  {
+   "name": "chat_tools",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris? Use the tool."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 64
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:27.916064248Z",
+     "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_1obanwq1",
+        "function": {
+         "index": 0,
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris"
+         }
+        }
+       }
+      ]
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 472157275,
+     "load_duration": 1560158,
+     "prompt_eval_count": 147,
+     "prompt_eval_duration": 136284000,
+     "eval_count": 20,
+     "eval_duration": 330855000
+    }
+   ]
+  },
+  {
+   "name": "chat_tools_stream",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris? Use the tool."
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 64
+    }
+   },
+   "status": 200,
+   "content_type": "application/x-ndjson",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:28.231133405Z",
+     "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "call_9jhcywm9",
+        "function": {
+         "index": 0,
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris"
+         }
+        }
+       }
+      ]
+     },
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:28.265827281Z",
+     "message": {
+      "role": "assistant",
+      "content": ""
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 349064829,
+     "load_duration": 783584,
+     "prompt_eval_count": 147,
+     "prompt_eval_duration": 17470000,
+     "eval_count": 20,
+     "eval_duration": 328590000
+    }
+   ]
+  },
+  {
+   "name": "chat_tool_result",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "stream": false,
+    "think": false,
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Get the weather for a city",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the weather in Paris? Use the tool."
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "function": {
+         "name": "get_weather",
+         "arguments": {
+          "city": "Paris"
+         }
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "content": "18C and sunny",
+      "tool_name": "get_weather"
+     }
+    ]
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:28.538545023Z",
+     "message": {
+      "role": "assistant",
+      "content": "The weather in Paris is 18C and sunny."
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 272171707,
+     "load_duration": 9141358,
+     "prompt_eval_count": 184,
+     "prompt_eval_duration": 50902000,
+     "eval_count": 13,
+     "eval_duration": 209708000
+    }
+   ]
+  },
+  {
+   "name": "chat_json",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Give a JSON object with a name and an age."
+     }
+    ],
+    "format": "json",
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 64
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:28.87395599Z",
+     "message": {
+      "role": "assistant",
+      "content": "{\n  \"name\": \"Alice\",\n  \"age\": 25\n}"
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 334703952,
+     "load_duration": 782383,
+     "prompt_eval_count": 27,
+     "prompt_eval_duration": 53686000,
+     "eval_count": 18,
+     "eval_duration": 267226999
+    }
+   ]
+  },
+  {
+   "name": "chat_schema",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Invent a person."
+     }
+    ],
+    "format": {
+     "type": "object",
+     "properties": {
+      "name": {
+       "type": "string"
+      },
+      "age": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "name",
+      "age"
+     ]
+    },
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 64
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.191459318Z",
+     "message": {
+      "role": "assistant",
+      "content": "{\"name\": \"Elias Voss\", \"age\": 28}"
+     },
+     "done": true,
+     "done_reason": "stop",
+     "total_duration": 316796964,
+     "load_duration": 622835,
+     "prompt_eval_count": 21,
+     "prompt_eval_duration": 33938000,
+     "eval_count": 17,
+     "eval_duration": 271321000
+    }
+   ]
+  },
+  {
+   "name": "chat_load",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "model": "qwen3:0.6b",
+    "messages": []
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.20122536Z",
+     "message": {
+      "role": "assistant",
+      "content": ""
+     },
+     "done": true,
+     "done_reason": "load"
+    }
+   ]
+  },
+  {
+   "name": "generate",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "qwen3:0.6b",
+    "prompt": "Why is the sky blue?",
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.607954432Z",
+     "response": "The sky appears blue because of the way light interacts with the atmosphere. Here's a simplified explanation:\n\n1. **Water",
+     "done": true,
+     "done_reason": "length",
+     "context": [
+      151644,
+      872,
+      198,
+      10234,
+      374,
+      279,
+      12884,
+      6303,
+      30,
+      608,
+      2152,
+      5854,
+      766,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      785,
+      12884,
+      7952,
+      6303,
+      1576,
+      315,
+      279,
+      1616,
+      3100,
+      83161,
+      448,
+      279,
+      16566,
+      13,
+      5692,
+      594,
+      264,
+      43799,
+      16148,
+      1447,
+      16,
+      13,
+      3070,
+      28253
+     ],
+     "total_duration": 406079427,
+     "load_duration": 624715,
+     "prompt_eval_count": 22,
+     "prompt_eval_duration": 27106000,
+     "eval_count": 24,
+     "eval_duration": 375329000
+    }
+   ]
+  },
+  {
+   "name": "generate_stream",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "qwen3:0.6b",
+    "prompt": "Why is the sky blue?",
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/x-ndjson",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.630551484Z",
+     "response": "The",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.646968724Z",
+     "response": " sky",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.663084516Z",
+     "response": " appears",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.686097404Z",
+     "response": " blue",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.704981885Z",
+     "response": " because",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.722573226Z",
+     "response": " of",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.740054988Z",
+     "response": " the",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.75739105Z",
+     "response": " way",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.775185439Z",
+     "response": " light",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.792617022Z",
+     "response": " interacts",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.810348031Z",
+     "response": " with",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.828293689Z",
+     "response": " the",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.845835981Z",
+     "response": " atmosphere",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.862593848Z",
+     "response": ".",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.879695063Z",
+     "response": " Here",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.896254632Z",
+     "response": "'s",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.912471403Z",
+     "response": " a",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.928605646Z",
+     "response": " simplified",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.945075155Z",
+     "response": " explanation",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.961290547Z",
+     "response": ":\n\n",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.977448039Z",
+     "response": "1",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:29.993568442Z",
+     "response": ".",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.009867023Z",
+     "response": " **",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.028931742Z",
+     "response": "Water",
+     "done": false
+    },
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.029116741Z",
+     "response": "",
+     "done": true,
+     "done_reason": "length",
+     "context": [
+      151644,
+      872,
+      198,
+      10234,
+      374,
+      279,
+      12884,
+      6303,
+      30,
+      608,
+      2152,
+      5854,
+      766,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      785,
+      12884,
+      7952,
+      6303,
+      1576,
+      315,
+      279,
+      1616,
+      3100,
+      83161,
+      448,
+      279,
+      16566,
+      13,
+      5692,
+      594,
+      264,
+      43799,
+      16148,
+      1447,
+      16,
+      13,
+      3070,
+      28253
+     ],
+     "total_duration": 419746610,
+     "load_duration": 603346,
+     "prompt_eval_count": 22,
+     "prompt_eval_duration": 17866000,
+     "eval_count": 24,
+     "eval_duration": 398505000
+    }
+   ]
+  },
+  {
+   "name": "generate_raw",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "qwen3:0.6b",
+    "prompt": "fn main() {",
+    "raw": true,
+    "stream": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.491134885Z",
+     "response": "\n    // This is a simple example of a function that takes a string and returns a string.\n    // The function",
+     "done": true,
+     "done_reason": "length",
+     "total_duration": 460796744,
+     "load_duration": 583845,
+     "prompt_eval_count": 4,
+     "prompt_eval_duration": 19224000,
+     "eval_count": 24,
+     "eval_duration": 431705000
+    }
+   ]
+  },
+  {
+   "name": "generate_system",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "qwen3:0.6b",
+    "prompt": "Hi",
+    "system": "Answer in French.",
+    "stream": false,
+    "think": false,
+    "options": {
+     "temperature": 0,
+     "num_predict": 24
+    }
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.884740471Z",
+     "response": "Bonjour ! Je suis disponible pour r\u00e9pondre \u00e0 vos questions. Veuillez me dire ce que vous avez besoin de faire ou",
+     "done": true,
+     "done_reason": "length",
+     "context": [
+      151644,
+      8948,
+      271,
+      16141,
+      304,
+      8585,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      13048,
+      608,
+      2152,
+      5854,
+      766,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      81581,
+      753,
+      14133,
+      35631,
+      54752,
+      4914,
+      74771,
+      265,
+      3784,
+      25251,
+      4755,
+      13,
+      647,
+      87925,
+      752,
+      13207,
+      3761,
+      1709,
+      9012,
+      46492,
+      62569,
+      409,
+      19463,
+      5908
+     ],
+     "total_duration": 392948981,
+     "load_duration": 669185,
+     "prompt_eval_count": 26,
+     "prompt_eval_duration": 30784000,
+     "eval_count": 24,
+     "eval_duration": 359406000
+    }
+   ]
+  },
+  {
+   "name": "generate_load",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "qwen3:0.6b"
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "model": "qwen3:0.6b",
+     "created_at": "2026-11-27T07:03:30.886666816Z",
+     "response": "",
+     "done": true,
+     "done_reason": "load"
+    }
+   ]
+  },
+  {
+   "name": "err_no_model",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Say hello in five words."
+     }
+    ]
+   },
+   "status": 400,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "error": "model is required"
+    }
+   ]
+  },
+  {
+   "name": "err_unknown_model",
+   "method": "POST",
+   "path": "/api/generate",
+   "body": {
+    "model": "nope",
+    "prompt": "hi"
+   },
+   "status": 404,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "error": "model 'nope' not found"
+    }
+   ]
+  },
+  {
+   "name": "err_bad_json",
+   "method": "POST",
+   "path": "/api/chat",
+   "body": "{bad",
+   "status": 400,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "error": "invalid character 'b' looking for beginning of object key string"
+    }
+   ]
+  },
+  {
+   "name": "tags",
+   "method": "GET",
+   "path": "/api/tags",
+   "body": null,
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "models": [
+      {
+       "name": "qwen3:0.6b",
+       "model": "qwen3:0.6b",
+       "modified_at": "2026-11-27T01:55:36.131189722-05:00",
+       "size": 522653767,
+       "digest": "7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435",
+       "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "qwen3",
+        "families": [
+         "qwen3"
+        ],
+        "parameter_size": "751.63M",
+        "quantization_level": "Q4_K_M",
+        "context_length": 40960,
+        "embedding_length": 1024
+       },
+       "capabilities": [
+        "completion",
+        "tools",
+        "thinking"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "show",
+   "method": "POST",
+   "path": "/api/show",
+   "body": {
+    "model": "qwen3:0.6b"
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "license": "                                 Apache ",
+     "modelfile": "# Modelfile generated by \"ollama show\"\n# To build a new Modelfile based on this, replace FROM with:\n# FROM qwen3:0.6b\n\nFROM /usr/share/ollama/.ollama/models/blobs/sha256-7f4030143c1c477224c5434f8272c662a8b042079a0a584f0a27a1684fe2e1fa\nTEMPLATE \"\"\"\n{{- $lastUserIdx := -1 -}}\n{{- range $idx, $msg := .",
+     "parameters": "repeat_penalty                 1\nstop                           \"<|im_start|>\"\nstop                           \"<|im_end|>\"\ntemperature                    0.6\ntop_k                          20\ntop_p                          0.95",
+     "template": "\n{{- $lastUserIdx := -1 -}}\n{{- range $idx, $msg := .Messages -}}\n{{- if eq $msg.Role \"user\" }}{{ $lastUserIdx = $idx }}{{ end -}}\n{{- end }}\n{{- if or .System .Tools }}<|im_start|>system\n{{ if .Syste",
+     "details": {
+      "parent_model": "",
+      "format": "gguf",
+      "family": "qwen3",
+      "families": [
+       "qwen3"
+      ],
+      "parameter_size": "751.63M",
+      "quantization_level": "Q4_K_M"
+     },
+     "model_info": {
+      "general.architecture": "qwen3",
+      "general.basename": "Qwen3",
+      "general.file_type": 15,
+      "general.license": "apache-2.0",
+      "general.parameter_count": 751632384,
+      "general.quantization_version": 2,
+      "general.size_label": "0.6B",
+      "general.type": "model",
+      "qwen3.attention.head_count": 16,
+      "qwen3.attention.head_count_kv": 8,
+      "qwen3.attention.key_length": 128,
+      "qwen3.attention.layer_norm_rms_epsilon": 1e-06,
+      "qwen3.attention.value_length": 128,
+      "qwen3.block_count": 28,
+      "qwen3.context_length": 40960,
+      "qwen3.embedding_length": 1024,
+      "qwen3.feed_forward_length": 3072,
+      "qwen3.rope.freq_base": 1000000,
+      "tokenizer.ggml.add_bos_token": false,
+      "tokenizer.ggml.bos_token_id": 151643,
+      "tokenizer.ggml.eos_token_id": 151645,
+      "tokenizer.ggml.merges": null,
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.padding_token_id": 151643,
+      "tokenizer.ggml.pre": "qwen2",
+      "tokenizer.ggml.token_type": null,
+      "tokenizer.ggml.tokens": null
+     },
+     "tensors": [
+      {
+       "name": "output.weight",
+       "type": "Q6_K",
+       "shape": [
+        1024,
+        151936
+       ]
+      },
+      {
+       "name": "output_norm.weight",
+       "type": "F32",
+       "shape": [
+        1024
+       ]
+      }
+     ],
+     "capabilities": [
+      "completion",
+      "tools",
+      "thinking"
+     ],
+     "modified_at": "2026-11-27T01:55:36.131189722-05:00"
+    }
+   ]
+  },
+  {
+   "name": "show_by_name",
+   "method": "POST",
+   "path": "/api/show",
+   "body": {
+    "model": "",
+    "name": "qwen3:0.6b"
+   },
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "license": "                                 Apache ",
+     "modelfile": "# Modelfile generated by \"ollama show\"\n# To build a new Modelfile based on this, replace FROM with:\n# FROM qwen3:0.6b\n\nFROM /usr/share/ollama/.ollama/models/blobs/sha256-7f4030143c1c477224c5434f8272c662a8b042079a0a584f0a27a1684fe2e1fa\nTEMPLATE \"\"\"\n{{- $lastUserIdx := -1 -}}\n{{- range $idx, $msg := .",
+     "parameters": "repeat_penalty                 1\nstop                           \"<|im_start|>\"\nstop                           \"<|im_end|>\"\ntemperature                    0.6\ntop_k                          20\ntop_p                          0.95",
+     "template": "\n{{- $lastUserIdx := -1 -}}\n{{- range $idx, $msg := .Messages -}}\n{{- if eq $msg.Role \"user\" }}{{ $lastUserIdx = $idx }}{{ end -}}\n{{- end }}\n{{- if or .System .Tools }}<|im_start|>system\n{{ if .Syste",
+     "details": {
+      "parent_model": "",
+      "format": "gguf",
+      "family": "qwen3",
+      "families": [
+       "qwen3"
+      ],
+      "parameter_size": "751.63M",
+      "quantization_level": "Q4_K_M"
+     },
+     "model_info": {
+      "general.architecture": "qwen3",
+      "general.basename": "Qwen3",
+      "general.file_type": 15,
+      "general.license": "apache-2.0",
+      "general.parameter_count": 751632384,
+      "general.quantization_version": 2,
+      "general.size_label": "0.6B",
+      "general.type": "model",
+      "qwen3.attention.head_count": 16,
+      "qwen3.attention.head_count_kv": 8,
+      "qwen3.attention.key_length": 128,
+      "qwen3.attention.layer_norm_rms_epsilon": 1e-06,
+      "qwen3.attention.value_length": 128,
+      "qwen3.block_count": 28,
+      "qwen3.context_length": 40960,
+      "qwen3.embedding_length": 1024,
+      "qwen3.feed_forward_length": 3072,
+      "qwen3.rope.freq_base": 1000000,
+      "tokenizer.ggml.add_bos_token": false,
+      "tokenizer.ggml.bos_token_id": 151643,
+      "tokenizer.ggml.eos_token_id": 151645,
+      "tokenizer.ggml.merges": null,
+      "tokenizer.ggml.model": "gpt2",
+      "tokenizer.ggml.padding_token_id": 151643,
+      "tokenizer.ggml.pre": "qwen2",
+      "tokenizer.ggml.token_type": null,
+      "tokenizer.ggml.tokens": null
+     },
+     "tensors": [
+      {
+       "name": "output.weight",
+       "type": "Q6_K",
+       "shape": [
+        1024,
+        151936
+       ]
+      },
+      {
+       "name": "output_norm.weight",
+       "type": "F32",
+       "shape": [
+        1024
+       ]
+      }
+     ],
+     "capabilities": [
+      "completion",
+      "tools",
+      "thinking"
+     ],
+     "modified_at": "2026-11-27T01:55:36.131189722-05:00"
+    }
+   ]
+  },
+  {
+   "name": "ps",
+   "method": "GET",
+   "path": "/api/ps",
+   "body": null,
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "models": [
+      {
+       "name": "qwen3:0.6b",
+       "model": "qwen3:0.6b",
+       "size": 1018534295,
+       "digest": "7df6b6e09427a769808717c0a93cadc4ae99ed4eb8bf5ca557c90846becea435",
+       "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "qwen3",
+        "families": [
+         "qwen3"
+        ],
+        "parameter_size": "751.63M",
+        "quantization_level": "Q4_K_M"
+       },
+       "expires_at": "2026-11-27T02:08:30.886732626-05:00",
+       "size_vram": 0,
+       "context_length": 4096
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "name": "version",
+   "method": "GET",
+   "path": "/api/version",
+   "body": null,
+   "status": 200,
+   "content_type": "application/json; charset=utf-8",
+   "lines": [
+    {
+     "version": "0.33.1"
+    }
+   ]
+  },
+  {
+   "name": "root",
+   "method": "GET",
+   "path": "/",
+   "body": null,
+   "status": 200,
+   "content_type": "text/plain; charset=utf-8",
+   "lines": [
+    "Ollama is running"
+   ]
+  }
+ ]
+}
