@@ -3,7 +3,8 @@ name: Release
 # A v* tag builds and publishes: binaries for every CUDA platform and the Docker image, in
 # parallel, both after CI passes. workflow_dispatch is a dry run: it builds everything and
 # publishes nothing (binaries stay as workflow artifacts).
-# macOS is not a target: there is no CUDA on macOS.
+# macOS is not a target: there is no CUDA on macOS. Nor Windows on Arm: NVIDIA ships no CUDA
+# toolkit for it.
 on:
   push:
     tags: ['v*']

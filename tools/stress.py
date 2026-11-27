@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Serving stress for tools/soak.sh: concurrent clients replay the captured oracle request shapes
-(tests/golden/api.json: chat/messages/responses, text and tools, streamed and not) against a
-running `eomoe serve` for N minutes. Fails on any non-200, unreadable or empty response, a failed
-health check, or server RSS growing more than 1 GiB (a leak).
+(tests/golden/api*.json: chat/messages/responses, text and tools, streamed and not) against a
+running `eomoe serve` for N minutes; --golden picks the model's capture (api_glm.json for GLM).
+Fails on any non-200, unreadable or empty response, a failed health check, or server RSS growing more than 1 GiB (a leak).
 
-  python3 -I tools/stress.py --port 8095 --minutes 30 --pid <eomoe pid> [--clients 4]
+  python3 -I tools/stress.py --port 8095 --minutes 30 --pid <eomoe pid> [--clients 4] [--golden api.json]
 """
 import argparse, json, random, threading, time
 from pathlib import Path
@@ -15,9 +15,10 @@ ap.add_argument("--port", type=int, default=8095)
 ap.add_argument("--minutes", type=float, default=30)
 ap.add_argument("--pid", type=int, required=True)
 ap.add_argument("--clients", type=int, default=4)
+ap.add_argument("--golden", default="api.json")
 a = ap.parse_args()
 BASE = f"http://127.0.0.1:{a.port}"
-CASES = [(c["path"], c["request"]) for c in json.load(open(Path(__file__).resolve().parent.parent / "tests/golden/api.json"))["cases"].values()]
+CASES = [(c["path"], c["request"]) for c in json.load(open(Path(__file__).resolve().parent.parent / "tests/golden" / a.golden))["cases"].values()]
 end = time.time() + a.minutes * 60
 lock, stats, errors, lat = threading.Lock(), {"ok": 0}, [], []
 

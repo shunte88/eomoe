@@ -1027,3 +1027,48 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   - Claude Code with the **stock tool set** and a relative path (`-p "calc.py … bug in add …" --allowedTools "Read,Edit"`): fixed `a - b` → `a + b`, then DONE, in 5m34s. 4 requests at 18.8–20.2K prompt tokens, decode about 20 tok/s. The time is almost all the first prefill: 147.7 s for 18.8K (127 tok/s).
   - Codex `exec --sandbox workspace-write`: fixed `mul`, then DONE, in 35 s. 8 requests at 2.4–3.3K prompt tokens, prefill 417 tok/s, decode 23–26 tok/s.
 - **Not done (ponytail):** long-context prefill. `attention_mla` is CUDA-core and goes 417 tok/s at 2.4K but 127 tok/s at 19K, so the next GLM speed win is a tensor-core MLA tile (as `attention_tc` did for Qwen). No grammar-constrained GLM tool calls (greedy output matched without them).
+
+## Post-14: CI, release, soak (2026-11-27)
+
+- **`ci.yml`** (push to main, PRs, and called by release): runs in the nvidia/cuda 13.3.1 devel container on a hosted runner. Steps: `cargo clippy --all-targets -D warnings`, then `cargo test --release`. The model and GPU gates are `#[ignore]`, so hosted CI runs only the model-free tests.
+- **`release.yml`** (tag `v*`; `workflow_dispatch` is a dry run that publishes nothing):
+  - After CI passes, two jobs run in parallel.
+  - **Binaries:**
+    - Targets: linux x86_64, linux aarch64 (native arm runner), windows x86_64.
+    - Kernels: `EOMOE_CUDA_ARCH=80,86,89,90,100,120`, a fatbin for every sm_80+ GPU (the mma.m16n8k16 kernels need sm_80).
+    - Windows needs two workarounds. Git Bash's `link` hides MSVC's `link.exe`. VS 18's STL wants CUDA 13.4, which has no release, so the build passes `-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`; the kernels use no STL.
+    - Not built: macOS (no CUDA) and Windows-on-Arm (no NVIDIA toolkit).
+  - **Image:**
+    - amd64 and arm64 are built on native runners.
+    - Each image is verified with `./eomoe --version` before it is pushed to GHCR as `:TAG-arch`.
+    - The manifest job then creates `:TAG` and `:latest`.
+  - Release: SHA256SUMS plus generated notes. A tag containing `-` makes a prerelease.
+- **`soak.yml`** (Sunday 07:00 UTC, which is 02:00 EST and 03:00 during EDT; or manual):
+  - Runs on the self-hosted runner `media2026-eomoe` (label `eomoe-gpu`, a user systemd service with linger). Fork PRs never reach it: there is no PR trigger, there is a repo guard, and every outside contributor needs approval.
+  - `tools/soak.sh`:
+    - Refuses to start if eomoe or llama-server is already running.
+    - Every test binary runs fenced (MemoryMax 26G, no swap) with `--include-ignored`. Anything matching `*11b*` is skipped by name (the user's rule).
+    - Then runs `tools/stress.py` for each model: Qwen3-Coder, gpt-oss and GLM, each replaying its own oracle capture.
+    - stress.py runs 4 concurrent clients, half of them streamed, checks health every 30 s, and fails on any error or on RSS growth over 1 GiB.
+- **Verified:**
+  - CI and the release dry run are all green: run 46078768547, all three binaries and both images.
+  - The CI-built linux binary links only libc/libm/libgcc.
+  - A local multi-arch build passed the phase5 `api_matches_oracle` GPU gate.
+  - Stress: 2 min on Qwen, 116 requests, 0 errors, RSS −215 MiB.
+- **Speed vs llama.cpp (measured from the oracle golden timings on this box, same models; not gated):**
+
+  | Model | eomoe decode | llama.cpp decode |
+  |---|---|---|
+  | gpt-oss | 25 tok/s | 20.2 tok/s |
+  | GLM | 23–26 tok/s | 22.0 tok/s |
+
+  The oracle prefill timings cannot be compared, because those prompts were tiny.
+- **Review debt** (code review since e74857c, judgement calls, none of them bugs):
+  - The glm.rs and gptoss.rs CPU-reference loaders are deliberately independent of `qwen3moe::Weights::load`. Each one is the plain reference its gate checks, so sharing a loader would couple three oracles.
+  - Smells left as they are:
+    - The architecture is carried as `oai: bool` plus `glm: Option`, which repeats the switch.
+    - Three layers sit between the splitter and the server: Splitter, GlmSplit, Split.
+    - The `(golden, TIE, FLOOR)` gate tuple is a data clump.
+    - `set_n_expert_used` re-reads the GGUF.
+
+    Refactor these when a fourth architecture lands (Phase 15).

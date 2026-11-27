@@ -2,7 +2,7 @@
 # Weekly GPU soak on media2026 (.github/workflows/soak.yml, or by hand): every long-form gate,
 # then a serving stress run. Each step is memory-fenced so an overrun kills the step, not the box.
 # NEVER runs tests/phase11b_kvcache.rs: it hard-locked this machine twice.
-# Env: STRESS_MINUTES (30), SOAK_OUT (soak-logs), EOMOE_TEST_* model overrides (tests/common).
+# Env: STRESS_MINUTES (30, per model), SOAK_OUT (soak-logs), EOMOE_TEST_* model overrides (tests/common).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT=${SOAK_OUT:-soak-logs}
@@ -29,16 +29,23 @@ for t in tests/*.rs; do
     gate "$n" --test "$n"
 done
 
-echo "== stress (${STRESS_MINUTES:-30} min)"
-fence target/release/eomoe serve --port 8095 >"$OUT/stress-server.log" 2>&1 &
-for _ in $(seq 180); do curl -sf localhost:8095/health >/dev/null && break; sleep 2; done
-if python3 -I tools/stress.py --port 8095 --minutes "${STRESS_MINUTES:-30}" --pid "$(pgrep -x eomoe)" >"$OUT/stress.log" 2>&1; then
-    tail -5 "$OUT/stress.log"
-else
-    fails+=(stress); tail -30 "$OUT/stress.log"
-fi
-pkill -x eomoe
-for _ in $(seq 60); do pgrep -x eomoe >/dev/null || break; sleep 1; done
+# Serving stress per model, replaying that model's oracle request capture.
+M=$HOME/.local/share/eomoe/models
+stress() {
+    echo "== stress $1 (${STRESS_MINUTES:-30} min)"
+    fence target/release/eomoe serve --port 8095 ${3:+--model "$3"} >"$OUT/stress-$1-server.log" 2>&1 &
+    for _ in $(seq 180); do curl -sf localhost:8095/health >/dev/null && break; sleep 2; done
+    if python3 -I tools/stress.py --port 8095 --minutes "${STRESS_MINUTES:-30}" --pid "$(pgrep -x eomoe)" --golden "$2" >"$OUT/stress-$1.log" 2>&1; then
+        tail -1 "$OUT/stress-$1.log"
+    else
+        fails+=("stress-$1"); tail -30 "$OUT/stress-$1.log"
+    fi
+    pkill -x eomoe
+    for _ in $(seq 60); do pgrep -x eomoe >/dev/null || break; sleep 1; done
+}
+stress qwen3-coder api.json
+stress gpt-oss api_gpt-oss.json "${EOMOE_TEST_GPTOSS:-$M/gpt-oss-20b-MXFP4.gguf}"
+stress glm api_glm.json "${EOMOE_TEST_GLM:-$M/GLM-4.7-Flash-Q4_K.gguf}"
 
 if [ ${#fails[@]} -gt 0 ]; then echo "::error::soak failures: ${fails[*]}"; exit 1; fi
 echo "soak: all green"

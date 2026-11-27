@@ -67,7 +67,7 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 | `--port` | `PORT` | 8080 |
 | `--ctx-size` | `CTX_SIZE` | 32768 |
 | `--cache-mib` | `MOE_CACHE_MIB` | all free VRAM |
-| `--moeexperts` | `MOE_EXPERTS` | the model's (8): fewer experts per token is faster at some quality cost; 4 decodes ~1.6x faster and keeps 80% of greedy choices |
+| `--moeexperts` | `MOE_EXPERTS` | the model's (Qwen3-Coder 8, gpt-oss and GLM 4): fewer experts per token is faster at some quality cost (Qwen3-Coder at 4: ~1.6x decode, 80% of greedy choices kept, one gate run) |
 | `--parallel` | `PARALLEL` | 4 (requests served at once; they share the KV pool, 1..=16) |
 | `--queue-limit` | `QUEUE_LIMIT` | no limit (requests that may wait beyond `--parallel`; more get 503 "server busy") |
 | `--req-timeout` | `REQ_TIMEOUT` | no limit (seconds per request, queueing included; then generation stops with finish reason `length`) |
