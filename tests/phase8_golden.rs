@@ -45,7 +45,7 @@ fn http(port: u16, method: &str, path: &str, headers: &serde_json::Map<String, s
 fn api_key_matches_oracle() {
     let g = Gguf::open(model_path()).unwrap();
     let (tok, tpl) = (Tokenizer::from_gguf(&g).unwrap(), ChatTemplate::from_gguf(&g).unwrap());
-    let app = server::App::new(tok, tpl, "local-code".into(), || Ok(Stub)).unwrap();
+    let app = server::App::new(tok, tpl, "local-code".into(), 0, || Ok(Stub)).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let keys = vec!["k1".to_string(), "k2".to_string()];

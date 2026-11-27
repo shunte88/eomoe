@@ -12,12 +12,14 @@ pub struct Sampling {
     pub top_p: f32,
     pub min_p: f32,
     pub seed: u64,
+    /// Constrain the output to JSON matching this schema (`{}`: any JSON); see `constrain`.
+    pub schema: Option<serde_json::Value>,
 }
 
 impl Default for Sampling {
     /// llama.cpp's defaults (common/common.h).
     fn default() -> Self {
-        Self { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05, seed: 0x5eed }
+        Self { temperature: 0.8, top_k: 40, top_p: 0.95, min_p: 0.05, seed: 0x5eed, schema: None }
     }
 }
 
@@ -56,6 +58,8 @@ struct Job {
     n_out: usize,
     /// Sampled, emitted, not yet in the KV cache.
     pending: Option<u32>,
+    /// Output bytes so far, for a schema-constrained request.
+    text: Vec<u8>,
     rng: u64,
 }
 
@@ -80,12 +84,23 @@ pub struct Batcher<E: Engine> {
     slots: Vec<Slot>,
     queue: std::collections::VecDeque<Request>,
     tick: u64,
+    /// Host-RAM prompt cache limit in bytes (llama-server --cache-ram); 0: off.
+    pub ram_cache: usize,
+    /// Each token's bytes, for `Request::schema`.
+    pub token_bytes: Vec<Vec<u8>>,
+    snaps: std::collections::VecDeque<Snap>,
+}
+
+/// A displaced sequence's KV, kept in host RAM until a prompt that shares its prefix returns.
+struct Snap {
+    tokens: Vec<u32>,
+    kv: Vec<u8>,
 }
 
 impl<E: Engine> Batcher<E> {
     pub fn new(engine: E, eog: Vec<u32>) -> Self {
         let slots = (0..engine.n_seq()).map(|_| Slot::default()).collect();
-        Self { engine, eog, slots, queue: Default::default(), tick: 0 }
+        Self { engine, eog, slots, queue: Default::default(), tick: 0, ram_cache: 0, token_bytes: vec![], snaps: Default::default() }
     }
 
     pub fn submit(&mut self, r: Request) {
@@ -118,6 +133,7 @@ impl<E: Engine> Batcher<E> {
                 .map(|(i, s)| (i, reuse(s)))
                 .max_by_key(|&(i, n)| (n, std::cmp::Reverse(self.slots[i].last_used)))
                 .unwrap();
+            let n = self.ram_swap(si, &req.prompt).unwrap_or(n);
             self.tick += 1;
             let slot = &mut self.slots[si];
             slot.last_used = self.tick;
@@ -126,7 +142,7 @@ impl<E: Engine> Batcher<E> {
             self.engine.truncate(n);
             if (req.sink)(Event::Started { n_cached: n }) {
                 let rng = req.sampling.seed;
-                slot.job = Some(Job { req, order: self.tick, n_out: 0, pending: None, rng });
+                slot.job = Some(Job { req, order: self.tick, n_out: 0, pending: None, text: vec![], rng });
             }
         }
     }
@@ -188,7 +204,15 @@ impl<E: Engine> Batcher<E> {
         if job.n_out >= job.req.max_tokens {
             return self.finish(si, Finish::Length);
         }
+        if let Some(sch) = &job.req.sampling.schema {
+            if !allow_json(logits, sch, &job.text, &self.token_bytes, &self.eog) {
+                return self.finish(si, Finish::Stop); // no token can continue the JSON
+            }
+        }
         let t = sample(logits, &job.req.sampling, &mut job.rng);
+        if job.req.sampling.schema.is_some() && !self.eog.contains(&t) {
+            job.text.extend_from_slice(&self.token_bytes[t as usize]);
+        }
         if self.eog.contains(&t) {
             return self.finish(si, Finish::Stop);
         }
@@ -209,6 +233,68 @@ impl<E: Engine> Batcher<E> {
         }
     }
 
+    /// llama-server's prompt cache (server-slot-sched.cpp): before `prompt` replaces most of the
+    /// slot's tokens, or when a saved prompt beats them, save the slot to host RAM and load the best
+    /// saved prompt: one keeping >= 1/4 of itself and more of both itself and the new prompt than the
+    /// slot does. Returns the positions the slot now reuses, if it changed.
+    fn ram_swap(&mut self, si: usize, prompt: &[u32]) -> Option<usize> {
+        if self.ram_cache == 0 {
+            return None;
+        }
+        let lcp = |a: &[u32]| a.iter().zip(prompt).take_while(|(x, y)| x == y).count();
+        let better = |snaps: &std::collections::VecDeque<Snap>, cached: &[u32]| {
+            let n = lcp(cached);
+            let mut best = (if cached.is_empty() { -1.0 } else { n as f32 / cached.len() as f32 }, n as f32 / prompt.len() as f32, None);
+            for (i, s) in snaps.iter().enumerate() {
+                let n = lcp(&s.tokens);
+                let (keep, sim) = (n as f32 / s.tokens.len() as f32, n as f32 / prompt.len() as f32);
+                if keep >= 0.25 && best.0 < keep && best.1 < sim {
+                    best = (keep, sim, Some((i, n)));
+                }
+            }
+            best.2
+        };
+        let cached = &self.slots[si].cached;
+        let keep = if cached.is_empty() { 0.0 } else { lcp(cached) as f32 / cached.len() as f32 };
+        if keep >= 0.5 && better(&self.snaps, cached).is_none() {
+            return None;
+        }
+        self.engine.select(si);
+        self.ram_save(si);
+        let (i, n) = better(&self.snaps, &self.slots[si].cached)?;
+        let n = n.min(prompt.len() - 1);
+        self.slots[si].cached.clear();
+        self.engine.truncate(0);
+        // Out first: making room may save other slots, which reorders the cache.
+        let s = self.snaps.remove(i).unwrap();
+        if !self.reserve(si, n) {
+            self.snaps.push_back(s);
+            return Some(0);
+        }
+        self.engine.select(si);
+        self.engine.kv_restore(&s.kv, n);
+        self.slots[si].cached = s.tokens[..n].to_vec();
+        Some(n)
+    }
+
+    /// Save the selected sequence `si` to the RAM cache (llama-server's prompt_cache.alloc).
+    fn ram_save(&mut self, si: usize) {
+        let tokens = &self.slots[si].cached;
+        let lcp = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        if self.ram_cache == 0 || tokens.is_empty() || self.snaps.iter().any(|s| lcp(&s.tokens, tokens) == tokens.len()) {
+            return;
+        }
+        let kv = self.engine.kv_save();
+        if kv.is_empty() || kv.len() > self.ram_cache {
+            return;
+        }
+        self.snaps.retain(|s| lcp(&s.tokens, tokens) < s.tokens.len());
+        while self.snaps.iter().map(|s| s.kv.len()).sum::<usize>() + kv.len() > self.ram_cache {
+            self.snaps.pop_front();
+        }
+        self.snaps.push_back(Snap { tokens: tokens.clone(), kv });
+    }
+
     /// Make room for sequence `si` to hold `len` positions, evicting idle caches LRU.
     fn reserve(&mut self, si: usize, len: usize) -> bool {
         let page = self.engine.kv_page();
@@ -225,11 +311,38 @@ impl<E: Engine> Batcher<E> {
             else {
                 return false;
             };
-            self.slots[v].cached.clear();
             self.engine.select(v);
+            self.ram_save(v);
+            self.slots[v].cached.clear();
             self.engine.truncate(0);
         }
     }
+}
+
+/// Mask `logits` to the best-scoring tokens (up to 64) that keep `text` a valid prefix of JSON
+/// matching `schema`; once the JSON is complete only end-of-generation tokens remain. False if
+/// nothing is allowed.
+/// ponytail: sorts the whole vocab per token (~ms at 151K); a top-k partial sort if it shows up.
+fn allow_json(logits: &mut [f32], schema: &serde_json::Value, text: &[u8], bytes: &[Vec<u8>], eog: &[u32]) -> bool {
+    use crate::constrain::{check, State};
+    let done = check(schema, text) == State::Done;
+    // A top-level number is never Done (more digits may follow) but may end here.
+    let can_end = done || check(schema, &[text, b" "].concat()) == State::Done;
+    let ok = |t: usize| {
+        if eog.contains(&(t as u32)) {
+            return can_end;
+        }
+        let b = bytes.get(t).map_or(&[][..], |b| b);
+        !done && !b.is_empty() && check(schema, &[text, b].concat()) != State::Invalid
+    };
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let keep: Vec<(usize, f32)> = idx.into_iter().filter(|&t| ok(t)).take(64).map(|t| (t, logits[t])).collect();
+    logits.fill(f32::NEG_INFINITY);
+    for &(t, l) in &keep {
+        logits[t] = l;
+    }
+    !keep.is_empty()
 }
 
 /// xorshift64*: uniform in [0, 1).
@@ -314,6 +427,7 @@ impl Utf8Stream {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
 
     /// Emits logits favouring (last input token + 1) % 8. Up to `n_seq` sequences share a pool of
@@ -356,6 +470,13 @@ mod tests {
             assert!(pages <= 4, "KV pool overflow: {:?}", self.n_past);
             self.computed[self.cur].extend_from_slice(t);
             t.iter().flat_map(|&x| (0..8).map(move |i| if i == (x + 1) % 8 { 1.0 } else { 0.0 })).collect()
+        }
+        fn kv_save(&mut self) -> Vec<u8> {
+            vec![1; self.n_past[self.cur]]
+        }
+        fn kv_restore(&mut self, data: &[u8], n: usize) {
+            assert!(self.n_past[self.cur] == 0 && n <= data.len());
+            self.n_past[self.cur] = n;
         }
         fn decode_batch(&mut self, rows: &[(usize, u32)]) -> Vec<f32> {
             self.batches.push(rows.len());
@@ -468,8 +589,48 @@ mod tests {
     }
 
     #[test]
+    fn displaced_prompt_comes_back_from_the_ram_cache() {
+        let a = [1, 2, 3, 4, 5];
+        let a2 = [1, 2, 3, 4, 5, 6];
+        for (limit, want) in [(1 << 20, 5), (0, 0)] {
+            let mut b = Batcher::new(fake(1), vec![]);
+            b.ram_cache = limit;
+            run_all(&mut b, vec![req(&a, 1)]);
+            run_all(&mut b, vec![req(&[0, 0, 0], 1)]); // displaces A from the only slot
+            b.engine.computed[0].clear();
+            assert_eq!(run_all(&mut b, vec![req(&a2, 1)])[0].2, Some(want), "limit {limit}");
+            assert_eq!(b.engine.computed[0].len(), a2.len() - want, "only the uncached suffix is computed");
+        }
+        // B was saved when A2 displaced it; it is restored the same way.
+        let mut b = Batcher::new(fake(1), vec![]);
+        b.ram_cache = 1 << 20;
+        run_all(&mut b, vec![req(&[0, 0, 0], 1)]);
+        run_all(&mut b, vec![req(&a, 1)]);
+        assert_eq!(run_all(&mut b, vec![req(&[0, 0, 0], 1)])[0].2, Some(2));
+    }
+
+    #[test]
+    fn schema_constrains_output_to_complete_json() {
+        let bytes: Vec<Vec<u8>> = ["{", "\"a\"", ":", "1", "}", "x", ",", ""].iter().map(|t| t.as_bytes().to_vec()).collect();
+        let mut b = Batcher::new(fake(1), vec![7]);
+        b.token_bytes = bytes.clone();
+        // Unconstrained, the fake ends at once (token 7 is EOG).
+        assert_eq!(run_all(&mut b, vec![req(&[6], 30)])[0].0, Vec::<u32>::new());
+        for schema in [json!({}), json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]})] {
+            // The fake's favourite after 4 is "x": masked, it must start the JSON instead.
+            let (mut r, seen) = req(&[4], 40);
+            r.sampling.schema = Some(schema.clone());
+            let got = run_all(&mut b, vec![(r, seen)]).remove(0);
+            let text: Vec<u8> = got.0.iter().flat_map(|&t| bytes[t as usize].clone()).collect();
+            let done = crate::constrain::check(&schema, &[&text[..], b" "].concat());
+            assert_eq!((done, got.1), (crate::constrain::State::Done, Some(Finish::Stop)), "{schema} -> {:?}", String::from_utf8_lossy(&text));
+            println!("{schema} -> {}", String::from_utf8_lossy(&text));
+        }
+    }
+
+    #[test]
     fn sampling_respects_filters() {
-        let s = Sampling { temperature: 1.0, top_k: 2, top_p: 1.0, min_p: 0.0, seed: 1 };
+        let s = Sampling { temperature: 1.0, top_k: 2, top_p: 1.0, min_p: 0.0, seed: 1, schema: None };
         let mut rng = 1;
         for _ in 0..200 {
             let t = sample(&mut [5.0, 0.0, 4.9, 4.8], &s, &mut rng);

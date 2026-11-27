@@ -38,6 +38,7 @@ impl App {
         tok: Tokenizer,
         tpl: ChatTemplate,
         alias: String,
+        ram_cache: usize,
         load: impl FnOnce() -> Result<E, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
         // llama.cpp's EOG set for the Qwen vocab: EOS/EOT plus the FIM end tokens.
@@ -46,13 +47,18 @@ impl App {
         let (jobs, rx) = mpsc::channel::<Request>();
         let (ready_tx, ready) = mpsc::channel();
         let eog_t = eog;
+        // For constrained output; control tokens never appear inside JSON.
+        let token_bytes: Vec<Vec<u8>> = (0..tok.n_vocab() as u32).map(|t| if tok.is_control(t) { vec![] } else { tok.decode_bytes(&[t]) }).collect();
         std::thread::Builder::new()
             .name("eomoe-model".into())
             .spawn(move || {
                 let mut b = match load() {
                     Ok(e) => {
                         ready_tx.send(Ok(e.n_ctx())).ok();
-                        Batcher::new(e, eog_t)
+                        let mut b = Batcher::new(e, eog_t);
+                        b.ram_cache = ram_cache;
+                        b.token_bytes = token_bytes;
+                        b
                     }
                     Err(e) => return drop(ready_tx.send(Err(e))),
                 };
@@ -303,7 +309,20 @@ fn sampling(body: &Value) -> Sampling {
         min_p: f("min_p", d.min_p).clamp(0.0, 1.0),
         top_k: body["top_k"].as_u64().map_or(d.top_k, |k| k as usize),
         seed: body["seed"].as_u64().unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 | 1),
+        schema: schema(body),
     }
+}
+
+/// The JSON schema a request constrains its output to: OpenAI `response_format` (json_object,
+/// json_schema), Responses `text.format`, or llama.cpp's native `json_schema`. `{}`: any JSON.
+fn schema(body: &Value) -> Option<Value> {
+    let rf = if body["response_format"].is_object() { &body["response_format"] } else { &body["text"]["format"] };
+    let s = match rf["type"].as_str() {
+        Some("json_object") => rf.get("schema").cloned().unwrap_or(json!({})),
+        Some("json_schema") => rf["json_schema"].get("schema").or(rf.get("schema")).cloned().unwrap_or(json!({})),
+        _ => body.get("json_schema").filter(|s| s.is_object()).cloned()?,
+    };
+    Some(s)
 }
 
 fn text_of(v: &Value) -> String {

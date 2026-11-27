@@ -938,6 +938,36 @@ impl Engine for GpuModel {
         KV_PAGE
     }
 
+    /// The sequence's pages of every layer's K and V, page-major per (layer, K|V).
+    fn kv_save(&mut self) -> Vec<u8> {
+        let pages = self.seqs[self.cur].pages.clone();
+        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
+        let pb = KV_PAGE * kvd * H;
+        self.stream.synchronize().expect("sync");
+        let mut out = vec![0u8; nl * 2 * pages.len() * pb];
+        for (i, dst) in out.chunks_mut(pb).enumerate() {
+            let src = self.kv + ((i / pages.len()) * self.n_ctx * kvd * H + pages[i % pages.len()] as usize * pb) as u64;
+            unsafe { result::memcpy_dtoh_sync(dst, src) }.expect("kv dtoh");
+        }
+        out
+    }
+
+    fn kv_restore(&mut self, data: &[u8], n: usize) {
+        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
+        let pb = KV_PAGE * kvd * H;
+        let np_img = data.len() / (nl * 2 * pb);
+        assert!(self.seqs[self.cur].n_past == 0 && n <= np_img * KV_PAGE, "kv_restore into a used sequence or past the image");
+        self.grow(self.cur, n);
+        let pages = self.seqs[self.cur].pages.clone();
+        for lh in 0..nl * 2 {
+            for (j, &p) in pages.iter().enumerate() {
+                let dst = self.kv + (lh * self.n_ctx * kvd * H + p as usize * pb) as u64;
+                self.htod(dst, &data[(lh * np_img + j) * pb..][..pb]);
+            }
+        }
+        self.seqs[self.cur].n_past = n;
+    }
+
     fn select(&mut self, seq: usize) {
         assert!(seq < self.seqs.len());
         self.cur = seq;

@@ -35,6 +35,14 @@ pub trait Engine {
         }
         out
     }
+    /// Copy of the selected sequence's whole KV cache, for `kv_restore`. Empty: unsupported.
+    fn kv_save(&mut self) -> Vec<u8> {
+        vec![]
+    }
+    /// Load the first `n` positions of a `kv_save` image into the selected, empty sequence.
+    fn kv_restore(&mut self, _data: &[u8], _n: usize) {
+        unimplemented!("kv_restore without kv_save")
+    }
     fn forward(&mut self, tokens: &[u32]) -> Vec<f32>;
     /// Logits of the last token only: prefill without T x n_vocab logits.
     fn forward_last(&mut self, tokens: &[u32]) -> Vec<f32> {

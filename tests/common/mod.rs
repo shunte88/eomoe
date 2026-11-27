@@ -109,8 +109,14 @@ impl Drop for Server {
 
 /// `eomoe serve` on `port`, returned once it is listening; killed on drop.
 pub fn start(port: u16) -> Server {
+    start_with(port, &[])
+}
+
+/// `eomoe serve` on `port` with extra flags.
+pub fn start_with(port: u16, extra: &[&str]) -> Server {
     let mut c = Command::new(env!("CARGO_BIN_EXE_eomoe"))
         .args(["serve", "--port", &port.to_string()])
+        .args(extra)
         .env("RUST_LOG", "info")
         .stderr(Stdio::piped())
         .spawn()

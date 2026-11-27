@@ -11,7 +11,7 @@ const MODEL_URL: &str = "https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Inst
 const MODEL_SHA256: &str = "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad";
 
 #[derive(Parser)]
-#[clap(name = "eomoe", version, about = "Local MoE LLM server for Claude Code and Codex")]
+#[clap(name = "eomoe", version = concat!("v", env!("CARGO_PKG_VERSION"), " built ", env!("EOMOE_BUILT")), about = "Local MoE LLM server for Claude Code and Codex")]
 pub struct CliArgs {
     /// YAML configuration file (CLI flags and env vars override its values)
     #[clap(long, env = "EOMOE_CONFIG_PATH", global = true)]
@@ -55,6 +55,9 @@ pub struct ServeArgs {
     /// Requests served at once; they share the context's KV pool [config: server.parallel, default: 4]
     #[clap(long, env = "PARALLEL")]
     pub parallel: Option<usize>,
+    /// Host-RAM prompt cache in MiB: displaced prompts' KV, restored when they return; 0 off, -1 no limit [config: server.cache_ram, default: 8192]
+    #[clap(long, env = "LLAMA_ARG_CACHE_RAM", allow_hyphen_values = true)]
+    pub cache_ram: Option<i64>,
     /// Model name served to clients [config: server.alias, default: local-code]
     #[clap(long)]
     pub alias: Option<String>,

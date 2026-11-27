@@ -26,7 +26,7 @@ fn run() -> Result<(), String> {
         Command::Claude(a) => cli::claude(a),
         Command::Serve(a) => {
             let s = config.resolve_serve(a)?;
-            log::info!("model={} ctx={} cache={:?} MiB parallel={} api_keys={} https={}", s.model.display(), s.ctx_size, s.cache_mib, s.parallel, s.api_keys.len(), s.tls.is_some());
+            log::info!("model={} ctx={} cache={:?} MiB parallel={} cache_ram={}MiB api_keys={} https={}", s.model.display(), s.ctx_size, s.cache_mib, s.parallel, s.cache_ram >> 20, s.api_keys.len(), s.tls.is_some());
             if !(1..=eomoe::gpu::MAX_SEQ).contains(&s.parallel) {
                 return Err(format!("--parallel must be 1..={}", eomoe::gpu::MAX_SEQ));
             }
@@ -34,7 +34,7 @@ fn run() -> Result<(), String> {
             let (tok, tpl) = (Tokenizer::from_gguf(&g)?, ChatTemplate::from_gguf(&g)?);
             let (path, ctx, cache, par) = (s.model.clone(), s.ctx_size, s.cache_mib.unwrap_or(usize::MAX >> 20), s.parallel);
             // The engine is built on, and stays on, the server's model thread.
-            let app = server::App::new(tok, tpl, s.alias.clone(), move || {
+            let app = server::App::new(tok, tpl, s.alias.clone(), s.cache_ram, move || {
                 let mut m = GpuModel::with_cache(Gguf::open(&path)?, ctx, cache)?;
                 m.set_n_seq(par);
                 Ok(m)

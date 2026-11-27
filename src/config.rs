@@ -32,6 +32,7 @@ pub struct ServerSection {
     pub port: Option<u16>,
     pub alias: Option<String>,
     pub parallel: Option<usize>,
+    pub cache_ram: Option<i64>,
     pub api_key: Option<String>,
     pub api_key_file: Option<PathBuf>,
     pub ssl_key_file: Option<PathBuf>,
@@ -55,6 +56,8 @@ pub struct ServeSettings {
     pub port: u16,
     pub alias: String,
     pub parallel: usize,
+    /// Host-RAM prompt cache in bytes; 0 off.
+    pub cache_ram: usize,
     /// Empty: no auth.
     pub api_keys: Vec<String>,
     /// (key, cert): serve HTTPS.
@@ -88,6 +91,10 @@ impl EomoeConfig {
             port: cli.port.or(s.port).unwrap_or(8080),
             alias: cli.alias.clone().or_else(|| s.alias.clone()).unwrap_or_else(|| "local-code".into()),
             parallel: cli.parallel.or(s.parallel).unwrap_or(4),
+            cache_ram: match cli.cache_ram.or(s.cache_ram).unwrap_or(0) { // off until the 11b GPU gate runs (llama-server: 8192)
+                n if n < 0 => usize::MAX,
+                n => (n as usize) << 20,
+            },
             api_keys,
             tls,
         })
@@ -101,7 +108,7 @@ mod tests {
     #[test]
     fn cli_overrides_config_overrides_defaults() {
         let cfg: EomoeConfig = serde_yaml::from_str("model:\n  path: /cfg/model.gguf\n  cache_mib: 2000\nserver:\n  host: 0.0.0.0\n  port: 9000\n").unwrap();
-        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, parallel: None, alias: None, api_key: None, api_key_file: None, ssl_key_file: None, ssl_cert_file: None };
+        let cli = ServeArgs { model: None, host: None, port: Some(7000), ctx_size: None, cache_mib: None, parallel: None, cache_ram: None, alias: None, api_key: None, api_key_file: None, ssl_key_file: None, ssl_cert_file: None };
         let s = cfg.resolve_serve(&cli).unwrap();
         assert_eq!(s.model, PathBuf::from("/cfg/model.gguf")); // config
         assert_eq!(s.cache_mib, Some(2000)); // config
@@ -116,7 +123,7 @@ mod tests {
     fn api_keys_from_flag_and_file() {
         let f = std::env::temp_dir().join(format!("eomoe-keys-{}", std::process::id()));
         std::fs::write(&f, "# team keys\nk3\n\nk4\n").unwrap();
-        let cli = ServeArgs { model: None, host: None, port: None, ctx_size: None, cache_mib: None, parallel: None, alias: None, api_key: Some("k1,,k2".into()), api_key_file: Some(f.clone()), ssl_key_file: None, ssl_cert_file: Some("c.pem".into()) };
+        let cli = ServeArgs { model: None, host: None, port: None, ctx_size: None, cache_mib: None, parallel: None, cache_ram: None, alias: None, api_key: Some("k1,,k2".into()), api_key_file: Some(f.clone()), ssl_key_file: None, ssl_cert_file: Some("c.pem".into()) };
         let cfg = EomoeConfig::default();
         assert!(cfg.resolve_serve(&cli).is_err(), "cert without key");
         let cli = ServeArgs { ssl_cert_file: None, ..cli };

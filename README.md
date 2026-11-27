@@ -1,4 +1,8 @@
-# eomoe
+<p align="center">
+  <img src="assets/eomoe.webp" alt="eomoe man, the everyman MoE superhero" width="320"/>
+</p>
+
+# eomoe - everyman's own MoE: a 30B coding model on an 8 GB GPU, faster than llama.cpp
 
 A single-binary Rust server that runs Qwen3-Coder-30B-A3B (Q4_K_M GGUF, a 30B mixture-of-experts model) on one 8 GB GPU. It speaks the same HTTP APIs as llama-server, so Claude Code, Codex and OpenAI clients work unchanged.
 
@@ -114,3 +118,18 @@ cargo test --release --test phase6_golden -- --ignored --nocapture --test-thread
 ```
 
 A phase is done only when its gate passes against the oracle and the evidence is in `STATUS.md`. The golden files come from the reference llama.cpp build via `tools/capture_*.py`. Requirements: Rust, the CUDA toolkit (`nvcc`; set `NVCC` to override its path), and an sm_120 GPU with 8 GB of VRAM. For other GPUs, set `EOMOE_CUDA_ARCH` (e.g. `89`).
+
+## License and support
+
+eomoe's own source is [MIT licensed](LICENSE). Distributed binaries may also include third-party components, see eomoe --about dialog for component information.
+
+MIT already covers commercial use, so building eomoe into a product needs no permission from me. If you want more than the license gives you - support, an integration, or an OEM arrangement - [open an issue](https://github.com/shunte88/eomoe/issues) and say what you need.
+
+
+If eomoe helps power your projects, a link back is appreciated:
+
+> Built on [eomoe - everyman's own MoE](https://github.com/shunte88/eomoe), © 2026 Stue Hunter. MIT licensed.
+
+Bug reports, hardware test results, and useful pull requests are welcome. You can also [buy 
+me a coffee](https://www.buymeacoffee.com/shunte88) or browse [Team Badger merchandise](https://www.zazzle.com/team_badger_t_shirt-235604841593837420).
+

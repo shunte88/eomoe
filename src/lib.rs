@@ -6,6 +6,7 @@
 pub mod expert_cache;
 pub mod cli;
 pub mod config;
+pub mod constrain;
 pub mod cpu;
 pub mod cpu_moe;
 pub mod generate;
