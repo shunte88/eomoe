@@ -6,11 +6,14 @@
 //! (b) Chat template: the GGUF's template renders as Python jinja2 configured like HF transformers
 //!     (tests/golden/template_qwen35moe.json, tools/capture_template_jinja.py); its transformers-only
 //!     `{% generation %}` tag is a no-op, as in llama.cpp.
+//! (c) CPU reference forward vs llama.cpp's greedy oracle (tests/golden/greedy_qwen36.json), within
+//!     llama.cpp's own `-fa off` backend floor (gate revision: QWEN36_TIE/QWEN36_FLOOR_MEAN).
 //! `cargo test --release --test phase15_qwen36 -- --include-ignored --nocapture --test-threads=1`
 
 mod common;
 use common::{golden, qwen36_path};
-use eomoe::{gguf::Gguf, template::ChatTemplate, tokenizer::Tokenizer};
+use eomoe::{gguf::Gguf, qwen35, qwen3moe::Engine, template::ChatTemplate, tokenizer::Tokenizer};
+use serde_json::json;
 
 #[test]
 #[ignore = "needs the Qwen3.6-35B-A3B model file"]
@@ -40,4 +43,54 @@ fn template_matches_jinja() {
             None => assert!(got.is_err(), "template error {} expected, got {got:?}", case["error"]),
         }
     }
+}
+
+/// Greedy chat answers through the real tokenizer + template (thinking off): a short question and
+/// a fact stated ~250 tokens before the question.
+fn answers(m: &mut impl Engine) {
+    let g = Gguf::open(qwen36_path()).unwrap();
+    let (tok, tpl) = (Tokenizer::from_gguf(&g).unwrap(), ChatTemplate::from_gguf(&g).unwrap());
+    let filler = "The weather that spring was mild, with long grey mornings that burned off into bright afternoons. \
+        Farmers in the valley planted barley and beans, and the river ran high with snowmelt from the hills. \
+        In the town, the bakery opened an hour earlier than usual, and the library extended its hours on Thursdays. \
+        Children walked to school along the canal path, counting herons and arguing about football. \
+        By May the orchards were in blossom and the market square filled with stalls selling cheese, honey and wool.";
+    let cases = [
+        ("What is the capital of France? Answer in one word.".to_string(), "Paris"),
+        (format!("Remember this: the vault code is 4817. {filler} {filler}\n\nWhat is the vault code?"), "4817"),
+    ];
+    let eog = ["<|im_end|>", "<|endoftext|>"].map(|s| tok.token_id(s).unwrap());
+    for (q, want) in cases {
+        let req = json!({"messages": [{"role": "user", "content": q}], "chat_template_kwargs": {"enable_thinking": false}});
+        let ids = tok.encode(&tpl.render(&req).unwrap(), true);
+        m.reset();
+        let mut logits = m.forward_last(&ids);
+        let mut out = vec![];
+        for _ in 0..32 {
+            let t = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+            if eog.contains(&t) {
+                break;
+            }
+            out.push(t);
+            logits = m.forward_last(&[t]);
+        }
+        let text = tok.decode(&out);
+        println!("{} prompt tokens -> {text:?}", ids.len());
+        assert!(text.contains(want), "expected {want:?} in {text:?}");
+    }
+}
+
+/// (c) coherence through the real tokenizer + template.
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file (CPU, minutes)"]
+fn cpu_reference_answers() {
+    answers(&mut qwen35::CpuModel::new(Gguf::open(qwen36_path()).unwrap()).unwrap());
+}
+
+/// (c) gate: teacher-forced vs llama.cpp greedy_qwen36.json, within llama.cpp's own floor.
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file (CPU, minutes)"]
+fn cpu_reference_matches_oracle() {
+    let mut m = qwen35::CpuModel::new(Gguf::open(qwen36_path()).unwrap()).unwrap();
+    common::greedy_floor_gate(&mut m, "greedy_qwen36.json", common::QWEN36_TIE, common::QWEN36_FLOOR_MEAN);
 }

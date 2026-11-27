@@ -1087,3 +1087,39 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   - Gate `template_matches_jinja`: 10 cases from jinja2 (`tools/capture_template_jinja.py`) → tests/golden/template_qwen35moe.json.
   - Without the rewrite the template fails to parse (red). Deleting the tags instead of mapping them is an equivalent mutant on this template (all of them sit between `{%-` blocks), so it is not counted.
   - Regression: phase1, phase13 and phase14 tokenizer and template gates, lib 33. Clippy is clean.
+
+### Phase 15c: Qwen3.6-35B-A3B CPU reference (2026-11-27), gated
+
+- **src/qwen35.rs `CpuModel`:** follows llama.cpp src/models/qwen35moe.cpp and the CPU `gated_delta_net` op.
+  - **Gated DeltaNet (30 layers):**
+    - `attn_qkv`, then a causal depthwise conv (kernel 4, over 3 cached raw rows), then SiLU.
+    - q and k: 16 heads × 128, L2-normed (`x / sqrt(Σx² + eps)`). v: 32 heads × 128.
+    - v head h reads k head `h % 16` (tiled, as in the op's `iv1 % neq1`).
+    - Per-head state S, 128×128, stored transposed as in ggml: S *= exp(g); S += k ⊗ β(v − Sᵀk); out = Sᵀq/√128.
+    - g = softplus(alpha + dt_bias) · ssm_a, and β = sigmoid(beta).
+    - Then rmsnorm(out, ssm_norm) · silu(z) per head, and `ssm_out`.
+  - **Gated attention (10 layers):**
+    - `attn_q` gives [q | gate] per head (256 each), with q/k RMS norms.
+    - NEOX rope on the first 64 dims. IMRoPE with equal text positions reduces to this. Base 1e7.
+    - GQA 16/2. The output is multiplied by sigmoid(gate). KV is rounded to f16.
+  - **FFN:** softmax top-8 of 256, normalised (`qwen3moe::route`), plus a shared expert × sigmoid(`ffn_gate_inp_shexp`·x).
+  - **Recurrent state limit:** `truncate` can only keep everything or reset; rewinding needs state checkpoints (15e).
+- **GATE REVISION (flagged):** `QWEN36_TIE = 0.1` and `QWEN36_FLOOR_MEAN = 0.1453` (tests/common/mod.rs).
+  - Measured as for GLM, from the fenced oracle runs recorded in 15a/b's capture: control replay 0/109 flips with mean 0.0576; `-fa off` floor 0/109 flips with mean 0.1453.
+  - Golden: tests/golden/greedy_qwen36.json, 5 cases and 109 steps (Paris, linked list, 240-token vault-code recall, fib, 312-token raw filler).
+- **Gate `phase15_qwen36::cpu_reference_matches_oracle`:** PASS. 0/109 top-1 failures; mean |dlogprob| 0.1336, under the 0.1453 floor; max 1.17.
+  - `cpu_reference_answers` also passes: "Paris", and "The vault code is **4817**." from a 240-token prompt.
+- **Gate fix:** `greedy_floor_gate` now fails on a NaN mean. `NaN > floor` was false, so a NaN slipped through. Found by the L2-norm mutation below, which went red only through its top-1 failures.
+- **Mutations, all red:**
+
+  | Mutation | Top-1 failures | Mean \|dlogprob\| |
+  |---|---|---|
+  | k head `h / 2` (repeat) instead of `h % 16` (tiled) | 103 | 5.23 |
+  | No state decay exp(g) | 59 | 4.54 |
+  | No silu(z) output gate | 109 | 9.47 |
+  | No shared-expert sigmoid gate | 108 | 6.23 |
+  | No attention sigmoid(gate) | 109 | 10.59 |
+  | No L2 norm on q/k | 100 | NaN |
+  | No rope on k | 1 | 0.51 |
+
+- Phase 15 suite: 4/4 pass (tokenizer, template, answers, oracle). Clippy is clean.

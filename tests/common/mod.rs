@@ -50,6 +50,11 @@ pub const GPTOSS_FLOOR_MEAN: f64 = 0.2588;
 pub const GLM_TIE: f32 = 0.1;
 pub const GLM_FLOOR_MEAN: f64 = 0.1795;
 
+/// Qwen3.6-35B-A3B (tests/golden/greedy_qwen36.json, 109 steps): llama.cpp's control replay gives
+/// 0/109 flips, mean 0.0576; its `-fa off` backend floor 0/109 flips, mean |dlogprob| 0.1453.
+pub const QWEN36_TIE: f32 = 0.1;
+pub const QWEN36_FLOOR_MEAN: f64 = 0.1453;
+
 fn log_softmax(l: &[f32]) -> Vec<f32> {
     let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let lse = m + l.iter().map(|x| ((x - m) as f64).exp()).sum::<f64>().ln() as f32;
@@ -114,7 +119,7 @@ pub fn greedy_floor_gate(m: &mut impl Engine, file: &str, tie: f32, floor: f64) 
         "top1 fails {}/{steps}, mean |dlogprob| {mean:.4} (floor {floor}), max {worst:.4}, top5 set differs on {top5_diff} steps",
         failures.len()
     );
-    if mean > floor {
+    if mean.is_nan() || mean > floor {
         failures.push(format!("mean |dlogprob| {mean:.4} > llama.cpp backend floor {floor}"));
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));

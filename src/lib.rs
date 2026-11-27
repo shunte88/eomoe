@@ -16,6 +16,7 @@ pub mod glm;
 pub mod gptoss;
 pub mod harmony;
 pub mod quant;
+pub mod qwen35;
 pub mod qwen3moe;
 pub mod server;
 pub mod template;
