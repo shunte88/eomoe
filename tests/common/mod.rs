@@ -41,6 +41,10 @@ pub const FLOOR_MEAN: f64 = 0.2414;
 /// mean |dlogprob| 0.2588. gpt-oss's flatter distributions make near-ties wider than qwen's.
 pub const GPTOSS_TIE: f32 = 0.4;
 pub const GPTOSS_FLOOR_MEAN: f64 = 0.2588;
+/// GLM-4.7-Flash: same measurement vs greedy_glm.json (2026-11-27): top-1 flips at a golden
+/// margin of 0.061 (1/102), mean |dlogprob| 0.1795.
+pub const GLM_TIE: f32 = 0.1;
+pub const GLM_FLOOR_MEAN: f64 = 0.1795;
 
 fn log_softmax(l: &[f32]) -> Vec<f32> {
     let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

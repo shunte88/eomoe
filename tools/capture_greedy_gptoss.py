@@ -3,7 +3,7 @@
 running llama-server (GPU, experts on CPU), into tests/golden/greedy_gpt-oss.json.
 
   llama-server -m gpt-oss-20b-MXFP4.gguf -ngl 99 -ot exps=CPU -c 4096 --port 8099 --jinja
-  python3 -I tools/capture_greedy_gptoss.py [base_url]
+  python3 -I tools/capture_greedy_gptoss.py [base_url] [name]   (name: gpt-oss, or glm -> greedy_glm.json)
 
 Chat prompts go through the server's own template; two are longer than the 128-token window.
 """
@@ -13,7 +13,8 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8099"
-OUT = Path(__file__).resolve().parent.parent / "tests" / "golden" / "greedy_gpt-oss.json"
+NAME = sys.argv[2] if len(sys.argv) > 2 else "gpt-oss"
+OUT = Path(__file__).resolve().parent.parent / "tests" / "golden" / f"greedy_{NAME}.json"
 
 FILLER = ("The weather that spring was mild, with long grey mornings that burned off into bright afternoons. "
           "Farmers in the valley planted barley and beans, and the river ran high with snowmelt from the hills. "
@@ -35,7 +36,9 @@ def post(path, body):
 
 
 def main():
-    prompts = [post("/apply-template", {"messages": [{"role": "user", "content": c}]})["prompt"] for c in CHATS] + RAW
+    # GLM: thinking off, so the 32 tokens are answer text.
+    kw = {"chat_template_kwargs": {"enable_thinking": False}} if NAME == "glm" else {}
+    prompts = [post("/apply-template", {"messages": [{"role": "user", "content": c}], **kw})["prompt"] for c in CHATS] + RAW
     out = []
     for p in prompts:
         toks = post("/tokenize", {"content": p, "add_special": False, "parse_special": True})["tokens"]

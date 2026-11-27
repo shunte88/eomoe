@@ -4,7 +4,7 @@ against a llama-server in a different backend configuration and compare it with 
 same way tests/common::greedy_floor_gate compares eomoe (top-1 vs oracle, mean |dlogprob| over the
 oracle's top 5).
 
-  python3 -I tools/capture_floor_gptoss.py [base_url]
+  python3 -I tools/capture_floor_gptoss.py [base_url] [name]   (name: gpt-oss or glm)
 """
 import json
 import sys
@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8099"
-GOLDEN = Path(__file__).resolve().parent.parent / "tests" / "golden" / "greedy_gpt-oss.json"
+GOLDEN = Path(__file__).resolve().parent.parent / "tests" / "golden" / f"greedy_{sys.argv[2] if len(sys.argv) > 2 else 'gpt-oss'}.json"
 
 
 def post(path, body):

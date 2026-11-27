@@ -12,6 +12,7 @@ pub mod cpu_moe;
 pub mod generate;
 pub mod gguf;
 pub mod gpu;
+pub mod glm;
 pub mod gptoss;
 pub mod harmony;
 pub mod quant;

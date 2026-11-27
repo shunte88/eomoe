@@ -944,3 +944,27 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   - Gate: `phase14_glm::template_matches_jinja` vs jinja2 (tests/golden/template_deepseek2.json, 10 cases): tools, tool calls and results, `reasoning_content`, inline `<think>` in content, and `enable_thinking: false`.
   - Mutations: strip, split and the kwargs passthrough are red. rstrip and lstrip survive, because this template always `.strip()`s afterwards, so they cannot show in its output.
   - The qwen3 and gpt-oss tokenizer and template gates still pass, and clippy is clean.
+
+### Phase 14c: GLM-4.7-Flash CPU reference (2026-11-27), gated
+
+- **src/glm.rs `CpuModel`:** follows llama.cpp src/models/deepseek2.cpp.
+  - MLA is absorbed: the per-position cache row is `[norm(kv_a[..512]) | rope(kv_a[512..])]`, 576 floats rounded to f16. q_nope is absorbed through `attn_k_b`, and the output comes back through `attn_v_b`.
+  - RoPE is NORM (adjacent pairs) with base 1e6. kq_scale is 1/sqrt(256).
+  - Layer 0 is a dense SwiGLU. The other layers use 64 routed experts with a sigmoid gate: the top 4 are chosen on sigmoid + exp_probs_b, and the plain sigmoids are renormalised ×1.8. A shared expert is added on top.
+  - It refuses any shape it was not built for (gating func other than sigmoid, expert groups, YaRN).
+- **Oracle:** the user OK'd two fenced llama-server runs (`-ngl 99 -ot exps=CPU`, MemoryMax 18G).
+  - Run 1 captured tests/golden/greedy_glm.json with tools/capture_greedy_gptoss.py (generalised with a name argument). Chat cases use `enable_thinking: false`.
+  - Its control replay gave 0/102 top-1 flips and mean |dlogprob| 0.0934.
+  - Run 2 replayed with `-fa off` to measure llama.cpp's own floor: 1/102 top-1 flips at a golden margin of 0.061, mean 0.1795.
+- **GATE REVISION (flagged):** GLM gets its own `GLM_TIE = 0.1` and `GLM_FLOOR_MEAN = 0.1795` (tests/common/mod.rs), measured as for gpt-oss.
+- **Gate `phase14_glm::cpu_reference_matches_oracle`:** PASS. 0/102 top-1 failures; mean |dlogprob| 0.1177, under the 0.1795 floor; max 1.45.
+  - `cpu_reference_answers` also passes: "Paris", and "4817" from a 231-token prompt.
+- **Mutations, all red:**
+
+  | Mutation | Top-1 failures | Mean \|dlogprob\| |
+  |---|---|---|
+  | No exp_probs_b in selection | 3 | 0.33 |
+  | No ×1.8 scale | 20 | 1.75 |
+  | No kv_a_norm | 95 | 7.66 |
+  | kq_scale 1/sqrt(576) | 10 | 0.86 |
+  | NEOX rope | 53 | 2.81 |
