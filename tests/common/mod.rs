@@ -27,11 +27,16 @@ pub fn golden(name: &str) -> serde_json::Value {
 }
 
 /// Near-tie: oracle top-1/top-2 gap below this exempts the top-1 check.
-const TIE: f32 = 0.05;
+pub const TIE: f32 = 0.05;
 /// llama.cpp's own CPU backend vs its CUDA greedy.json: mean |dlogprob| over the oracle's
 /// top-5 (tools/measure_backend_floor.py, 2026-11-25). Activation quantization (Q8_K/q8_1)
 /// makes a tighter per-token tolerance unreachable even for llama.cpp across backends.
-const FLOOR_MEAN: f64 = 0.2414;
+pub const FLOOR_MEAN: f64 = 0.2414;
+/// gpt-oss-20b: llama.cpp with flash attention off, teacher-forced, vs its own greedy_gpt-oss.json
+/// (tools/capture_floor_gptoss.py, 2026-11-27): top-1 flips at golden margins up to 0.375 (4/160),
+/// mean |dlogprob| 0.2588. gpt-oss's flatter distributions make near-ties wider than qwen's.
+pub const GPTOSS_TIE: f32 = 0.4;
+pub const GPTOSS_FLOOR_MEAN: f64 = 0.2588;
 
 fn log_softmax(l: &[f32]) -> Vec<f32> {
     let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -42,10 +47,10 @@ fn log_softmax(l: &[f32]) -> Vec<f32> {
 /// Teacher-forced: feed prompt + the oracle's own greedy tokens in one pass and compare
 /// every step with the oracle (so one divergence can't derail the rest).
 /// Gate: top-1 equal on every non-tie step; mean |dlogprob| <= llama.cpp's backend floor.
-pub fn greedy_floor_gate(m: &mut impl Engine) {
+pub fn greedy_floor_gate(m: &mut impl Engine, file: &str, tie: f32, floor: f64) {
     let mut failures = vec![];
     let (mut worst, mut dsum, mut dn, mut top5_diff, mut steps) = (0f32, 0f64, 0u32, 0u32, 0u32);
-    for (ci, case) in golden("greedy.json").as_array().unwrap().iter().enumerate() {
+    for (ci, case) in golden(file).as_array().unwrap().iter().enumerate() {
         let prompt: Vec<u32> = serde_json::from_value(case["prompt_tokens"].clone()).unwrap();
         let gen: Vec<u32> = serde_json::from_value(case["tokens"].clone()).unwrap();
         let mut seq = prompt.clone();
@@ -71,7 +76,7 @@ pub fn greedy_floor_gate(m: &mut impl Engine) {
             ours.sort_by(|a, b| lp[*b as usize].total_cmp(&lp[*a as usize]));
 
             steps += 1;
-            if ours[0] != top[0].0 && top[0].1 - top[1].1 >= TIE {
+            if ours[0] != top[0].0 && top[0].1 - top[1].1 >= tie {
                 failures.push(format!("case {ci} step {k}: top1 {} vs oracle {}", ours[0], top[0].0));
             }
             for &(id, olp) in &top {
@@ -94,11 +99,11 @@ pub fn greedy_floor_gate(m: &mut impl Engine) {
     }
     let mean = dsum / dn as f64;
     println!(
-        "top1 fails {}/{steps}, mean |dlogprob| {mean:.4} (floor {FLOOR_MEAN}), max {worst:.4}, top5 set differs on {top5_diff} steps",
+        "top1 fails {}/{steps}, mean |dlogprob| {mean:.4} (floor {floor}), max {worst:.4}, top5 set differs on {top5_diff} steps",
         failures.len()
     );
-    if mean > FLOOR_MEAN {
-        failures.push(format!("mean |dlogprob| {mean:.4} > llama.cpp backend floor {FLOOR_MEAN}"));
+    if mean > floor {
+        failures.push(format!("mean |dlogprob| {mean:.4} > llama.cpp backend floor {floor}"));
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }

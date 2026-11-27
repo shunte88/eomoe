@@ -818,7 +818,7 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - Phase 1 and phase 11 are unchanged.
 - **Note (flagged):** phase1 case 5 has an integer `default` on an enum parameter, and the gpt-oss template itself fails on it (`str + int`), in jinja2 as in HF transformers. The golden records the error, and eomoe must fail too. Serving will report such a request as a template error.
 
-## Phase 13c: gpt-oss CPU reference forward (2026-11-27). PROVISIONAL, oracle gate pending
+## Phase 13c: gpt-oss CPU reference forward (2026-11-27). Oracle-verified (see the update at the end)
 
 - **What changed:** `src/gptoss.rs`, a separate module (qwen3moe code untouched), mirrors llama.cpp `openai-moe.cpp`:
   - biases on q/k/v/o, on the router and on every expert matrix; no QK-norm;
@@ -839,3 +839,26 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
     - Plain SwiGLU: red (garbage).
     - **No YaRN mscale: still green.** The gate is too coarse for small numeric errors.
 - **Still to do:** the real gate is the llama.cpp greedy oracle (`tools/capture_greedy_gptoss.py` → `tests/golden/greedy_gpt-oss.json`, GPU llama-server with `-ot exps=CPU`). It needs the user's OK to run. Until then 13c is not done.
+
+### Phase 13c update: oracle gate green (2026-11-27)
+
+- **Oracle:** `tools/capture_greedy_gptoss.py` → `tests/golden/greedy_gpt-oss.json`.
+  - Setup: llama-server on the GPU with `-ot exps=CPU`, fenced in `systemd-run --scope -p MemoryMax=18G -p MemorySwapMax=0`. 25 GB stayed free.
+  - Prompts: 3 Harmony chats (one of 286 tokens) and 2 raw texts (one of 303 tokens), 32 greedy tokens each with top-5 logprobs.
+- **Gate:** `cpu_reference_matches_oracle`, the shared `greedy_floor_gate` (teacher-forced).
+  - First run with the qwen tolerances: 4/160 top-1 misses, all where the oracle's top-1/top-2 margin is ≤ 0.375. Mean 0.2342, under the 0.2414 floor; max 5.57.
+- **Diagnosis:**
+  - Emulating llama.cpp's q8_1 activation quantization barely moved the numbers (0.224). Rejected.
+  - One-at-a-time sweep against the oracle; every structural change fits worse:
+    - no YaRN mscale: 0.489, 8 misses;
+    - no YaRN frequency blend: 0.374, 9 misses;
+    - SWA on odd layers: 2.09, 57 misses;
+    - no truncate: 0.228; f32 KV: 0.235. Both are noise.
+- **llama.cpp's own floor on gpt-oss** (`tools/capture_floor_gptoss.py`, fenced, the golden replayed teacher-forced):
+  - Control, same config: 0/160 top-1, mean 0.0734.
+  - `-fa off`: **4/160 top-1, mean 0.2588, max 5.46.** The flips are at golden margins up to 0.375. Three of the four are the steps eomoe flips.
+- **GATE REVISION (flagged):** `greedy_floor_gate(m, file, tie, floor)`.
+  - gpt-oss uses its own measured floor: tie 0.4 (from 0.375) and mean 0.2588. qwen keeps 0.05 and 0.2414.
+  - Revised gate: `top1 fails 0/160, mean |dlogprob| 0.2342 (floor 0.2588)`, `test result: ok. 4 passed` (phase13 total).
+  - It stays red-capable: the no-mscale and no-YaRN-frequency variants exceed the floor.
+- **Regressions:** phase2 still `ok. 2 passed` with the new signature. Clippy clean.

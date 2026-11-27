@@ -26,5 +26,5 @@ fn dequant_matches_gguf_py() {
 #[ignore = "needs model file"]
 fn forward_matches_oracle_greedy() {
     let mut m = eomoe::cpu::CpuModel::new(Gguf::open(model_path()).unwrap()).unwrap();
-    common::greedy_floor_gate(&mut m);
+    common::greedy_floor_gate(&mut m, "greedy.json", common::TIE, common::FLOOR_MEAN);
 }

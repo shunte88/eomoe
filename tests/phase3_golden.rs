@@ -62,7 +62,7 @@ fn gpu_matches_cpu_reference() {
 #[test]
 #[ignore = "needs model file + GPU"]
 fn gpu_forward_matches_oracle_greedy() {
-    common::greedy_floor_gate(&mut gpu());
+    common::greedy_floor_gate(&mut gpu(), "greedy.json", common::TIE, common::FLOOR_MEAN);
 }
 
 /// Incremental decode through the KV cache: prefill the prompt, then one token per call.

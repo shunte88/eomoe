@@ -81,3 +81,12 @@ fn cpu_reference_answers() {
         assert!(text.contains(want), "expected {want:?} in {text:?}");
     }
 }
+
+/// (c) proper: teacher-forced CPU logits vs the llama.cpp greedy oracle (tools/capture_greedy_gptoss.py),
+/// same floor gate as phase 2 with gpt-oss's own measured llama.cpp floor (GPTOSS_TIE / GPTOSS_FLOOR_MEAN).
+#[test]
+#[ignore = "needs the gpt-oss-20b model file (CPU, minutes)"]
+fn cpu_reference_matches_oracle() {
+    let mut m = gptoss::CpuModel::new(Gguf::open(gptoss_path()).unwrap()).unwrap();
+    common::greedy_floor_gate(&mut m, "greedy_gpt-oss.json", common::GPTOSS_TIE, common::GPTOSS_FLOOR_MEAN);
+}
