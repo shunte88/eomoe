@@ -29,14 +29,33 @@ impl ChatTemplate {
             out.write_str(&py_str(v)).map_err(|_| Error::new(ErrorKind::WriteFailure, "write failed"))
         });
         env.add_filter("string", |v: Value| py_str(&v));
-        env.add_filter("tojson", |v: Value| Value::from_safe_string(to_json(&v)));
+        // ponytail: ensure_ascii (GLM passes False, the output we already make) is read and ignored.
+        env.add_filter("tojson", |v: Value, kw: minijinja::value::Kwargs| -> Result<Value, Error> {
+            let _: Option<bool> = kw.get("ensure_ascii")?;
+            kw.assert_all_used()?;
+            Ok(Value::from_safe_string(to_json(&v)))
+        });
         env.add_function("strftime_now", |f: String| strftime_now(&f));
-        // Python's dict.items() (gpt-oss's template); other unknown methods stay errors.
+        // Python's dict.items() (gpt-oss) and str strip/lstrip/rstrip/split (GLM); other unknown
+        // methods stay errors.
         env.set_unknown_method_callback(|_state, v, method, args| match (method, v.kind(), args) {
             ("items", ValueKind::Map, []) => {
                 let pairs: Result<Vec<Value>, Error> = v.try_iter()?.map(|k| Ok(Value::from(vec![k.clone(), v.get_item(&k)?]))).collect();
                 Ok(Value::from(pairs?))
             }
+            ("strip" | "lstrip" | "rstrip", ValueKind::String, [] | [_]) => {
+                let (s, chars) = (v.as_str().unwrap_or(""), args.first().and_then(|c| c.as_str()));
+                let p = |c: char| chars.map_or(c.is_whitespace(), |cs| cs.contains(c));
+                Ok(Value::from(match method {
+                    "strip" => s.trim_matches(p),
+                    "lstrip" => s.trim_start_matches(p),
+                    _ => s.trim_end_matches(p),
+                }))
+            }
+            ("split", ValueKind::String, [sep]) if sep.as_str().is_some_and(|x| !x.is_empty()) => {
+                Ok(Value::from(v.as_str().unwrap_or("").split(sep.as_str().unwrap()).map(Value::from).collect::<Vec<_>>()))
+            }
+            ("split", ValueKind::String, []) => Ok(Value::from(v.as_str().unwrap_or("").split_whitespace().map(Value::from).collect::<Vec<_>>())),
             _ => Err(Error::new(ErrorKind::UnknownMethod, format!("{} has no method named {method}", v.kind()))),
         });
         env.add_function("raise_exception", |m: String| -> Result<String, Error> { Err(Error::new(ErrorKind::InvalidOperation, m)) });
@@ -68,6 +87,10 @@ impl ChatTemplate {
         });
         if let Some(tools) = req.get("tools").filter(|t| !t.is_null()) {
             ctx["tools"] = tools.clone();
+        }
+        // llama-server's chat_template_kwargs (e.g. GLM's enable_thinking) become template variables.
+        for (k, v) in req.get("chat_template_kwargs").and_then(|o| o.as_object()).into_iter().flatten() {
+            ctx[k] = v.clone();
         }
         let tpl = self.env.get_template("chat").map_err(|e| e.to_string())?;
         tpl.render(Value::from(minijinja::value::Serde(&ctx))).map_err(|e| format!("{e:#}"))

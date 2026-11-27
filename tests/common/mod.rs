@@ -21,6 +21,10 @@ pub fn gptoss_path() -> String {
     std::env::var("EOMOE_TEST_GPTOSS").unwrap_or_else(|_| format!("{}/.local/share/eomoe/models/gpt-oss-20b-MXFP4.gguf", std::env::var("HOME").unwrap()))
 }
 
+pub fn glm_path() -> String {
+    std::env::var("EOMOE_TEST_GLM").unwrap_or_else(|_| format!("{}/.local/share/eomoe/models/GLM-4.7-Flash-Q4_K.gguf", std::env::var("HOME").unwrap()))
+}
+
 pub fn golden(name: &str) -> serde_json::Value {
     let p = format!("{}/tests/golden/{name}", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()

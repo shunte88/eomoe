@@ -929,3 +929,18 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - Codex `exec --sandbox workspace-write`: it fixed `mul`, re-read the file, then DONE, in 1m11s (7 requests, 5.2–6.2K prompt).
   - Failed with the stock tool set (14–16K prompt, relative path): the plumbing worked (calls parsed, results returned), but gpt-oss-20b guessed a wrong path for Read and then called a `Search` tool that was never offered, until Claude Code compacted. This is a model-quality limit, not a server bug, so drive it with a trimmed `--tools`.
 - **Not done (ponytail):** `reasoning_effort` (the template default is medium); the Harmony tool-call grammar (greedy output matched without it); whitespace-only reasoning is not discarded.
+
+### Phase 14a/14b: GLM-4.7-Flash tokenizer and chat template (2026-11-27), gated
+
+Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers, MLA q_lora 768 / kv_lora 512 / rope 64, 64 experts top-4 + 1 shared, a dense first layer). It lives at ~/.local/share/eomoe/models/GLM-4.7-Flash-Q4_K.gguf (`EOMOE_TEST_GLM` overrides).
+- **14a tokenizer:** `tokenizer.ggml.pre` = glm4.
+  - The regex comes from the model's tokenizer.json, and `ignore_merges` is ported: a pre-token that is itself in the vocab becomes one token, as llama-vocab.cpp does for glm4.
+  - Gate: `phase14_glm::tokenize_matches_hf` vs HF `tokenizers` (tests/golden/tokenize_glm.json, 31 cases), plus a decode round trip.
+  - Mutation: ignore_merges off → red. The golden gained CJK words where BPE without ignore_merges splits differently (` 参考` → 3 tokens, not 1), found by toggling the flag in HF over the vocab.
+- **14b chat template:**
+  - minijinja gained the Python str methods `strip`/`lstrip`/`rstrip` (optional chars) and `split` (sep or whitespace).
+  - `tojson` accepts `ensure_ascii`, which is ignored.
+  - `chat_template_kwargs` from the request become template variables, as in llama-server (GLM's `enable_thinking`).
+  - Gate: `phase14_glm::template_matches_jinja` vs jinja2 (tests/golden/template_deepseek2.json, 10 cases): tools, tool calls and results, `reasoning_content`, inline `<think>` in content, and `enable_thinking: false`.
+  - Mutations: strip, split and the kwargs passthrough are red. rstrip and lstrip survive, because this template always `.strip()`s afterwards, so they cannot show in its output.
+  - The qwen3 and gpt-oss tokenizer and template gates still pass, and clippy is clean.

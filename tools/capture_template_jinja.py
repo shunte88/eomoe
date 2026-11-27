@@ -49,6 +49,9 @@ reqs = [c["request"] for c in json.load(open(root / "template.json"))]
 reqs += [
     {"messages": [{"role": "user", "content": "2+2?"}, {"role": "assistant", "thinking": "Easy: 4.", "content": "4"}, {"role": "user", "content": "And 3+3?"}], "add_generation_prompt": True},
     {"messages": [{"role": "developer", "content": "Answer in French."}, {"role": "user", "content": "Hi"}], "add_generation_prompt": False},
+    {"messages": [{"role": "user", "content": "2+2?"}, {"role": "assistant", "reasoning_content": "Easy: 4.", "content": "4"}, {"role": "user", "content": "And 3+3?"}, {"role": "assistant", "reasoning_content": "Six.", "content": "6"}], "add_generation_prompt": False},
+    {"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "\n<think>\n Plan: greet. \n</think>\n\n  Hello there!  "}], "add_generation_prompt": False},
+    {"messages": [{"role": "user", "content": "Hi"}], "chat_template_kwargs": {"enable_thinking": False}},
 ]
 out = []
 for req in reqs:
@@ -60,6 +63,7 @@ for req in reqs:
                 try: tc["function"]["arguments"] = json.loads(a)
                 except ValueError: pass
     ctx.setdefault("add_generation_prompt", True)
+    ctx.update(ctx.pop("chat_template_kwargs", {}))  # as llama-server passes them
     try:
         out.append({"request": req, "prompt": tpl.render(**ctx)})
     except (TypeError, jinja2.exceptions.TemplateError) as e:  # the template's own bug: callers get an error
