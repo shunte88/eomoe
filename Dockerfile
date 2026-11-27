@@ -28,7 +28,8 @@ WORKDIR /app
 COPY --from=builder /app/target/release/eomoe .
 RUN mkdir -p /app/config /app/models
 
-ENV EOMOE_CONFIG_PATH=/app/config/config.yaml
+# No EOMOE_CONFIG_PATH here: `docker run IMAGE ./eomoe serve --model ...` works from flags alone;
+# docker-compose.yml sets it for its mounted ./config.
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \

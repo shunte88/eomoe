@@ -79,7 +79,7 @@ Settings come from flags, environment variables, or a YAML file (`--config`, or 
 
 The YAML file also takes `logging.level` (`RUST_LOG` overrides it).
 
-Deployment: `docker compose up` reads `./config/config.yaml` and `./models` (it needs nvidia-container-toolkit). `eomoe.service` is a systemd unit.
+Deployment: `docker compose up` reads `./config/config.yaml` and `./models` (it needs nvidia-container-toolkit). Or the release image: `docker run --gpus all -p 8080:8080 -v ~/models:/models:ro ghcr.io/shunte88/eomoe ./eomoe serve --host 0.0.0.0 --model /models/<file>.gguf` (on a CDI-mode toolkit, `--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all` instead of `--gpus all`). `eomoe.service` is a systemd unit.
 
 ## Remote access
 

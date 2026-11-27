@@ -3,7 +3,7 @@
 running llama-server (GPU, experts on CPU), into tests/golden/greedy_gpt-oss.json.
 
   llama-server -m gpt-oss-20b-MXFP4.gguf -ngl 99 -ot exps=CPU -c 4096 --port 8099 --jinja
-  python3 -I tools/capture_greedy_gptoss.py [base_url] [name]   (name: gpt-oss, or glm -> greedy_glm.json)
+  python3 -I tools/capture_greedy_gptoss.py [base_url] [name]   (name: gpt-oss, or glm / qwen36 -> greedy_<name>.json)
 
 Chat prompts go through the server's own template; two are longer than the 128-token window.
 """
@@ -36,8 +36,8 @@ def post(path, body):
 
 
 def main():
-    # GLM: thinking off, so the 32 tokens are answer text.
-    kw = {"chat_template_kwargs": {"enable_thinking": False}} if NAME == "glm" else {}
+    # GLM and Qwen3.6: thinking off, so the 32 tokens are answer text.
+    kw = {"chat_template_kwargs": {"enable_thinking": False}} if NAME in ("glm", "qwen36") else {}
     prompts = [post("/apply-template", {"messages": [{"role": "user", "content": c}], **kw})["prompt"] for c in CHATS] + RAW
     out = []
     for p in prompts:

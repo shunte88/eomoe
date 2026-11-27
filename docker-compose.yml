@@ -6,8 +6,9 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./models:/app/models:ro
-    # Config is read from EOMOE_CONFIG_PATH (/app/config/config.yaml, set in the image).
-    # Its model.path should point under /app/models.
+    # model.path in ./config/config.yaml should point under /app/models.
+    environment:
+      - EOMOE_CONFIG_PATH=/app/config/config.yaml
     restart: unless-stopped
     deploy:
       resources:

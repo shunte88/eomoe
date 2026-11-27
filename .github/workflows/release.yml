@@ -111,7 +111,7 @@ jobs:
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --tag "ghcr.io/${GITHUB_REPOSITORY,,}:sha-$GITHUB_SHA-${{ matrix.arch }}" .
       - name: Verify the image runs
-        run: docker run --rm "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}" ./eomoe --version
+        run: docker run --rm "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}" sh -c './eomoe --version && ./eomoe about >/dev/null' # about loads the config, as serve does
       - name: Publish
         if: env.PUBLISH == 'true'
         env:
