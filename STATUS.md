@@ -923,4 +923,9 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
     - 9 cases (chat/messages/responses × text, tool call, tool result with reasoning in the history), streamed and full.
     - All match: prompt tokens 79/132/189, stop/finish, calls `get_weather {"city":"Paris"}`, reasoning presence and keys, and streamed event shapes. `count_tokens` 132 also matches.
     - Mutations (all red): no `thinking` mapping (6 mismatches), Anthropic thinking input dropped (2), Responses reasoning input dropped (2; the merge branch is not covered by the golden), `<|call|>` not EOG, chat reasoning streamed as content (2).
+  - Full regression, all except 11b (not run, by the user's rule): lib 33, phase1 4, phase2 2, phase3 4, phase4 2, phase5 2, phase6 5, phase7 2, phase8 1, phase11 2, 11c 2, 11d 1, phase12 3, phase13 6. All pass and clippy is clean.
+- **Smoke tests (`eomoe serve --model gpt-oss`, ctx 32768):**
+  - Claude Code, `-p "<abs path>/calc.py has a bug in add…" --tools "Read,Edit"`: Read, then Edit (`a - b` → `a + b`), then DONE, in 40 s (4 requests, 2.2–3.6K prompt, 25 tok/s decode).
+  - Codex `exec --sandbox workspace-write`: it fixed `mul`, re-read the file, then DONE, in 1m11s (7 requests, 5.2–6.2K prompt).
+  - Failed with the stock tool set (14–16K prompt, relative path): the plumbing worked (calls parsed, results returned), but gpt-oss-20b guessed a wrong path for Read and then called a `Search` tool that was never offered, until Claude Code compacted. This is a model-quality limit, not a server bug, so drive it with a trimmed `--tools`.
 - **Not done (ponytail):** `reasoning_effort` (the template default is medium); the Harmony tool-call grammar (greedy output matched without it); whitespace-only reasoning is not discarded.
