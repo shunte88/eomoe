@@ -12,6 +12,7 @@ pub mod cpu_moe;
 pub mod generate;
 pub mod gguf;
 pub mod gpu;
+pub mod gptoss;
 pub mod quant;
 pub mod qwen3moe;
 pub mod server;

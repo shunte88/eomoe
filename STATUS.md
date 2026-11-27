@@ -817,3 +817,25 @@ koboldcpp was reviewed for features that suit a single-model, coding-agent serve
   - Green: `test result: ok. 2 passed` (tokenizer + template).
   - Phase 1 and phase 11 are unchanged.
 - **Note (flagged):** phase1 case 5 has an integer `default` on an enum parameter, and the gpt-oss template itself fails on it (`str + int`), in jinja2 as in HF transformers. The golden records the error, and eomoe must fail too. Serving will report such a request as a template error.
+
+## Phase 13c: gpt-oss CPU reference forward (2026-11-27). PROVISIONAL, oracle gate pending
+
+- **What changed:** `src/gptoss.rs`, a separate module (qwen3moe code untouched), mirrors llama.cpp `openai-moe.cpp`:
+  - biases on q/k/v/o, on the router and on every expert matrix; no QK-norm;
+  - YaRN NeoX rope (factor 32, original ctx 4096, beta 32/1, corr dims floor/ceil, cos/sin × (1 + 0.1 ln 32));
+  - per-head attention sinks in the softmax denominator;
+  - even layers use a 128-token sliding window;
+  - top-4 experts by router logit, softmax over the chosen 4;
+  - clamped SwiGLU (min(gate, 7), clamp(up, ±7), alpha 1.702, up + 1), with the down bias added before the router weight;
+  - f16 KV.
+- **Design call:** a separate module, not a generalised Weights/Hparams. One adapter would make the seam hypothetical; generalising waits for 13d, when the GPU path needs it.
+- **Gate (provisional):** `tests/phase13_gptoss.rs::cpu_reference_answers`. Greedy decoding through the real tokenizer and Harmony template.
+  - The 79-token question decodes to `...The answer is "Paris"...<|channel|>final<|message|>Paris`.
+  - A 286-token prompt with the fact stated more than one 128-token window before the question gives `...the vault code is 4817...`.
+  - Red first (`no gptoss in the root`), then green on the first run: `test result: ok. 1 passed`, 31.9 s on the CPU.
+  - Mutation checks:
+    - SWA on every layer: red (recall lost).
+    - No sinks: red (garbage).
+    - Plain SwiGLU: red (garbage).
+    - **No YaRN mscale: still green.** The gate is too coarse for small numeric errors.
+- **Still to do:** the real gate is the llama.cpp greedy oracle (`tools/capture_greedy_gptoss.py` → `tests/golden/greedy_gpt-oss.json`, GPU llama-server with `-ot exps=CPU`). It needs the user's OK to run. Until then 13c is not done.
