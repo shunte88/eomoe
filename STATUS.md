@@ -6,6 +6,7 @@ Oracle: llama.cpp `e6443bd` (`~/.local/share/local-code-llm`), Qwen3-Coder-30B-A
 Architecture decisions:
 - CUDA C kernels now, all-Rust kernels (rust-cuda) as the end goal. Every kernel is a plain `extern "C" __global__` with only pointer and plain-value params, loaded from PTX by name, so the kernel source can be swapped without touching the engine.
 - First release targets qwen3moe (F32 / Q4_K / Q6_K only), with the architecture code kept separate.
+- **Speed bar (2026-11-28):** every supported model must beat the best of tuned llama.cpp and RustingStrata on both prefill and decode, measured with `tools/bench.py` on the same machine, model and prompt. Speed claims (README, announcements) cite only bench.py runs against those two. Current gaps are in the benchmark-harness section at the end of this file.
 
 | Phase | Gate | Status |
 |---|---|---|
