@@ -158,3 +158,14 @@ fn gpu_batched_sequences_match_solo() {
     println!("{} sequences x {steps} steps batched vs solo: max top-1 |dlogprob| {worst:.4}", cases.len());
     assert!(worst < 0.05, "batched decode drifts from solo: {worst}");
 }
+
+/// (e) `eomoe serve` defaults: the expert cache takes all free VRAM, then `--parallel 4`
+/// sequences each get recurrent state; the cache must leave room for them, and they must work.
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file and a CUDA GPU"]
+fn gpu_full_cache_fits_four_sequences() {
+    let mut m = GpuModel::with_cache(Gguf::open(qwen36_path()).unwrap(), 32768, usize::MAX >> 20).unwrap();
+    m.set_n_seq(4);
+    m.select(3);
+    answers(&mut m);
+}

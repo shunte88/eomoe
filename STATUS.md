@@ -1182,3 +1182,64 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
     - the lazily allocated recurrent state isn't counted in the VRAM log;
     - M-RoPE is reduced to NEOX, which is valid for text only, with equal positions.
 - **Docker (eca40b4):** a plain `docker run IMAGE ./eomoe serve --model …` works without a mounted config. The image no longer sets `EOMOE_CONFIG_PATH`; docker-compose.yml sets it for its mounted ./config. release.yml checks the image with `./eomoe about` as well as `--version`. Verified against the GHCR image serving GLM-4.7-Flash on the GPU.
+
+## Benchmark harness: eomoe vs tuned llama.cpp vs RustingStrata (2026-11-28)
+
+`tools/bench.py` runs one engine at a time under a memory fence (llama-server 18G, everything else 26G, swap off; llama-server always `-ngl 99`). Each engine serves the same GGUF and gets the same streamed, greedy, thinking-off chat requests. Engine loads alternate (A B C A B C). Each load sends one warm-up request (discarded), then 3 requests of about 5.2K prompt tokens (16 KB of `tests/golden/long_prompt.txt` behind a fresh nonce, so no prompt cache can help) and up to 128 reply tokens.
+- **Prefill** = prompt tokens / time to first token.
+- **Decode** = (reply tokens − 1) / (last token − first token).
+
+Values are tok/s, mean (range) over 2 loads × 3 runs. Machine: RTX 5060 8 GB, 30 GB RAM. llama.cpp is the local e6443bd build. RustingStrata is v1.4.2 (`serve --gpu --mtp 0`, defaults otherwise, no `calibrate`).
+
+**Tuning llama.cpp.** Every config used `-ub 2048 -b 2048 -fa on`. One run each, with prefill/decode:
+
+| Config | Qwen3.6 | Qwen3-Coder |
+|---|---|---|
+| `-ncmoe 28` | OOM | |
+| `-ncmoe 29` | OOM | |
+| `-ncmoe 30` | 965/41.6 | |
+| `-ncmoe 31` | 969/40.3 | |
+| `-ncmoe 34` | 903/38.0 | 387/29.6 |
+| `-ncmoe 37` | 850/36.3 | 932/27.4 |
+| `-ncmoe 40` | | 895/26.2 |
+| `-ncmoe 44` | | 829/23.6 |
+| `-cmoe --moe-cache-mib 3000` | 922/44.4 | 894/27.7 |
+| `-cmoe --moe-cache-mib 3800` | | 935/33.4 |
+| `-cmoe --moe-cache-mib 4500` | CUDA error at the first request | |
+
+The best two configs per model go into the full runs below.
+
+**Qwen3.6-35B-A3B Q4_K_M** (5203 prompt tokens):
+
+| Engine | Prefill | Decode |
+|---|---|---|
+| eomoe | 258.3 (256.0–259.7) | 39.3 (37.0–40.8) |
+| llama.cpp `-ncmoe 30` | 989.6 (984.6–997.6) | 42.0 (41.7–42.1) |
+| llama.cpp `-cmoe --moe-cache-mib 3000` | 916.7 (911.3–925.7) | 49.9 (44.4–53.5) |
+| RustingStrata | 1307.6 (1237.4–1349.3) | 62.7 (59.4–65.1) |
+
+**Qwen3-Coder-30B-A3B-Instruct Q4_K_M** (about 5.2K prompt tokens):
+
+| Engine | Prefill | Decode |
+|---|---|---|
+| eomoe | 862.2 (816.2–885.8) | 59.5 (54.3–63.5) |
+| llama.cpp `-ncmoe 37` | 934.6 (924.5–950.6) | 27.7 (27.6–27.9) |
+| llama.cpp `-cmoe --moe-cache-mib 3800` | 926.2 (919.0–935.6) | 39.6 (34.0–42.9) |
+| RustingStrata | none: every chat reply is empty | none |
+
+On Qwen3-Coder, Strata v1.4.2 returns `finish_reason: stop` with 0 tokens, even for "What is the capital of France?" with no extra request fields. It loads the model (reporting `arch: qwen3moe`) but does not chat with it.
+
+**What it says:**
+- **Qwen3-Coder decode:** eomoe is about 1.5× tuned llama.cpp.
+- **Qwen3-Coder prefill:** eomoe is about 8% behind tuned llama.cpp. The README's "2.4× llama.cpp" prefill figure was against `-ot exps=CPU` at `-ub 512`, so it does not hold against tuned llama.cpp and must be restated before any public claim.
+- **Qwen3.6:** eomoe is the slowest of the three. Prefill is 3.8× behind tuned llama.cpp and 5× behind Strata; decode is 1.6× behind Strata. Phase 15d left the DeltaNet path unoptimised: per-piece kernel launches, a serial `gated_delta` over tokens, and a 128-row cache batch. That is now a measured target for 15e/17.
+
+**Bug found by the harness.** `eomoe serve --model Qwen3.6` with its defaults (whole-VRAM expert cache, `--parallel 4`) panicked at load with "recurrent state alloc: OUT_OF_MEMORY". The cause: the expert cache took all free VRAM before `set_n_seq` added three more 63 MB recurrent states.
+- **Fix:** allocate recurrent state for 4 sequences before the expert cache is sized. Past 4, `set_n_seq` allocates more and, if that doesn't fit, names `--parallel`/`--cache-mib` in the message (ponytail ceiling).
+- **Red test:** `phase15_qwen36::gpu_full_cache_fits_four_sequences` (whole-VRAM cache, `set_n_seq(4)`, answers on sequence 3) failed with the same OOM before the fix and passes after it.
+- **Unchanged gates:**
+  - Prefill: 0/109 top-1 fails, mean 0.1337.
+  - Decode: 0/109 top-1 fails, mean 0.1341.
+  - Batched: max top-1 |dlogprob| 0.0012.
+  - `gpu_answers`: passes.
+- Clippy is clean.

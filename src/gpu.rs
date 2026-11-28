@@ -455,7 +455,9 @@ impl GpuModel {
                 return Err(format!("qwen35: state_size {} / conv_kernel {} / rope dims {} unsupported by the DeltaNet kernels", q.dk, q.d_conv, hp.n_rot));
             }
         }
-        let rs = if n_delta > 0 { vec![alloc(n_delta * rs_layer * F)?] } else { vec![] };
+        // Recurrent state for `serve`'s default 4 sequences, taken before the expert cache claims
+        // the rest of VRAM. ponytail: more sequences allocate in set_n_seq and may not fit.
+        let rs = if n_delta > 0 { (0..4).map(|_| alloc(n_delta * rs_layer * F)).collect::<Result<_, _>>()? } else { vec![] };
         let kv = alloc(n_kv_layers * kv_arrays(hp) * n_ctx * kvd * H)?;
         let pt = alloc(MAX_SEQ * (n_ctx / KV_PAGE) * 4)?;
         let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
@@ -816,7 +818,7 @@ impl GpuModel {
         }
         self.seqs.resize_with(n, SeqKv::default);
         while !self.rs.is_empty() && self.rs.len() < n {
-            let b = self.stream.alloc_zeros::<u8>(self.rs_bytes()).expect("recurrent state alloc");
+            let b = self.stream.alloc_zeros::<u8>(self.rs_bytes()).expect("recurrent state for this --parallel does not fit in VRAM; lower --parallel or --cache-mib");
             self.rs.push(b.device_ptr(&self.stream).0);
             self._bufs.push(b);
         }
