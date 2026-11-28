@@ -1266,3 +1266,20 @@ The nsys profile of one 5.2K-token Qwen3.6 prefill: `mm_q8_0_t8` took 11.5 s of 
 | + hd-256 attention | 774.6 (738.6–793.8) | 39.4 |
 
 Bar for Qwen3.6: prefill 1308, decode 63 (Strata).
+
+## 15e-speed (2): SPAN 4096 → 8192 (2026-11-28)
+
+Prefill moves each non-resident expert across PCIe once per SPAN tokens per layer. A 5.2K-token prompt therefore uploaded every miss twice; at 8192 it uploads them once. The cost is 64 MiB more VRAM for the hidden states.
+
+bench.py (eomoe, 1 load × 3 runs):
+
+| Model | Prefill before → after (tok/s) | Decode (tok/s) |
+|---|---|---|
+| Qwen3.6 | 775 → 870.3 (846.0–888.9) | 39.1 |
+| Qwen3-Coder | 862 → 953.4 (930.0–976.5) | 58.8 |
+
+Qwen3-Coder prefill now passes the best tuned llama.cpp (935).
+
+At a ~20K-token prompt (Coder, ctx 32768), SPAN 8192 gives 672 tok/s and 16384 gives 671. The cost at that length is attention, not uploads, so 8192 stays.
+
+phase6, phase7 and phase15 are green.

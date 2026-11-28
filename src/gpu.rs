@@ -32,8 +32,8 @@ const GEMM_T: usize = 128;
 /// Tokens per expert (_ids) GEMM tile (GB_TI).
 const GEMM_TI: usize = 64;
 /// Tokens per layer-major prefill pass: the experts move once per SPAN tokens. Costs
-/// 2 x SPAN x n_embd x 4 bytes of VRAM (64 MiB) for the hidden states.
-const SPAN: usize = 4096;
+/// 2 x SPAN x n_embd x 4 bytes of VRAM (128 MiB at n_embd 2048) for the hidden states.
+const SPAN: usize = 8192;
 /// Positions per split-K block of decode attention.
 const ATT_SPLIT: usize = 128;
 /// Logit rows per output matmul (all-logits calls): 64 x n_vocab x 4 bytes = 39 MiB.
