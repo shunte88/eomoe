@@ -100,6 +100,7 @@ struct Kernels {
     gemm_q6_k_ids: CudaFunction,
     mm_q8_0: CudaFunction,
     mm_q8_0_t8: CudaFunction,
+    gemm_q8_0: CudaFunction,
     mm_q8_0_ids: CudaFunction,
     mm_q8_0_ids_t8: CudaFunction,
     mm_mxfp4: CudaFunction,
@@ -111,6 +112,7 @@ struct Kernels {
     attention: CudaFunction,
     attention_dec: CudaFunction,
     attention_tc: CudaFunction,
+    attention_tc256: CudaFunction,
     attn_merge: CudaFunction,
     attention_mla: CudaFunction,
     rmsnorm_strided: CudaFunction,
@@ -317,6 +319,7 @@ impl GpuModel {
             gemm_q6_k_ids: f("gemm_q6_k_ids")?,
             mm_q8_0: f("mm_q8_0")?,
             mm_q8_0_t8: f("mm_q8_0_t8")?,
+            gemm_q8_0: f("gemm_q8_0")?,
             mm_q8_0_ids: f("mm_q8_0_ids")?,
             mm_q8_0_ids_t8: f("mm_q8_0_ids_t8")?,
             mm_mxfp4: f("mm_mxfp4")?,
@@ -328,6 +331,7 @@ impl GpuModel {
             attention: f("attention")?,
             attention_dec: f("attention_dec")?,
             attention_tc: f("attention_tc")?,
+            attention_tc256: f("attention_tc256")?,
             attn_merge: f("attn_merge")?,
             attention_mla: f("attention_mla")?,
             rmsnorm_strided: f("rmsnorm_strided")?,
@@ -619,10 +623,11 @@ impl GpuModel {
             (GgmlType::Q6_K, ..GEMM_MIN) => (&self.k.mm_q6_k_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
             (GgmlType::Q4_K, _) => (&self.k.gemm_q4_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
             (GgmlType::Q6_K, _) => (&self.k.gemm_q6_k, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
-            // ponytail: no tensor-core GEMM for Q8_0 / MXFP4 yet; prefill runs the 8-token tiles.
+            // ponytail: no tensor-core GEMM for MXFP4 yet; its prefill runs the 8-token tiles.
             (GgmlType::Q8_0, 1) => (&self.k.mm_q8_0, m.n_rows.div_ceil(4), 1),
             (GgmlType::MXFP4, 1) => (&self.k.mm_mxfp4, m.n_rows.div_ceil(4), 1),
-            (GgmlType::Q8_0, _) => (&self.k.mm_q8_0_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q8_0, ..GEMM_MIN) => (&self.k.mm_q8_0_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
+            (GgmlType::Q8_0, _) => (&self.k.gemm_q8_0, m.n_rows.div_ceil(128), ntok.div_ceil(GEMM_T)),
             (GgmlType::MXFP4, _) => (&self.k.mm_mxfp4_t8, m.n_rows.div_ceil(4), ntok.div_ceil(8)),
             (t, _) => unreachable!("checked at load: {t:?}"),
         };
@@ -955,14 +960,16 @@ impl GpuModel {
                       p += n;
                   }
                   let gq = nh / nkv;
-                  if hd == 128 && 8 % gq == 0 && l.sinks == 0 && l.window == 0 {
+                  let small = tc <= 4;
+                  // ponytail: hd 256 decode stays on the generic kernel (no attention_dec256 yet).
+                  if (hd == 128 || (hd == 256 && !small)) && 8 % gq == 0 && l.sinks == 0 && l.window == 0 {
                     // Decode (<= 4 tokens): attention_dec, one row per warp. Prefill: tensor-core
                     // attention_tc. Both split the positions when blocks are few, partials in s.gu
                     // (idle during attention).
-                    let small = tc <= 4;
-                    let cap = self.gu_len / (tc * nh * 130);
+                    let cap = self.gu_len / (tc * nh * (hd + 2));
+                    let tcf = if hd == 128 { &self.k.attention_tc } else { &self.k.attention_tc256 };
                     let (f, gy, bs) = if small { (&self.k.attention_dec, (tc * gq).div_ceil(8), 256) }
-                        else { (&self.k.attention_tc, (tc * gq).div_ceil(64), 128) };
+                        else { (tcf, (tc * gq).div_ceil(64), 128) };
                     // Fill the GPU: split positions until ~240 blocks (decode: every ATT_SPLIT).
                     let want = if small { usize::MAX } else { (240 / (nkv * gy)).max(1) };
                     let sk = (pos + tc).div_ceil(if small { ATT_SPLIT } else { 512 }).min(want).min(cap).max(1);
@@ -970,7 +977,7 @@ impl GpuModel {
                     launch!(self, *f, (nkv as u32, gy as u32, sk as u32), bs, [q, kc, vc, pt, attn, nhi, nkvi, pos0, ti, scale, part]);
                     if sk > 1 {
                         let rows = (tc * nh) as i32;
-                        launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), 128, [part, attn, rows, ski]);
+                        launch!(self, self.k.attn_merge, ((tc * nh) as u32, 1, 1), hd as u32, [part, attn, rows, ski]);
                     }
                   } else {
                     let (sinks, win) = (l.sinks, l.window);

@@ -1244,3 +1244,25 @@ On Qwen3-Coder, Strata v1.4.2 returns `finish_reason: stop` with 0 tokens, even 
   - Batched: max top-1 |dlogprob| 0.0012.
   - `gpu_answers`: passes.
 - Clippy is clean.
+
+## 15e-speed (1): Qwen3.6 prefill, Q8_0 tensor-core GEMM and hd-256 tensor-core attention (2026-11-28)
+
+The nsys profile of one 5.2K-token Qwen3.6 prefill: `mm_q8_0_t8` took 11.5 s of 19 s of GPU time, and the generic `attention` kernel took 4.2 s. Qwen3.6's attention and DeltaNet projections are Q8_0, which had no GEMM, and its head dim is 256, which `attention_tc` did not cover. `gated_delta`, the recurrence, was only 0.47 s.
+- **Q8_0 GEMM:** `qdeq32_q8_0` plugs Q8_0 into the existing tensor-core `gemm_tile`. Int8 is exact in f16; scale d per 32, no min. Used at 16+ tokens. Mutation (low byte read unsigned): 109/109 top-1 fails, red.
+- **hd-256 attention:** `attention_tc` is now a template over (HD, KT). HD 128 is unchanged. HD 256 feeds Q as plain f16, as llama.cpp's FA does, and uses 32-position K tiles so Q, the output and the scores fit in registers (8 bytes of spill). Decode at hd 256 stays on the generic kernel (ponytail). Mutation (query row 1 fed row 0's values): mean 0.6439 > floor 0.1453, red.
+
+**Gates:**
+- Qwen3.6 prefill: 0/109 top-1 fails, mean 0.1366 (was 0.1337; the f16 Q), floor 0.1453.
+- Qwen3.6 decode: 0/109 top-1 fails, mean 0.1341.
+- Batched: 0.0017.
+- Full regression (all suites except phase11b, plus lib): green. Clippy is clean.
+
+**bench.py** (eomoe, Qwen3.6, 1 load × 3 runs):
+
+| Step | Prefill (tok/s) | Decode (tok/s) |
+|---|---|---|
+| Before | 258 | 39.3 |
+| + Q8_0 GEMM | 500 | 39.3 |
+| + hd-256 attention | 774.6 (738.6–793.8) | 39.4 |
+
+Bar for Qwen3.6: prefill 1308, decode 63 (Strata).

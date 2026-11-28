@@ -296,6 +296,18 @@ __device__ __forceinline__ void qdeq32_q4_k(const uint8_t* row, int j, uint32_t*
     }
 }
 
+// Q8_0: chunk j is block j (34 bytes: f16 d, int8 qs[32]), 2-byte aligned; int8 is exact in f16.
+__device__ __forceinline__ void qdeq32_q8_0(const uint8_t* row, int j, uint32_t* q, float* sc, float* mn) {
+    const uint8_t* b = row + j * 34;
+    sc[0] = sc[1] = ld_f16(b);
+    mn[0] = mn[1] = 0.0f;
+#pragma unroll
+    for (int l = 0; l < 32; l += 2) {
+        const unsigned short u = *(const unsigned short*)(b + 2 + l);
+        q[l / 2] = h2u((float)(int8_t)(u & 0xFF), (float)(int8_t)(u >> 8));
+    }
+}
+
 // Q6_K: chunk j of a super-block is quadrant qd = j%4 of half n = (j/4)%2; q - 32 in [-32, 31].
 __device__ __forceinline__ void qdeq32_q6_k(const uint8_t* row, int j, uint32_t* q, float* sc, float* mn) {
     const uint8_t* b = row + (j >> 3) * 210;
@@ -443,6 +455,7 @@ __device__ __forceinline__ void gemm_store(float* y, int n_rows, int r0, int t0,
     }
 GEMM_QUANT(q4_k, true)
 GEMM_QUANT(q6_k, false)
+GEMM_QUANT(q8_0, true)
 
 // Row-wise RMSNorm, y may alias x. grid rows.
 __device__ __forceinline__ void rmsnorm_row(float* yr, const float* xr, const float* w, int n, float eps) {
@@ -647,12 +660,16 @@ extern "C" __global__ void attention_dec(const float* q, const __half* kc, const
 // transposed, so both B fragments are half2 loads). The online softmax runs on the accumulator
 // registers: thread (g = lane/4, tq = lane%4) holds rows g and g+8, columns 8n + 2tq + {0,1}.
 // Q and P are fed as f16 hi + lo pairs (two mmas each): ~f32 accuracy; K and V are exact f16.
-// Requires hd == 128 and 64 % G == 0. grid (nkv, ceil(T*G/64), S), block 128. Split-K as above.
-#define TC_KT 64
-extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
-                                                              int nh, int nkv, int n_past, int T, float scale, float* part) {
-    __shared__ __align__(16) __half sk[TC_KT][136];
-    __shared__ __align__(16) __half svt[128][TC_KT + 8];
+// HD 128: Q as f16 hi + lo, K tiles of 64. HD 256 (qwen35): Q plain f16 (as llama.cpp's FA) and K
+// tiles of 32, so Q, the output and the scores fit in registers. Requires 64 % G == 0.
+// grid (nkv, ceil(T*G/64), S), block 128. Split-K as above, partials (m, l, acc[HD]) HD + 2 apart.
+template <int HD, int KT>
+__device__ __forceinline__ void attention_tc_impl(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
+                                                  int nh, int nkv, int n_past, int T, float scale, float* part) {
+    constexpr bool LO = HD == 128;
+    constexpr int NK = HD / 16, NO = HD / 8, NS = KT / 8;
+    __shared__ __align__(16) __half sk[KT][HD + 8];
+    __shared__ __align__(16) __half svt[HD][KT + 8];
     const int G = nh / nkv, QT = 64 / G, hk = blockIdx.x, t0 = blockIdx.y * QT;
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, tq = lane & 3;
     const int rr[2] = {16 * w + g, 16 * w + g + 8};
@@ -661,29 +678,38 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
     for (int i = 0; i < 2; i++) {
         const int t = min(t0 + rr[i] / G, T - 1);
         tr[i] = n_past + t;  // last visible position
-        qp[i] = q + ((size_t)t * nh + hk * G + rr[i] % G) * 128;
+        qp[i] = q + ((size_t)t * nh + hk * G + rr[i] % G) * HD;
     }
-    uint32_t qh[8][4], ql[8][4];
-    for (int kk = 0; kk < 8; kk++) {
+    uint32_t qh[NK][4], ql[LO ? NK : 1][4];
+#pragma unroll
+    for (int kk = 0; kk < NK; kk++) {
         const int c = 16 * kk + 2 * tq;
-        split_h2(qp[0][c], qp[0][c + 1], qh[kk][0], ql[kk][0]);
-        split_h2(qp[1][c], qp[1][c + 1], qh[kk][1], ql[kk][1]);
-        split_h2(qp[0][c + 8], qp[0][c + 9], qh[kk][2], ql[kk][2]);
-        split_h2(qp[1][c + 8], qp[1][c + 9], qh[kk][3], ql[kk][3]);
+        if constexpr (LO) {
+            split_h2(qp[0][c], qp[0][c + 1], qh[kk][0], ql[kk][0]);
+            split_h2(qp[1][c], qp[1][c + 1], qh[kk][1], ql[kk][1]);
+            split_h2(qp[0][c + 8], qp[0][c + 9], qh[kk][2], ql[kk][2]);
+            split_h2(qp[1][c + 8], qp[1][c + 9], qh[kk][3], ql[kk][3]);
+        } else {
+            qh[kk][0] = h2u(qp[0][c], qp[0][c + 1]);
+            qh[kk][1] = h2u(qp[1][c], qp[1][c + 1]);
+            qh[kk][2] = h2u(qp[0][c + 8], qp[0][c + 9]);
+            qh[kk][3] = h2u(qp[1][c + 8], qp[1][c + 9]);
+        }
     }
-    float o[16][4];
-    for (int n = 0; n < 16; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    float o[NO][4];
+#pragma unroll
+    for (int n = 0; n < NO; n++) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
     const int n_pos = n_past + min(t0 + QT, T);
-    const int span = (n_pos + TC_KT * gridDim.z - 1) / (TC_KT * gridDim.z) * TC_KT;
+    const int span = (n_pos + KT * gridDim.z - 1) / (KT * gridDim.z) * KT;
     const int pb = blockIdx.z * span, pe = min(n_pos, pb + span);
-    for (int p0 = pb; p0 < pe; p0 += TC_KT) {
+    for (int p0 = pb; p0 < pe; p0 += KT) {
         __syncthreads();  // previous tile consumed
-        for (int i = threadIdx.x; i < TC_KT * 16; i += 128) {
-            const int j = i >> 4, c = i & 15, p = p0 + j;
+        for (int i = threadIdx.x; i < KT * (HD / 8); i += 128) {
+            const int j = i / (HD / 8), c = i % (HD / 8), p = p0 + j;
             uint4 kv4 = make_uint4(0, 0, 0, 0), vv4 = make_uint4(0, 0, 0, 0);
             if (p < pe) {
-                const size_t off = (kv_slot(pt, p) * nkv + hk) * 128 + 8 * c;
+                const size_t off = (kv_slot(pt, p) * nkv + hk) * HD + 8 * c;
                 kv4 = *(const uint4*)(kc + off);
                 vv4 = *(const uint4*)(vc + off);
             }
@@ -692,18 +718,21 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
             for (int e = 0; e < 8; e++) svt[8 * c + e][j] = vh[e];
         }
         __syncthreads();
-        float sc[8][4];
-        for (int n = 0; n < 8; n++) {
+        float sc[NS][4];
+#pragma unroll
+        for (int n = 0; n < NS; n++) {
             sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.0f;
-            for (int kk = 0; kk < 8; kk++) {
+#pragma unroll
+            for (int kk = 0; kk < NK; kk++) {
                 const __half* kr = &sk[8 * n + g][16 * kk + 2 * tq];
                 const uint32_t b0 = *(const uint32_t*)kr, b1 = *(const uint32_t*)(kr + 8);
                 mma16816(sc[n], qh[kk], b0, b1);
-                mma16816(sc[n], ql[kk], b0, b1);
+                if constexpr (LO) mma16816(sc[n], ql[kk], b0, b1);
             }
         }
         float mx[2] = {-INFINITY, -INFINITY};
-        for (int n = 0; n < 8; n++)
+#pragma unroll
+        for (int n = 0; n < NS; n++)
             for (int e = 0; e < 4; e++) {
                 const int r = e >> 1, p = p0 + 8 * n + 2 * tq + (e & 1);
                 const float v = p <= tr[r] ? sc[n][e] * scale : -INFINITY;
@@ -718,7 +747,8 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
             c[r] = mn == -INFINITY ? 1.0f : expf(m[r] - mn);
             m[r] = mn;
         }
-        for (int n = 0; n < 8; n++)
+#pragma unroll
+        for (int n = 0; n < NS; n++)
             for (int e = 0; e < 4; e++) {
                 const int r = e >> 1;
                 const float v = sc[n][e] == -INFINITY ? 0.0f : expf(sc[n][e] - m[r]);
@@ -730,14 +760,17 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
             sum[r] += __shfl_xor_sync(0xffffffff, sum[r], 2);
             l[r] = l[r] * c[r] + sum[r];
         }
-        for (int n = 0; n < 16; n++) { o[n][0] *= c[0]; o[n][1] *= c[0]; o[n][2] *= c[1]; o[n][3] *= c[1]; }
-        for (int kk = 0; kk < TC_KT / 16; kk++) {
+#pragma unroll
+        for (int n = 0; n < NO; n++) { o[n][0] *= c[0]; o[n][1] *= c[0]; o[n][2] *= c[1]; o[n][3] *= c[1]; }
+#pragma unroll
+        for (int kk = 0; kk < KT / 16; kk++) {
             uint32_t ph[4], pl[4];
             split_h2(sc[2 * kk][0], sc[2 * kk][1], ph[0], pl[0]);
             split_h2(sc[2 * kk][2], sc[2 * kk][3], ph[1], pl[1]);
             split_h2(sc[2 * kk + 1][0], sc[2 * kk + 1][1], ph[2], pl[2]);
             split_h2(sc[2 * kk + 1][2], sc[2 * kk + 1][3], ph[3], pl[3]);
-            for (int n = 0; n < 16; n++) {
+#pragma unroll
+            for (int n = 0; n < NO; n++) {
                 const __half* vr = &svt[8 * n + g][16 * kk + 2 * tq];
                 const uint32_t b0 = *(const uint32_t*)vr, b1 = *(const uint32_t*)(vr + 8);
                 mma16816(o[n], ph, b0, b1);
@@ -750,14 +783,22 @@ extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, c
         if (t >= T) continue;
         const size_t row = (size_t)t * nh + hk * G + r % G;
         if (gridDim.z > 1) {
-            float* pp = part + ((size_t)blockIdx.z * T * nh + row) * 130;
+            float* pp = part + ((size_t)blockIdx.z * T * nh + row) * (HD + 2);
             if (tq == 0) { pp[0] = m[i]; pp[1] = l[i]; }
-            for (int n = 0; n < 16; n++) { pp[2 + 8 * n + 2 * tq] = o[n][2 * i]; pp[3 + 8 * n + 2 * tq] = o[n][2 * i + 1]; }
+            for (int n = 0; n < NO; n++) { pp[2 + 8 * n + 2 * tq] = o[n][2 * i]; pp[3 + 8 * n + 2 * tq] = o[n][2 * i + 1]; }
             continue;
         }
-        for (int n = 0; n < 16; n++)
-            *(float2*)(out + row * 128 + 8 * n + 2 * tq) = make_float2(o[n][2 * i] / l[i], o[n][2 * i + 1] / l[i]);
+        for (int n = 0; n < NO; n++)
+            *(float2*)(out + row * HD + 8 * n + 2 * tq) = make_float2(o[n][2 * i] / l[i], o[n][2 * i + 1] / l[i]);
     }
+}
+extern "C" __global__ void __launch_bounds__(128) attention_tc(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
+                                                              int nh, int nkv, int n_past, int T, float scale, float* part) {
+    attention_tc_impl<128, 64>(q, kc, vc, pt, out, nh, nkv, n_past, T, scale, part);
+}
+extern "C" __global__ void __launch_bounds__(128) attention_tc256(const float* q, const __half* kc, const __half* vc, const int* pt, float* out,
+                                                                 int nh, int nkv, int n_past, int T, float scale, float* part) {
+    attention_tc_impl<256, 32>(q, kc, vc, pt, out, nh, nkv, n_past, T, scale, part);
 }
 
 // Combine split-K partials (m, l, acc[hd]) of attention_dec / attention_tc / attention_mla.
