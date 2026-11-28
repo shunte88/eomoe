@@ -452,7 +452,7 @@ impl GpuModel {
         });
         if let Some(q) = &hp.qwen35 {
             if q.dk != 128 || q.d_conv > 8 || hp.n_rot > hp.head_dim {
-                return Err(format!("qwen35: state_size {} / conv_kernel {} unsupported by the DeltaNet kernels", q.dk, q.d_conv));
+                return Err(format!("qwen35: state_size {} / conv_kernel {} / rope dims {} unsupported by the DeltaNet kernels", q.dk, q.d_conv, hp.n_rot));
             }
         }
         let rs = if n_delta > 0 { vec![alloc(n_delta * rs_layer * F)?] } else { vec![] };
@@ -795,9 +795,9 @@ impl GpuModel {
         for &(sq, r0, n, _) in ps {
             let cst = self.rs[sq] + (di * self.rs_layer * F) as u64;
             let sst = cst + ((q.d_conv - 1) * ch * F) as u64;
-            let (inp, c, out, dnr) = (s.dn + (r0 * wd * F) as u64, cv + (r0 * ch * F) as u64, s.attn + (r0 * vd * F) as u64, s.dn + (r0 * wd * F) as u64);
+            let (dnr, c, out) = (s.dn + (r0 * wd * F) as u64, cv + (r0 * ch * F) as u64, s.attn + (r0 * vd * F) as u64);
             let ni = n as i32;
-            launch!(self, self.k.ssm_conv, (ch.div_ceil(256) as u32, 1, 1), 256, [c, inp, wdi, cst, conv, chi, ni, kc]);
+            launch!(self, self.k.ssm_conv, (ch.div_ceil(256) as u32, 1, 1), 256, [c, dnr, wdi, cst, conv, chi, ni, kc]);
             let (qk_heads, l2eps) = ((2 * q.nk) as i32, hp.eps);
             launch!(self, self.k.l2norm_heads, ((n * 2 * q.nk) as u32, 1, 1), q.dk as u32, [c, chi, qk_heads, dk, l2eps]);
             launch!(self, self.k.gated_delta, ((q.dk / 4) as u32, q.nv as u32, 1), 128, [c, chi, dnr, wdi, boff, aoff, dt, a, sst, out, vdi, nki, nvi, ni]);
@@ -1339,6 +1339,7 @@ impl Engine for GpuModel {
     /// Recurrent models: only a rewind to 0 (which zeroes the state) until state checkpoints.
     fn truncate(&mut self, n_past: usize) {
         if !self.rs.is_empty() && n_past < self.seqs[self.cur].n_past {
+            // ponytail: no state checkpoints yet, so keep-all or reset; callers use `rewind`.
             assert!(n_past == 0, "recurrent state can only be reset");
             unsafe { result::memset_d8_async(self.rs[self.cur], 0, self.rs_bytes(), self.stream.cu_stream()) }.expect("memset");
         }

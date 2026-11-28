@@ -117,3 +117,44 @@ fn gpu_decode_matches_oracle() {
 fn gpu_answers() {
     answers(&mut GpuModel::new(Gguf::open(qwen36_path()).unwrap(), 4096).unwrap());
 }
+
+/// (d) three sequences decoded together (`decode_batch`, recurrent state per sequence, lazily
+/// allocated by `set_n_seq`) match each sequence run alone, teacher-forced on the golden tokens.
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file and a CUDA GPU"]
+fn gpu_batched_sequences_match_solo() {
+    let cases: Vec<(Vec<u32>, Vec<u32>)> = (golden("greedy_qwen36.json").as_array().unwrap().iter().skip(1).take(3))
+        .map(|k| (serde_json::from_value(k["prompt_tokens"].clone()).unwrap(), serde_json::from_value(k["tokens"].clone()).unwrap()))
+        .collect();
+    let steps = cases.iter().map(|(_, g)| g.len() - 1).min().unwrap();
+    let mut m = GpuModel::new(Gguf::open(qwen36_path()).unwrap(), 4096).unwrap();
+    let nv = m.n_vocab();
+    let solo: Vec<Vec<f32>> = cases.iter().map(|(p, g)| {
+        m.reset();
+        let mut l = vec![];
+        m.forward_last(p);
+        for &t in &g[..steps] {
+            l.extend(m.forward_last(&[t]));
+        }
+        l
+    }).collect();
+    m.set_n_seq(3);
+    for (i, (p, _)) in cases.iter().enumerate() {
+        m.select(i);
+        m.forward_last(p);
+    }
+    let lsm = |v: &[f32]| { let mx = v.iter().fold(f32::MIN, |a, &b| a.max(b)); let s = v.iter().map(|x| (x - mx).exp()).sum::<f32>().ln() + mx; v.iter().map(|x| x - s).collect::<Vec<f32>>() };
+    let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let mut worst = 0f32;
+    for k in 0..steps {
+        let rows: Vec<(usize, u32)> = cases.iter().enumerate().map(|(i, (_, g))| (i, g[k])).collect();
+        let l = m.decode_batch(&rows);
+        for i in 0..cases.len() {
+            let (a, b) = (lsm(&solo[i][k * nv..][..nv]), lsm(&l[i * nv..][..nv]));
+            assert_eq!(am(&a), am(&b), "seq {i} step {k}: top-1 differs");
+            worst = worst.max((a[am(&a)] - b[am(&a)]).abs());
+        }
+    }
+    println!("{} sequences x {steps} steps batched vs solo: max top-1 |dlogprob| {worst:.4}", cases.len());
+    assert!(worst < 0.05, "batched decode drifts from solo: {worst}");
+}

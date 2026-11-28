@@ -1143,8 +1143,8 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
 - **KV and recurrent state:**
   - KV is allocated for the 10 attention layers only, indexed through `slot[li]`.
   - Recurrent state is per sequence: 30 × (3·8192 + 32·128·128) floats, about 63 MB. It is allocated lazily in `set_n_seq` and zeroed by `truncate(0)`.
-  - `kv_save`/`kv_restore` panic on recurrent models: the 11b RAM cache is off by default, and its state snapshots come with 15e.
-  - A rewind to 0 < n < n_past panics until 15e's state checkpoints.
+  - The RAM cache (11b) skips recurrent models, because `kv_save` returns empty. State snapshots come with 15e.
+  - A direct `truncate` to 0 < n < n_past panics. The batcher uses `rewind`, which recomputes instead (below).
 - **Gates (tests/phase15_qwen36.rs):** all PASS against greedy_qwen36.json, same tie and floor as 15c.
 
   | Test | Top-1 failures | Mean \|dlogprob\| | Max |
@@ -1172,3 +1172,13 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   - Gate: `generate::tests::recurrent_engine_recomputes_a_prompt_it_cannot_rewind_to`. It was red before the batcher used the return value (n_cached 4, expected 0).
   - Smoke test, `eomoe serve` with Qwen3.6, ctx 8192, 7319 MiB: answered Paris, then a follow-up turn (Berlin, prefix recomputed), then a fresh prompt (Rome). No panic.
   - **Known limitation until 15e:** reasoning comes back inside `content`, ending `</think>`. Still to come: the `<think>` split, state checkpoints for prefix reuse, and an oracle API golden.
+- **Concurrent sequences gate:** `gpu_batched_sequences_match_solo` decodes 3 sequences together through `decode_batch`, with state allocated lazily by `set_n_seq`. It matches each sequence run alone: 3 × 10 steps, top-1 identical, max |dlogprob| 0.0014.
+  - Mutation: every sequence sharing `rs[0]`. Red.
+- **Review since 5b9f689 (two axes, before v0.1.5):**
+  - No bugs found. Fixed: the guard's error now names the rope dims; one pointer had two names (`inp`/`dnr`); the truncate ceiling is marked `ponytail:`; two stale STATUS claims about kv_save and rewind are corrected.
+  - Left as judgement calls:
+    - the `dn` scratch layout is spelled out in 3 places;
+    - `rewind`'s 3-line body is repeated in two engines;
+    - the lazily allocated recurrent state isn't counted in the VRAM log;
+    - M-RoPE is reduced to NEOX, which is valid for text only, with equal positions.
+- **Docker (eca40b4):** a plain `docker run IMAGE ./eomoe serve --model …` works without a mounted config. The image no longer sets `EOMOE_CONFIG_PATH`; docker-compose.yml sets it for its mounted ./config. release.yml checks the image with `./eomoe about` as well as `--version`. Verified against the GHCR image serving GLM-4.7-Flash on the GPU.

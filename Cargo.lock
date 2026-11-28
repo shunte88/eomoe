@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "eomoe"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "axum-server",
