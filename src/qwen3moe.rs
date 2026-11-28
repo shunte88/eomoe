@@ -13,6 +13,12 @@ pub trait Engine {
     fn n_ctx(&self) -> usize;
     /// Keep the first `n_past` positions of the KV cache, drop the rest.
     fn truncate(&mut self, n_past: usize);
+    /// Keep at most the first `n` positions; returns how many were kept. Recurrent engines
+    /// (qwen35) keep all or none: their state can't rewind.
+    fn rewind(&mut self, n: usize) -> usize {
+        self.truncate(n);
+        n
+    }
     fn reset(&mut self) {
         self.truncate(0)
     }

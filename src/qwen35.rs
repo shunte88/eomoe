@@ -320,6 +320,12 @@ impl Engine for CpuModel {
         usize::MAX
     }
 
+    fn rewind(&mut self, n: usize) -> usize {
+        let n = if n < self.n_past { 0 } else { n };
+        self.truncate(n);
+        n
+    }
+
     /// Recurrent state can't rewind: only "keep everything" or a full reset.
     fn truncate(&mut self, n_past: usize) {
         if n_past >= self.n_past {

@@ -137,11 +137,11 @@ impl<E: Engine> Batcher<E> {
                 .unwrap();
             let n = self.ram_swap(si, &req.prompt).unwrap_or(n);
             self.tick += 1;
+            self.engine.select(si);
+            let n = self.engine.rewind(n);
             let slot = &mut self.slots[si];
             slot.last_used = self.tick;
             slot.cached.truncate(n);
-            self.engine.select(si);
-            self.engine.truncate(n);
             if (req.sink)(Event::Started { n_cached: n }) {
                 let rng = req.sampling.seed;
                 slot.job = Some(Job { req, order: self.tick, n_out: 0, pending: None, text: vec![], rng });
@@ -449,10 +449,12 @@ mod tests {
         n_past: Vec<usize>,
         computed: Vec<Vec<u32>>,
         batches: Vec<usize>,
+        /// Like qwen35's state: a rewind keeps everything or nothing.
+        recurrent: bool,
     }
 
     fn fake(n_seq: usize) -> Fake {
-        Fake { n_seq, cur: 0, n_past: vec![0; n_seq], computed: vec![vec![]; n_seq], batches: vec![] }
+        Fake { n_seq, cur: 0, n_past: vec![0; n_seq], computed: vec![vec![]; n_seq], batches: vec![], recurrent: false }
     }
 
     impl Engine for Fake {
@@ -473,6 +475,11 @@ mod tests {
         }
         fn truncate(&mut self, n: usize) {
             self.n_past[self.cur] = self.n_past[self.cur].min(n);
+        }
+        fn rewind(&mut self, n: usize) -> usize {
+            let n = if self.recurrent && n < self.n_past[self.cur] { 0 } else { n };
+            self.truncate(n);
+            n
         }
         fn forward(&mut self, t: &[u32]) -> Vec<f32> {
             self.n_past[self.cur] += t.len();
@@ -555,6 +562,16 @@ mod tests {
         assert_eq!(b.engine.computed[0][0], 0);
         // max_tokens 0: no tokens at all.
         assert_eq!(run_all(&mut b, vec![req(&[1, 2], 0)])[0].0, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn recurrent_engine_recomputes_a_prompt_it_cannot_rewind_to() {
+        let mut b = Batcher::new(Fake { recurrent: true, ..fake(1) }, vec![7]);
+        run_all(&mut b, vec![req(&[1, 2], 10)]);
+        // Prefix [1, 2, 3, 4] of a longer cache: the state can't rewind, so all is recomputed.
+        b.engine.computed[0].clear();
+        assert_eq!(run_all(&mut b, vec![req(&[1, 2, 3, 4, 0], 2)])[0].2, Some(0));
+        assert_eq!(b.engine.computed[0], vec![1, 2, 3, 4, 0, 1]);
     }
 
     #[test]

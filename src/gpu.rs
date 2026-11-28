@@ -1293,7 +1293,9 @@ impl Engine for GpuModel {
     /// The sequence's pages of every layer's K and V, page-major per (layer, K|V).
     fn kv_save(&mut self) -> Vec<u8> {
         let pages = self.seqs[self.cur].pages.clone();
-        assert!(self.rs.is_empty(), "kv_save: recurrent state is not snapshotted");
+        if !self.rs.is_empty() {
+            return vec![]; // ponytail: no recurrent state in the image; RAM cache unsupported for qwen35
+        }
         let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.n_kv_layers);
         let pb = KV_PAGE * kvd * H;
         self.stream.synchronize().expect("sync");
@@ -1326,6 +1328,12 @@ impl Engine for GpuModel {
     fn select(&mut self, seq: usize) {
         assert!(seq < self.seqs.len());
         self.cur = seq;
+    }
+
+    fn rewind(&mut self, n: usize) -> usize {
+        let n = if !self.rs.is_empty() && n < self.seqs[self.cur].n_past { 0 } else { n };
+        self.truncate(n);
+        n
     }
 
     /// Recurrent models: only a rewind to 0 (which zeroes the state) until state checkpoints.

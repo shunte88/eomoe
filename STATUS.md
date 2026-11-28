@@ -1168,3 +1168,7 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   | Full rope instead of `n_rot` | prefill | 5 | 1.00 |
   | No state reset on `truncate(0)` | prefill | 12 | 2.55 |
 - **Regression (every suite except 11b, which is not run by the user's rule):** all pass. lib 34, phase1 4, phase2 2, phase3 4, phase4 2, phase5 3, phase6 5, phase7 2, phase8 1, phase11 2, 11c 2, 11d 1, phase12 3, phase13 6, phase14 6. Phase 15: 7/7. Clippy is clean.
+- **Serving safety (pre-15e):** `Engine::rewind(n) -> kept`. Its default truncates and returns n; recurrent engines (`GpuModel` with DeltaNet layers, and `qwen35::CpuModel`) keep all positions or none. The batcher now truncates its token cache to what the engine kept, so a prefix the state can't rewind to is recomputed instead of panicking. `kv_save` returns empty (unsupported) for recurrent models, so the RAM cache skips them.
+  - Gate: `generate::tests::recurrent_engine_recomputes_a_prompt_it_cannot_rewind_to`. It was red before the batcher used the return value (n_cached 4, expected 0).
+  - Smoke test, `eomoe serve` with Qwen3.6, ctx 8192, 7319 MiB: answered Paris, then a follow-up turn (Berlin, prefix recomputed), then a fresh prompt (Rome). No panic.
+  - **Known limitation until 15e:** reasoning comes back inside `content`, ending `</think>`. Still to come: the `<think>` split, state checkpoints for prefix reuse, and an oracle API golden.
