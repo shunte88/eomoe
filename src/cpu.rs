@@ -31,6 +31,9 @@ impl CpuModel {
         if w.hp.glm.is_some() {
             return Err("GLM: use glm::CpuModel".into());
         }
+        if w.hp.qwen35.is_some() {
+            return Err("Qwen3.6: use qwen35::CpuModel".into());
+        }
         Ok(Self { kv: (0..w.hp.n_layer).map(|_| (vec![], vec![])).collect(), w, n_past: 0 })
     }
 

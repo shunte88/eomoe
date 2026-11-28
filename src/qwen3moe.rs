@@ -75,6 +75,20 @@ pub struct Hparams {
     /// GLM-4.7-Flash (deepseek2). head_dim is then the absorbed MLA cache row (lat + rope) and
     /// n_head_kv 1: every head attends over one shared latent row per position.
     pub glm: Option<Glm>,
+    /// Qwen3.6 (qwen35moe): Gated DeltaNet layers, gated attention (attn_q gives [q | gate] per
+    /// head), roped dims n_rot of head_dim, sigmoid-gated shared expert (src/qwen35.rs).
+    pub qwen35: Option<Qwen35>,
+    /// Dims of each head that RoPE rotates (head_dim but for qwen35).
+    pub n_rot: usize,
+}
+
+/// DeltaNet widths of Qwen3.6: k heads (group_count), v heads (time_step_rank), head width
+/// (state_size), conv kernel.
+pub struct Qwen35 {
+    pub nk: usize,
+    pub nv: usize,
+    pub dk: usize,
+    pub d_conv: usize,
 }
 
 /// MLA widths and the routed experts' weight scale of GLM-4.7-Flash.
@@ -87,11 +101,13 @@ pub struct Glm {
     pub w_scale: f32,
 }
 
-/// Grouped-query attention (qwen3moe, gpt-oss) or absorbed MLA (GLM, src/glm.rs).
+/// Grouped-query attention (qwen3moe, gpt-oss, qwen35 full-attention layers), absorbed MLA (GLM,
+/// src/glm.rs) or a Gated DeltaNet mixer (qwen35; its ssm_out is the layer's `wo`).
 #[allow(clippy::large_enum_variant)] // one per layer
 pub enum Attn {
     Gqa { wq: TensorInfo, wk: TensorInfo, wv: TensorInfo },
     Mla { q_a: TensorInfo, q_a_norm: TensorInfo, q_b: TensorInfo, kv_a: TensorInfo, kv_a_norm: TensorInfo, k_b: TensorInfo, v_b: TensorInfo },
+    Delta { qkv: TensorInfo, z: TensorInfo, beta: TensorInfo, alpha: TensorInfo, dt_bias: TensorInfo, a: TensorInfo, conv: TensorInfo, norm: TensorInfo },
 }
 
 /// A layer's routed experts (3-D gate/up/down tensors).
@@ -100,9 +116,11 @@ pub struct Moe {
     pub gate: TensorInfo,
     pub up: TensorInfo,
     pub down: TensorInfo,
-    /// GLM: selection bias (exp_probs_b) and the shared expert's gate, up, down.
+    /// GLM: selection bias (exp_probs_b). GLM, qwen35: the shared expert's gate, up, down;
+    /// qwen35: its sigmoid gate (ffn_gate_inp_shexp).
     pub sel_bias: Option<TensorInfo>,
     pub shared: Option<[TensorInfo; 3]>,
+    pub shared_gate: Option<TensorInfo>,
 }
 
 pub struct Layer {
@@ -134,7 +152,7 @@ pub struct Weights {
 impl Weights {
     pub fn load(g: Gguf) -> Result<Self, String> {
         let arch = g.str("general.architecture").unwrap_or("").to_string();
-        if !["qwen3moe", "gpt-oss", "deepseek2"].contains(&arch.as_str()) {
+        if !["qwen3moe", "gpt-oss", "deepseek2", "qwen35moe"].contains(&arch.as_str()) {
             return Err(format!("unsupported architecture {arch:?}"));
         }
         let oai = arch == "gpt-oss";
@@ -156,17 +174,28 @@ impl Weights {
         } else {
             None
         };
+        let qwen35 = if arch == "qwen35moe" {
+            Some(Qwen35 { nk: u("ssm.group_count")?, nv: u("ssm.time_step_rank")?, dk: u("ssm.state_size")?, d_conv: u("ssm.conv_kernel")? })
+        } else {
+            None
+        };
+        let recurrent: Vec<bool> = match g.arr(&format!("{arch}.attention.recurrent_layers")) {
+            Some(a) => a.iter().map(|v| matches!(v, crate::gguf::Value::Bool(true))).collect(),
+            None => (0..u("block_count")?).map(|i| qwen35.is_some() && (i + 1) % u("full_attention_interval").unwrap_or(4) != 0).collect(),
+        };
         let n_dense = if glm.is_some() { u("leading_dense_block_count").unwrap_or(0) } else { 0 };
         let n_embd = u("embedding_length")?;
         let n_head = u("attention.head_count")?;
         let t = |n: String| g.tensor(&n).cloned().ok_or(format!("missing tensor {n}"));
         let output = t("output.weight".into()).or_else(|_| t("token_embd.weight".into()))?;
+        let head_dim = glm.as_ref().map_or_else(|| u("attention.key_length").unwrap_or(n_embd / n_head), |m| m.lat + m.rope);
         let hp = Hparams {
             n_layer: u("block_count")?,
             n_embd,
             n_head,
             n_head_kv: if glm.is_some() { 1 } else { u("attention.head_count_kv")? },
-            head_dim: glm.as_ref().map_or_else(|| u("attention.key_length").unwrap_or(n_embd / n_head), |m| m.lat + m.rope),
+            head_dim,
+            n_rot: if qwen35.is_some() { u("rope.dimension_count")? } else { head_dim },
             n_expert: u("expert_count")?,
             n_expert_used: u("expert_used_count")?,
             n_ff_exp: u("expert_feed_forward_length")?,
@@ -177,24 +206,36 @@ impl Weights {
             swa: if oai { u("attention.sliding_window")? } else { 0 },
             rope_yarn: if oai { Some(crate::gptoss::yarn(&g)?) } else { None },
             glm,
+            qwen35,
         };
         let layers = (0..hp.n_layer)
             .map(|i| {
                 let b = |s: &str| t(format!("blk.{i}.{s}.weight"));
                 let bias = |s: &str| t(format!("blk.{i}.{s}.bias"));
-                let qwen = |s: &str| if oai || hp.glm.is_some() { Ok(None) } else { b(s).map(Some) };
-                let is_glm = hp.glm.is_some();
+                let (is_glm, is_q35, delta) = (hp.glm.is_some(), hp.qwen35.is_some(), recurrent[i]);
+                let qwen = |s: &str| if oai || is_glm || delta { Ok(None) } else { b(s).map(Some) };
                 Ok(Layer {
                     attn_norm: b("attn_norm")?,
-                    attn: if is_glm {
+                    attn: if delta {
+                        Attn::Delta {
+                            qkv: b("attn_qkv")?,
+                            z: b("attn_gate")?,
+                            beta: b("ssm_beta")?,
+                            alpha: b("ssm_alpha")?,
+                            dt_bias: bias("ssm_dt")?,
+                            a: t(format!("blk.{i}.ssm_a"))?,
+                            conv: b("ssm_conv1d")?,
+                            norm: b("ssm_norm")?,
+                        }
+                    } else if is_glm {
                         Attn::Mla { q_a: b("attn_q_a")?, q_a_norm: b("attn_q_a_norm")?, q_b: b("attn_q_b")?, kv_a: b("attn_kv_a_mqa")?, kv_a_norm: b("attn_kv_a_norm")?, k_b: b("attn_k_b")?, v_b: b("attn_v_b")? }
                     } else {
                         Attn::Gqa { wq: b("attn_q")?, wk: b("attn_k")?, wv: b("attn_v")? }
                     },
-                    wo: b("attn_output")?,
+                    wo: b(if delta { "ssm_out" } else { "attn_output" })?,
                     q_norm: qwen("attn_q_norm")?,
                     k_norm: qwen("attn_k_norm")?,
-                    ffn_norm: b(if oai { "post_attention_norm" } else { "ffn_norm" })?,
+                    ffn_norm: b(if oai || is_q35 { "post_attention_norm" } else { "ffn_norm" })?,
                     bias: if oai {
                         let n = ["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
                         Some(n.map(bias).into_iter().collect::<Result<Vec<_>, _>>()?.try_into().unwrap())
@@ -211,7 +252,8 @@ impl Weights {
                             up: b("ffn_up_exps")?,
                             down: b("ffn_down_exps")?,
                             sel_bias: if is_glm { Some(bias("exp_probs_b")?) } else { None },
-                            shared: if is_glm { Some([b("ffn_gate_shexp")?, b("ffn_up_shexp")?, b("ffn_down_shexp")?]) } else { None },
+                            shared: if is_glm || is_q35 { Some([b("ffn_gate_shexp")?, b("ffn_up_shexp")?, b("ffn_down_shexp")?]) } else { None },
+                            shared_gate: if is_q35 { Some(b("ffn_gate_inp_shexp")?) } else { None },
                         })
                     },
                     dense: if i < n_dense { Some([b("ffn_gate")?, b("ffn_up")?, b("ffn_down")?]) } else { None },

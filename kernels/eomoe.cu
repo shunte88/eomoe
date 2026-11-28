@@ -476,8 +476,9 @@ extern "C" __global__ void rope_norm(float* dst, int d_stride, const float* src,
 // Per-head RMSNorm (q_norm/k_norm; none if w is null) then NEOX rope in place. v is
 // T x heads x hd, grid T * heads, block hd. Pairs (i, i + hd/2), pos = pos0 + t, theta_i =
 // pos * freq[i] (YaRN table) or pos * base^(-2i/hd) if freq is null; cos/sin times mscale.
+// Only the first n_rot dims are roped (pairs (i, i + n_rot/2)); the rest pass through.
 extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int hd, int pos0,
-                                        float eps, float base, const float* freq, float mscale) {
+                                        float eps, float base, const float* freq, float mscale, int n_rot) {
     __shared__ float s[1024];
     float* hv = v + (size_t)blockIdx.x * hd;
     const int i = threadIdx.x;
@@ -485,10 +486,11 @@ extern "C" __global__ void qk_norm_rope(float* v, const float* w, int heads, int
     const float sc = 1.0f / sqrtf(block_sum(a * a) / hd + eps);
     s[i] = w ? a * sc * w[i] : a;
     __syncthreads();
-    const int half = hd / 2;
+    if (i >= n_rot) { hv[i] = s[i]; return; }  // partial rope (qwen35: the first 64 of 256)
+    const int half = n_rot / 2;
     const float pos = (float)(pos0 + blockIdx.x / heads);
     const int j = i < half ? i : i - half;
-    const float th = pos * (freq ? freq[j] : powf(base, -2.0f * j / hd));
+    const float th = pos * (freq ? freq[j] : powf(base, -2.0f * j / n_rot));
     const float sn = sinf(th) * mscale, cs = cosf(th) * mscale;
     hv[i] = i < half ? s[i] * cs - s[i + half] * sn : s[i - half] * sn + s[i] * cs;
 }
@@ -890,4 +892,107 @@ extern "C" __global__ void moe_combine(float* x, const float* d, const int* off,
         for (int j = j0; j < j1; j++) acc += w[j] * d[(size_t)rows[j] * n + i];
         x[(size_t)t * n + i] += acc;
     }
+}
+
+// ---- qwen35moe (Gated DeltaNet + gated attention; src/qwen35.rs is the reference) ----
+
+// Causal depthwise conv + SiLU over n tokens of one sequence. in: n rows `in_stride` apart (the
+// first ch floats of each are the raw qkv); state: the previous kc - 1 raw rows, [k][ch]; w: [ch][kc].
+// out: n x ch. grid ch / 256, block 256, one channel per thread.
+extern "C" __global__ void ssm_conv(float* out, const float* in, int in_stride, float* state,
+                                    const float* w, int ch, int n, int kc) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
+    float hist[8], wc[8];
+    for (int k = 0; k < kc; k++) wc[k] = w[c * kc + k];
+    for (int k = 0; k < kc - 1; k++) hist[k] = state[k * ch + c];
+    for (int t = 0; t < n; t++) {
+        const float x = in[(size_t)t * in_stride + c];
+        float s = x * wc[kc - 1];
+        for (int k = 0; k < kc - 1; k++) s += hist[k] * wc[k];
+        out[(size_t)t * ch + c] = s / (1.0f + expf(-s));
+        for (int k = 0; k < kc - 2; k++) hist[k] = hist[k + 1];
+        hist[kc - 2] = x;
+    }
+    for (int k = 0; k < kc - 1; k++) state[k * ch + c] = hist[k];
+}
+
+// x / sqrt(sum x^2 + eps) of the first `heads` d-wide pieces of rows `stride` apart.
+// grid n * heads, block d.
+extern "C" __global__ void l2norm_heads(float* x, int stride, int heads, int d, float eps) {
+    float* r = x + (size_t)(blockIdx.x / heads) * stride + (blockIdx.x % heads) * d;
+    const float v = r[threadIdx.x];
+    r[threadIdx.x] = v / sqrtf(block_sum(v * v) + eps);
+}
+
+// Gated delta rule over n tokens of one sequence. c: conv rows (ch wide) [q (nk x 128) | k | v
+// (nv x 128)], q/k L2-normed; raw beta / alpha at dn + t * dn_stride + {beta_off, alpha_off} + h.
+// state: nv x 128 x 128, row j of head h = S[:, j] (ggml's transposed layout). One warp per row
+// j (lane owns i = lane + 32 m): S[:, j] *= exp(g); d = (v[j] - S[:, j].k) beta; S[:, j] += d k;
+// out[t][h][j] = S[:, j].q / sqrt(128). Rows are independent, so a warp never syncs.
+// grid (128 / 4, nv), block 128.
+extern "C" __global__ void gated_delta(const float* c, int ch, const float* dn, int dn_stride,
+                                       int beta_off, int alpha_off, const float* dt, const float* a,
+                                       float* state, float* out, int out_stride, int nk, int nv, int n) {
+    const int lane = threadIdx.x & 31, j = blockIdx.x * 4 + (threadIdx.x >> 5), h = blockIdx.y, kh = h % nk;
+    float* row = state + ((size_t)h * 128 + j) * 128;
+    float m[4];
+    for (int i = 0; i < 4; i++) m[i] = row[lane + 32 * i];
+    for (int t = 0; t < n; t++) {
+        const float* ct = c + (size_t)t * ch;
+        const float *q = ct + kh * 128, *k = ct + (nk + kh) * 128;
+        const float v = ct[(2 * nk + h) * 128 + j];
+        const float* dr = dn + (size_t)t * dn_stride;
+        const float x = dr[alpha_off + h] + dt[h];
+        const float decay = expf((x > 20.0f ? x : log1pf(expf(x))) * a[h]);
+        const float b = 1.0f / (1.0f + expf(-dr[beta_off + h]));
+        float kv[4], s = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            kv[i] = k[lane + 32 * i];
+            m[i] *= decay;
+            s += m[i] * kv[i];
+        }
+        const float d = (v - warp_sum(s)) * b;
+        float o = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            m[i] += d * kv[i];
+            o += m[i] * q[lane + 32 * i];
+        }
+        o = warp_sum(o);
+        if (lane == 0) out[(size_t)t * out_stride + h * 128 + j] = o * 0.08838834764831845f;  // 1/sqrt(128)
+    }
+    for (int i = 0; i < 4; i++) row[lane + 32 * i] = m[i];
+}
+
+// x (rows of heads x d) = rmsnorm(x, w) * silu(z) per d-wide head; z rows `z_stride` apart.
+// grid n * heads, block d.
+extern "C" __global__ void gated_rmsnorm(float* x, const float* z, int z_stride, const float* w,
+                                         int heads, int d, float eps) {
+    float* r = x + (size_t)blockIdx.x * d;
+    const float zv = z[(size_t)(blockIdx.x / heads) * z_stride + (blockIdx.x % heads) * d + threadIdx.x];
+    const float v = r[threadIdx.x];
+    const float sc = 1.0f / sqrtf(block_sum(v * v) / d + eps);
+    r[threadIdx.x] = v * sc * w[threadIdx.x] * zv / (1.0f + expf(-zv));
+}
+
+// src rows of heads x [q (hd) | gate (hd)] -> q and gate, each heads x hd. grid n * heads, block hd.
+extern "C" __global__ void split_qgate(float* q, float* gate, const float* src, int hd) {
+    const size_t b = blockIdx.x, i = threadIdx.x;
+    q[b * hd + i] = src[b * 2 * hd + i];
+    gate[b * hd + i] = src[b * 2 * hd + hd + i];
+}
+
+extern "C" __global__ void mul_sigmoid(float* x, const float* g, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] /= 1.0f + expf(-g[i]);
+}
+
+// Shared-expert gate: o row *= sigmoid(sg . h row). grid n, block 256.
+extern "C" __global__ void sigmoid_dot_scale(float* o, const float* h, const float* sg, int e) {
+    float* orow = o + (size_t)blockIdx.x * e;
+    const float* hrow = h + (size_t)blockIdx.x * e;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < e; i += blockDim.x) acc += hrow[i] * sg[i];
+    const float s = 1.0f / (1.0f + expf(-block_sum(acc)));
+    for (int i = threadIdx.x; i < e; i += blockDim.x) orow[i] *= s;
 }

@@ -12,7 +12,7 @@
 
 mod common;
 use common::{golden, qwen36_path};
-use eomoe::{gguf::Gguf, qwen35, qwen3moe::Engine, template::ChatTemplate, tokenizer::Tokenizer};
+use eomoe::{gguf::Gguf, gpu::GpuModel, qwen35, qwen3moe::Engine, template::ChatTemplate, tokenizer::Tokenizer};
 use serde_json::json;
 
 #[test]
@@ -93,4 +93,27 @@ fn cpu_reference_answers() {
 fn cpu_reference_matches_oracle() {
     let mut m = qwen35::CpuModel::new(Gguf::open(qwen36_path()).unwrap()).unwrap();
     common::greedy_floor_gate(&mut m, "greedy_qwen36.json", common::QWEN36_TIE, common::QWEN36_FLOOR_MEAN);
+}
+
+/// (d) CUDA engine, prefill (DeltaNet + gated attention kernels, staged expert waves).
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file and a CUDA GPU"]
+fn gpu_matches_oracle() {
+    let mut m = GpuModel::new(Gguf::open(qwen36_path()).unwrap(), 4096).unwrap();
+    common::greedy_floor_gate(&mut m, "greedy_qwen36.json", common::QWEN36_TIE, common::QWEN36_FLOOR_MEAN);
+}
+
+/// (d) CUDA engine token by token through a small expert cache (recurrent state carried per token).
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file and a CUDA GPU"]
+fn gpu_decode_matches_oracle() {
+    let m = GpuModel::with_cache(Gguf::open(qwen36_path()).unwrap(), 4096, 1000).unwrap();
+    common::greedy_floor_gate(&mut common::Decode(m), "greedy_qwen36.json", common::QWEN36_TIE, common::QWEN36_FLOOR_MEAN);
+}
+
+/// (d) the CUDA engine answers coherently (Paris; vault code recall over 240 tokens).
+#[test]
+#[ignore = "needs the Qwen3.6-35B-A3B model file and a CUDA GPU"]
+fn gpu_answers() {
+    answers(&mut GpuModel::new(Gguf::open(qwen36_path()).unwrap(), 4096).unwrap());
 }

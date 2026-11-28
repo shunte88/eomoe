@@ -1123,3 +1123,48 @@ Model: `ggml-org/GLM-4.7-Flash-GGUF` Q4_K (18.2 GB, arch `deepseek2`, 47 layers,
   | No rope on k | 1 | 0.51 |
 
 - Phase 15 suite: 4/4 pass (tokenizer, template, answers, oracle). Clippy is clean.
+
+### Phase 15d: Qwen3.6-35B-A3B CUDA engine (2026-11-27), gated
+
+- **src/gpu.rs, using the same `qwen3moe::Weights`:** the loader now reads `qwen35moe`: `recurrent_layers` from the GGUF bool array, `Attn::Delta`, `Moe.shared_gate`, and `n_rot`.
+- **New kernels (kernels/eomoe.cu), with src/qwen35.rs as the reference:**
+  - `ssm_conv`: causal conv + SiLU, one thread per channel, conv state carried per sequence.
+  - `l2norm_heads`.
+  - `gated_delta`: one warp per state row; lanes own 4 floats; the row stays in registers across the tokens of a piece; no block syncs.
+  - `gated_rmsnorm`: rmsnorm · silu(z).
+  - `split_qgate` and `mul_sigmoid`: gated attention.
+  - `sigmoid_dot_scale`: the shared-expert gate.
+  - `qk_norm_rope` takes `n_rot`, for partial rope (64 of 256).
+- **DeltaNet layer:**
+  - One Q8_0 matmul over [qkv | z | beta | alpha] (12352 rows) into a `dn` scratch buffer.
+  - Per piece: conv, then L2, then the delta rule, against that sequence's state.
+  - Then gated rmsnorm over the ubatch, then `ssm_out`.
+- **Gated attention:** head_dim 256 goes through the generic `attention` kernel.
+- **KV and recurrent state:**
+  - KV is allocated for the 10 attention layers only, indexed through `slot[li]`.
+  - Recurrent state is per sequence: 30 × (3·8192 + 32·128·128) floats, about 63 MB. It is allocated lazily in `set_n_seq` and zeroed by `truncate(0)`.
+  - `kv_save`/`kv_restore` panic on recurrent models: the 11b RAM cache is off by default, and its state snapshots come with 15e.
+  - A rewind to 0 < n < n_past panics until 15e's state checkpoints.
+- **Gates (tests/phase15_qwen36.rs):** all PASS against greedy_qwen36.json, same tie and floor as 15c.
+
+  | Test | Top-1 failures | Mean \|dlogprob\| | Max |
+  |---|---|---|---|
+  | `gpu_matches_oracle` (prefill, 4096 ctx) | 0/109 | 0.1337 | 1.17 |
+  | `gpu_decode_matches_oracle` (token by token, 1000 MB expert cache) | 0/109 | 0.1341 | |
+
+  - `gpu_answers` also passes: "Paris", and "The vault code is **4817**." Prefill runs at 101–121 tok/s on the 250/343-token cases.
+- **Mutations, all red:**
+
+  | Mutation | Test | Top-1 failures | Mean |
+  |---|---|---|---|
+  | k head `h / 2` | prefill | 102 | 5.35 |
+  | No decay | prefill | 59 | 4.55 |
+  | No conv SiLU | prefill | 107 | 6.04 |
+  | Conv state not written back | decode | 96 | 4.90 |
+  | No L2 norm | prefill | 99 | NaN |
+  | No silu(z) | prefill | 109 | 9.47 |
+  | No shared-expert gate | prefill | 108 | 6.23 |
+  | No attention gate | prefill | 109 | 10.59 |
+  | Full rope instead of `n_rot` | prefill | 5 | 1.00 |
+  | No state reset on `truncate(0)` | prefill | 12 | 2.55 |
+- **Regression (every suite except 11b, which is not run by the user's rule):** all pass. lib 34, phase1 4, phase2 2, phase3 4, phase4 2, phase5 3, phase6 5, phase7 2, phase8 1, phase11 2, 11c 2, 11d 1, phase12 3, phase13 6, phase14 6. Phase 15: 7/7. Clippy is clean.

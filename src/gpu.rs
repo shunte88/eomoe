@@ -1,5 +1,6 @@
 //! CUDA engine for qwen3moe, gpt-oss (biases, sinks, sliding window, YaRN; `Hparams::oai`) and
-//! GLM-4.7-Flash (absorbed MLA over a shared latent cache, dense / shared-expert FFNs). Same numerics as the CPU reference (f32 activations and KV
+//! GLM-4.7-Flash (absorbed MLA over a shared latent cache, dense / shared-expert FFNs) and Qwen3.6
+//! (qwen35moe: Gated DeltaNet layers with per-sequence recurrent state, gated attention). Same numerics as the CPU reference (f32 activations and KV
 //! cache, weights dequantized on the fly), with the dense weights resident in VRAM and the
 //! experts in host RAM, cached in VRAM slots by `ExpertCache` (ubatches up to 32 tokens; larger
 //! ones read the cached experts and stream the rest through staging slots, as llama.cpp).
@@ -125,6 +126,13 @@ struct Kernels {
     add_bias: CudaFunction,
     bias_ids: CudaFunction,
     moe_combine: CudaFunction,
+    ssm_conv: CudaFunction,
+    l2norm_heads: CudaFunction,
+    gated_delta: CudaFunction,
+    gated_rmsnorm: CudaFunction,
+    split_qgate: CudaFunction,
+    mul_sigmoid: CudaFunction,
+    sigmoid_dot_scale: CudaFunction,
 }
 
 /// A quantized matrix in VRAM: n_rows rows of k elements.
@@ -141,6 +149,8 @@ enum DAttn {
     Gqa { wq: Mat, wk: Mat, wv: Mat },
     /// k_b and v_b are per-head stacks of lat (k_b) / vd (v_b) rows.
     Mla { q_a: Mat, q_a_norm: Ptr, q_b: Mat, kv_a: Mat, kv_a_norm: Ptr, k_b: Mat, v_b: Mat },
+    /// qwen35 DeltaNet: one matrix [qkv | z | beta | alpha] per token, dt_bias, ssm_a, conv, ssm_norm.
+    Delta { w: Mat, dt: Ptr, a: Ptr, conv: Ptr, norm: Ptr },
 }
 
 struct DLayer {
@@ -159,6 +169,8 @@ struct DLayer {
     bias: [Ptr; 5],
     sinks: Ptr,
     window: i32,
+    /// qwen35: the shared expert's sigmoid gate (0: none).
+    shared_gate: Ptr,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +189,8 @@ struct Scratch {
     act: Ptr,
     db: Ptr,
     logits: Ptr,
+    /// qwen35: the DeltaNet projections ([qkv | z | beta | alpha] rows) / gated attention's q|gate.
+    dn: Ptr,
     /// Per layer routing, see `forward_span` and `meta_bytes`.
     meta: Ptr,
 }
@@ -196,6 +210,13 @@ pub struct GpuModel {
     /// Per layer: K then V, each n_ctx x (n_head_kv * head_dim) f16, in KV_PAGE pages that the
     /// sequences' page tables map their positions to.
     kv: Ptr,
+    /// Per layer: its index among the layers of its kind (attention: KV pool, DeltaNet: state).
+    slot: Vec<usize>,
+    /// Layers with a KV cache.
+    n_kv_layers: usize,
+    /// qwen35: per sequence, every DeltaNet layer's conv then ssm state (`rs_layer` floats each).
+    rs: Vec<Ptr>,
+    rs_layer: usize,
     /// Page tables, MAX_SEQ rows of n_ctx / KV_PAGE i32 (device copy of `seqs[i].pages`).
     pt: Ptr,
     seqs: Vec<SeqKv>,
@@ -250,6 +271,11 @@ const F: usize = std::mem::size_of::<f32>();
 /// gate: top-2 24.3, 4 25.3, 5 25.4, 6 25.3, 8 24.0 tok/s).
 const PREFETCH_TOP: usize = 5;
 const H: usize = 2; // f16
+
+/// qwen35: floats per token of the DeltaNet projection [qkv | z | beta | alpha].
+fn dn_width(q: &crate::qwen3moe::Qwen35) -> usize {
+    2 * q.nk * q.dk + 2 * q.nv * q.dk + 2 * q.nv
+}
 
 /// KV arrays per layer: K and V, or MLA's one shared latent row per position.
 fn kv_arrays(hp: &Hparams) -> usize {
@@ -317,6 +343,13 @@ impl GpuModel {
             add_bias: f("add_bias")?,
             bias_ids: f("bias_ids")?,
             moe_combine: f("moe_combine")?,
+            ssm_conv: f("ssm_conv")?,
+            l2norm_heads: f("l2norm_heads")?,
+            gated_delta: f("gated_delta")?,
+            gated_rmsnorm: f("gated_rmsnorm")?,
+            split_qgate: f("split_qgate")?,
+            mul_sigmoid: f("mul_sigmoid")?,
+            sigmoid_dot_scale: f("sigmoid_dot_scale")?,
         };
 
         let mut bufs = vec![];
@@ -354,6 +387,9 @@ impl GpuModel {
                     }
                     DAttn::Mla { q_a: up(&[q_a])?, q_a_norm: up(&[q_a_norm])?.p, q_b: up(&[q_b])?, kv_a: up(&[kv_a])?, kv_a_norm: up(&[kv_a_norm])?.p, k_b: up(&[k_b])?, v_b: up(&[v_b])? }
                 }
+                Attn::Delta { qkv, z, beta, alpha, dt_bias, a, conv, norm } => {
+                    DAttn::Delta { w: up(&[qkv, z, beta, alpha])?, dt: up(&[dt_bias])?.p, a: up(&[a])?.p, conv: up(&[conv])?.p, norm: up(&[norm])?.p }
+                }
             };
             let ffn = match (&l.dense, l.moe.as_ref().and_then(|m| m.shared.as_ref())) {
                 (Some([g, u, d]), _) | (None, Some([g, u, d])) => Some((up(&[g, u])?, up(&[d])?)),
@@ -368,6 +404,7 @@ impl GpuModel {
                 bias: [opt(bias[0])?, opt(bias[1])?, opt(bias[2])?, opt(bias[3])?, opt(bias[4])?],
                 sinks: opt(l.sinks.as_ref())?,
                 window: if li % 2 == 0 { w.hp.swa as i32 } else { 0 },
+                shared_gate: opt(l.moe.as_ref().and_then(|m| m.shared_gate.as_ref()))?,
                 attn_norm: up(&[&l.attn_norm])?.p,
                 attn,
                 wo: up(&[&l.wo])?,
@@ -405,7 +442,21 @@ impl GpuModel {
         }
         let (e, kvd, nq, kk) = (hp.n_embd, hp.n_head_kv * hp.head_dim, hp.n_head * hp.head_dim, hp.n_expert_used);
         let n_ctx = n_ctx.next_multiple_of(KV_PAGE);
-        let kv = alloc(hp.n_layer * kv_arrays(hp) * n_ctx * kvd * H)?;
+        let is_delta: Vec<bool> = layers.iter().map(|l| matches!(l.attn, DAttn::Delta { .. })).collect();
+        let slot: Vec<usize> = (0..is_delta.len()).map(|i| is_delta[..i].iter().filter(|&&d| d == is_delta[i]).count()).collect();
+        let n_kv_layers = is_delta.iter().filter(|&&d| !d).count();
+        let n_delta = is_delta.len() - n_kv_layers;
+        let rs_layer = hp.qwen35.as_ref().map_or(0, |q| {
+            let ch = 2 * q.nk * q.dk + q.nv * q.dk;
+            (q.d_conv - 1) * ch + q.nv * q.dk * q.dk
+        });
+        if let Some(q) = &hp.qwen35 {
+            if q.dk != 128 || q.d_conv > 8 || hp.n_rot > hp.head_dim {
+                return Err(format!("qwen35: state_size {} / conv_kernel {} unsupported by the DeltaNet kernels", q.dk, q.d_conv));
+            }
+        }
+        let rs = if n_delta > 0 { vec![alloc(n_delta * rs_layer * F)?] } else { vec![] };
+        let kv = alloc(n_kv_layers * kv_arrays(hp) * n_ctx * kvd * H)?;
         let pt = alloc(MAX_SEQ * (n_ctx / KV_PAGE) * 4)?;
         let ebytes = |l: &crate::qwen3moe::Layer| w.expert(l, 0).iter().map(|b| b.len()).sum::<usize>();
         let layout = |m: &crate::qwen3moe::Moe, l| (m.gate.ty, m.up.ty, m.down.ty, ebytes(l));
@@ -446,6 +497,11 @@ impl GpuModel {
             db: alloc(b * kk * e * F)?,
             logits: alloc(LOGIT_ROWS.min(b) * hp.n_vocab * F)?,
             meta: alloc(meta_bytes(span, b, kk, hp.n_expert))?,
+            dn: match &hp.qwen35 {
+                // [b rows of [qkv | z | beta | alpha] (gated attention: q|gate, gate)][b conv rows]
+                Some(q) => alloc(b * (dn_width(q).max(3 * nq) + 2 * q.nk * q.dk + q.nv * q.dk) * F)?,
+                None => 0,
+            },
         };
         let cpu_out = unsafe { ctx.alloc_pinned_with_flags::<f32>(CACHE_MAX_BATCH * e, 0) }.map_err(err)?;
         let meta_host = unsafe { ctx.alloc_pinned_with_flags::<u8>(meta_bytes(span, b, kk, hp.n_expert), 0) }.map_err(err)?;
@@ -487,6 +543,10 @@ impl GpuModel {
             rope_mscale: w.hp.rope_yarn.as_ref().map_or(1.0, |y| y.1),
             bias_off,
             kv,
+            slot,
+            n_kv_layers,
+            rs,
+            rs_layer,
             pt,
             seqs: vec![SeqKv::default()],
             free_pages: (0..(n_ctx / KV_PAGE) as i32).rev().collect(),
@@ -715,6 +775,38 @@ impl GpuModel {
         launch!(self, self.k.add_inplace, ((t * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
     }
 
+    fn rs_bytes(&self) -> usize {
+        (self.slot.len() - self.n_kv_layers) * self.rs_layer * F
+    }
+
+    /// qwen35 Gated DeltaNet over one ubatch of `tc` rows of h (pieces as in forward_span), each
+    /// piece continuing its sequence's conv and ssm state. Returns the ssm_out input (s.attn).
+    fn delta_net(&self, a: &DAttn, di: usize, h: Ptr, tc: usize, ps: &[(usize, usize, usize, usize)]) -> Ptr {
+        let DAttn::Delta { w, dt, a, conv, norm } = a else { unreachable!() };
+        let (hp, s) = (&self.w.hp, self.s);
+        let q = hp.qwen35.as_ref().unwrap();
+        let (wd, vd) = (dn_width(q), q.nv * q.dk);
+        let ch = 2 * q.nk * q.dk + vd;
+        let cv = s.dn + (self.max_batch * wd.max(3 * hp.n_head * hp.head_dim) * F) as u64;
+        self.mm(w, h, s.dn, tc);
+        let (wdi, chi, kc, dk, eps, nki, nvi, vdi) = (wd as i32, ch as i32, q.d_conv as i32, q.dk as i32, hp.eps, q.nk as i32, q.nv as i32, vd as i32);
+        let (boff, aoff) = ((ch + vd) as i32, (ch + vd + q.nv) as i32);
+        let (dt, a, conv, norm) = (*dt, *a, *conv, *norm);
+        for &(sq, r0, n, _) in ps {
+            let cst = self.rs[sq] + (di * self.rs_layer * F) as u64;
+            let sst = cst + ((q.d_conv - 1) * ch * F) as u64;
+            let (inp, c, out, dnr) = (s.dn + (r0 * wd * F) as u64, cv + (r0 * ch * F) as u64, s.attn + (r0 * vd * F) as u64, s.dn + (r0 * wd * F) as u64);
+            let ni = n as i32;
+            launch!(self, self.k.ssm_conv, (ch.div_ceil(256) as u32, 1, 1), 256, [c, inp, wdi, cst, conv, chi, ni, kc]);
+            let (qk_heads, l2eps) = ((2 * q.nk) as i32, hp.eps);
+            launch!(self, self.k.l2norm_heads, ((n * 2 * q.nk) as u32, 1, 1), q.dk as u32, [c, chi, qk_heads, dk, l2eps]);
+            launch!(self, self.k.gated_delta, ((q.dk / 4) as u32, q.nv as u32, 1), 128, [c, chi, dnr, wdi, boff, aoff, dt, a, sst, out, vdi, nki, nvi, ni]);
+        }
+        let (attn, z) = (s.attn, s.dn + (ch * F) as u64);
+        launch!(self, self.k.gated_rmsnorm, ((tc * q.nv) as u32, 1, 1), q.dk as u32, [attn, z, wdi, norm, nvi, dk, eps]);
+        s.attn
+    }
+
     /// Serve up to `n` sequences at once (`Engine::n_seq`); drops every cached sequence.
     pub fn set_n_seq(&mut self, n: usize) {
         assert!((1..=MAX_SEQ).contains(&n), "1..={MAX_SEQ} sequences");
@@ -723,6 +815,11 @@ impl GpuModel {
             self.truncate(0);
         }
         self.seqs.resize_with(n, SeqKv::default);
+        while !self.rs.is_empty() && self.rs.len() < n {
+            let b = self.stream.alloc_zeros::<u8>(self.rs_bytes()).expect("recurrent state alloc");
+            self.rs.push(b.device_ptr(&self.stream).0);
+            self._bufs.push(b);
+        }
         self.cur = 0;
     }
 
@@ -799,11 +896,12 @@ impl GpuModel {
         self.htod(s.x, &xe);
 
         let (ei, eps, base) = (e as i32, hp.eps, hp.rope_base);
-        let (nhi, nkvi, hdi) = (nh as i32, nkv as i32, hd as i32);
+        let (nhi, nkvi, hdi, nrot) = (nh as i32, nkv as i32, hd as i32, hp.n_rot as i32);
+        let gated = hp.qwen35.is_some();
         let scale = 1.0 / (hd as f32).sqrt();
         let pt_row = |sq: usize| self.pt + (sq * (self.n_ctx / KV_PAGE) * 4) as u64;
         for (li, l) in self.layers.iter().enumerate() {
-            let kc = self.kv + (li * kv_arrays(hp) * self.n_ctx * kvd * H) as u64;
+            let kc = self.kv + (self.slot[li] * kv_arrays(hp) * self.n_ctx * kvd * H) as u64;
             let vc = kc + (self.n_ctx * kvd * H) as u64;
             // --- attention, per ubatch; leaves each ubatch's normed FFN input in s.h ---
             let mut sels = vec![];
@@ -816,8 +914,18 @@ impl GpuModel {
                 let (ks, vs) = (s.kvs, s.kvs + (tc * kvd * F) as u64);
                 let wn = l.attn_norm;
                 launch!(self, self.k.rmsnorm, (tn, 1, 1), 256, [h, x, wn, ei, eps]);
-                let wo_in = if let DAttn::Gqa { wq, wk, wv } = &l.attn {
-                self.mm(wq, h, s.q, tc);
+                let wo_in = if let DAttn::Delta { .. } = &l.attn {
+                    self.delta_net(&l.attn, self.slot[li], h, tc, ps)
+                } else if let DAttn::Gqa { wq, wk, wv } = &l.attn {
+                let gate = s.dn + (tc * 2 * nh * hd * F) as u64;
+                if gated {
+                    // attn_q rows are per head [q | gate]; split, gate the output after attention.
+                    self.mm(wq, h, s.dn, tc);
+                    let (q, dn, hdi) = (s.q, s.dn, hd as i32);
+                    launch!(self, self.k.split_qgate, ((tc * nh) as u32, 1, 1), hd as u32, [q, gate, dn, hdi]);
+                } else {
+                    self.mm(wq, h, s.q, tc);
+                }
                 self.mm(wk, h, ks, tc);
                 self.mm(wv, h, vs, tc);
                 self.bias(l.bias[0], s.q, nh * hd, tc);
@@ -829,8 +937,8 @@ impl GpuModel {
                   let (q, attn, ks, vs) = (at(s.q, r0, nh * hd), at(s.attn, r0, nh * hd), at(ks, r0, kvd), at(vs, r0, kvd));
                   let (pos0, tn, ti) = (pos as i32, tc as u32, tc as i32);
                   let (qn, kn, fr, ms) = (l.q_norm, l.k_norm, self.rope_freq, self.rope_mscale);
-                  launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base, fr, ms]);
-                  launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base, fr, ms]);
+                  launch!(self, self.k.qk_norm_rope, (tn * nh as u32, 1, 1), hd as u32, [q, qn, nhi, hdi, pos0, eps, base, fr, ms, nrot]);
+                  launch!(self, self.k.qk_norm_rope, (tn * nkv as u32, 1, 1), hd as u32, [ks, kn, nkvi, hdi, pos0, eps, base, fr, ms, nrot]);
                   // Store K and V, one launch per page the rows land in.
                   let mut p = pos;
                   while p < pos + tc {
@@ -867,6 +975,10 @@ impl GpuModel {
                     launch!(self, self.k.attention, (nh as u32, tn, 1), 32 * 8, [q, kc, vc, pt, attn, nhi, nkvi, hdi, pos0, scale, sinks, win]);
                   }
                 }
+                if gated {
+                    let (attn, n) = (s.attn, (tc * nh * hd) as i32);
+                    launch!(self, self.k.mul_sigmoid, ((tc * nh * hd).div_ceil(256) as u32, 1, 1), 256, [attn, gate, n]);
+                }
                 s.attn
                 } else {
                     self.mla_attention(&l.attn, h, tc, ps, kc)
@@ -883,6 +995,10 @@ impl GpuModel {
                     self.mm(gu, h, sgu, tc);
                     launch!(self, self.k.swiglu, ((tc * gu.n_rows / 2).div_ceil(256) as u32, 1, 1), 256, [act, sgu, ffi, ti]);
                     self.mm(down, act, o, tc);
+                    if l.shared_gate != 0 {
+                        let (sg, h) = (l.shared_gate, h);
+                        launch!(self, self.k.sigmoid_dot_scale, (tn, 1, 1), 256, [o, h, sg, ei]);
+                    }
                     launch!(self, self.k.add_inplace, ((tc * e).div_ceil(256) as u32, 1, 1), 256, [x, o, n]);
                 }
                 let Some(router) = &l.router else { continue };
@@ -1177,7 +1293,8 @@ impl Engine for GpuModel {
     /// The sequence's pages of every layer's K and V, page-major per (layer, K|V).
     fn kv_save(&mut self) -> Vec<u8> {
         let pages = self.seqs[self.cur].pages.clone();
-        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
+        assert!(self.rs.is_empty(), "kv_save: recurrent state is not snapshotted");
+        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.n_kv_layers);
         let pb = KV_PAGE * kvd * H;
         self.stream.synchronize().expect("sync");
         let mut out = vec![0u8; nl * kv_arrays(&self.w.hp) * pages.len() * pb];
@@ -1189,7 +1306,8 @@ impl Engine for GpuModel {
     }
 
     fn kv_restore(&mut self, data: &[u8], n: usize) {
-        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.w.hp.n_layer);
+        assert!(self.rs.is_empty(), "kv_restore: recurrent state is not snapshotted");
+        let (kvd, nl) = (self.w.hp.n_head_kv * self.w.hp.head_dim, self.n_kv_layers);
         let pb = KV_PAGE * kvd * H;
         let nl = nl * kv_arrays(&self.w.hp);
         let np_img = data.len() / (nl * pb);
@@ -1210,7 +1328,12 @@ impl Engine for GpuModel {
         self.cur = seq;
     }
 
+    /// Recurrent models: only a rewind to 0 (which zeroes the state) until state checkpoints.
     fn truncate(&mut self, n_past: usize) {
+        if !self.rs.is_empty() && n_past < self.seqs[self.cur].n_past {
+            assert!(n_past == 0, "recurrent state can only be reset");
+            unsafe { result::memset_d8_async(self.rs[self.cur], 0, self.rs_bytes(), self.stream.cu_stream()) }.expect("memset");
+        }
         let sq = &mut self.seqs[self.cur];
         sq.n_past = sq.n_past.min(n_past);
         let keep = sq.n_past.div_ceil(KV_PAGE);
